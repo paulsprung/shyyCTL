@@ -132,17 +132,28 @@ def debug_channel1():
     run("set", "led1", "color", "off", match=m)
 
 
-def _openrgb_group(device_type_name: str, name_contains: str | None = None):
+def _openrgb_group(device_type_name: str, name_contains: str | None = None, retries: int = 4):
     from openrgb import OpenRGBClient
     from openrgb.utils import DeviceType
-    client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
-    devices = [d for d in client.devices if d is not None]
-    if len(devices) != len(client.devices):
-        print(f"({len(client.devices) - len(devices)} device(s) came back as None from "
-              "OpenRGB - probably still settling after a restart)")
     dtype = getattr(DeviceType, device_type_name)
-    return [d for d in devices
-            if d.type == dtype and (name_contains is None or name_contains in d.name)]
+
+    for attempt in range(retries):
+        client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
+        total = len(client.devices)
+        devices = [d for d in client.devices if d is not None]
+        matched = [d for d in devices
+                   if d.type == dtype and (name_contains is None or name_contains in d.name)]
+        if matched or len(devices) == total:
+            if len(devices) != total:
+                print(f"({total - len(devices)} device(s) came back as None from OpenRGB, "
+                      "but the ones we wanted were fine)")
+            return matched
+        print(f"({total - len(devices)} device(s) came back as None - still settling, "
+              f"retrying {attempt + 1}/{retries}...")
+        time.sleep(1.5)
+
+    print("Gave up waiting for OpenRGB to settle - try again in a few seconds.")
+    return []
 
 
 def show_zones():
