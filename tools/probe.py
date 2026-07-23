@@ -60,6 +60,9 @@ def probe_hub():
     print("\n=== Control Hub status ===")
     run("status", "--verbose", match=m)
 
+    print("\n=== LED/accessory detection (status can't show this - write-only) ===")
+    run("initialize", match=m)
+
     print("\nRun 'python tools/probe.py verify' next to confirm control actually works.")
 
 
