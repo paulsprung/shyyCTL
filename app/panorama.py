@@ -503,7 +503,34 @@ class PanoramaUSB(_PanoramaBase):
         self.dev = dev
         self.ep_out = ep_out
         self.ep_in = ep_in
+        self._try_cdc_line_coding(intf.bInterfaceNumber)
         return True
+
+    def _try_cdc_line_coding(self, interface_number: int):
+        """Sends the two standard USB CDC control requests a real serial
+        driver issues before any data flows - SET_LINE_CODING (115200 8N1)
+        and SET_CONTROL_LINE_STATE asserting DTR+RTS.
+
+        Reasoning, not a guess pulled from nowhere: reed-tpse's Linux build
+        opens /dev/ttyACM0 through the OS's normal serial API, which sends
+        exactly these two control requests automatically as a side effect
+        of "opening the port" - before that happens, many USB-UART bridge
+        firmwares simply refuse to send anything on the data pipe. Our raw
+        WinUSB path skips that entirely by going straight to bulk transfers,
+        which is one explanation (not yet confirmed) for the panel staying
+        completely silent to both real requests and passive listening this
+        session. Harmless if the device doesn't care: failure here is
+        logged and swallowed, connect() proceeds regardless.
+        """
+        import usb.core
+        line_coding = (115200).to_bytes(4, "little") + bytes((0, 0, 8))  # 1 stop bit, no parity, 8 data bits
+        try:
+            # bmRequestType 0x21 = host-to-device, class, interface
+            self.dev.ctrl_transfer(0x21, 0x20, 0, interface_number, line_coding)  # SET_LINE_CODING
+            self.dev.ctrl_transfer(0x21, 0x22, 0x0003, interface_number, None)     # SET_CONTROL_LINE_STATE, DTR+RTS
+            log.debug("CDC line-coding control requests accepted")
+        except usb.core.USBError as exc:
+            log.debug("CDC line-coding control requests rejected/unsupported (may be harmless): %s", exc)
 
     def disconnect(self):
         if self.dev is not None:
