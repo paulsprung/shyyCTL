@@ -92,6 +92,21 @@ class OpenRgbBridge:
         from openrgb.utils import DeviceType
         return [d for d in self._devices() if d.type == DeviceType.DRAM]
 
+    def describe_all(self) -> list[dict]:
+        """Raw device/zone breakdown, exactly what OpenRGB itself reports -
+        every controllable device on the system, not just the three groups
+        shyyctl cares about (that also includes keyboards/mice etc.)."""
+        return [
+            {
+                "name": d.name,
+                "type": d.type.name,
+                "leds": len(d.leds),
+                "modes": [m.name for m in d.modes],
+                "zones": [{"name": z.name, "leds": len(z.leds)} for z in d.zones],
+            }
+            for d in self._devices()
+        ]
+
     # -- hub channel <-> zone mapping -------------------------------------
 
     @staticmethod

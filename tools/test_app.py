@@ -2,8 +2,12 @@
 real hardware. The next step up from tools/probe.py: this exercises the
 actual modules shyyctl will run, not one-off liquidctl/OpenRGB calls.
 
-Run from the repo root:
+Run from the repo root and pick what to test:
     python tools/test_app.py
+
+liquidctl LED colour control is NOT exercised here anymore - confirmed this
+session that the 360mm units don't come out right through it. RGB is
+OpenRGB-only now (hub, mobo, RAM); liquidctl is fan PWM/RPM only.
 """
 
 import json
@@ -23,107 +27,129 @@ from app.hub import Hub
 from app.openrgb_bridge import OpenRgbBridge
 from app.scan import Scan
 
-config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+ORANGE = (255, 107, 61)
 
-hub = Hub(config["hub"]["match"])
-rgb = OpenRgbBridge(**config["openrgb"])
+# Known-good LED counts from this session's manual verification in OpenRGB's
+# own GUI - this hub can't report them itself (see scan.py). Test-only
+# stand-in for what the real setup screen will get from a human picking the
+# fan model.
+VERIFIED_COUNTS = {"led1": 36, "led3": 24, "led4": 36, "led5": 16}
 
-print("Connecting to hub...")
-if not hub.connect():
-    print("FAILED:", hub.last_error)
-    sys.exit(1)
-print("Connected:", hub.description)
-print("Channels:", hub.channels)
+_hub: Hub | None = None
+_rgb: OpenRgbBridge | None = None
 
-print("\n=== direct status() check, right after connect, before any scan ===")
-raw = hub._run("status", "--verbose", match=hub.match)
-print(f"raw stdout ({len(raw or '')} chars):")
-print(repr(raw))
-readings = hub.status()
-print(f"\nparsed into {len(readings)} readings:")
-for r in readings:
-    print(" ", r)
-print(f"\nhub.rpm('fan1') -> {hub.rpm('fan1')}")
-input("\nEnter to continue to the scan.")
 
-# OpenRGB is deliberately NOT connected here. scan.py connects it itself,
-# only after fan probing is done (see _scan_openrgb) - connecting it early
-# was ruled out as the cause of the all-empty fan results (same result with
-# or without it), kept anyway since it's still the more correct order.
+def hub() -> Hub:
+    global _hub
+    if _hub is None:
+        _hub = Hub(CONFIG["hub"]["match"])
+    if not _hub.connected and not _hub.connect():
+        print("Could not connect to hub:", _hub.last_error)
+        sys.exit(1)
+    return _hub
 
-print("\nRunning scan (no curve measurement, quick)...")
-scan = Scan(hub, rgb)
-scan.start(measure_curves=False)
-while scan.running:
-    print(" ", scan.step)
-    time.sleep(1)
 
-print("\n=== scan result ===")
-print(json.dumps(scan.state(), indent=2))
+def rgb() -> OpenRgbBridge:
+    global _rgb
+    if _rgb is None:
+        _rgb = OpenRgbBridge(**CONFIG["openrgb"])
+    if not _rgb.connected and not _rgb.connect():
+        print("Could not connect to OpenRGB:", _rgb.last_error)
+    return _rgb
 
-print("\n=== addressing test, path 1: liquidctl firmware fixed mode ===")
-print("(channel 1 is expected to fail here - confirmed liquidctl driver bug, not new)")
-for entry in scan.results:
-    if not entry["present"] or not entry["led_channel"]:
-        continue
-    ch = entry["led_channel"]
-    print(f"\n{ch}: setting fixed orange via liquidctl...")
-    try:
-        hub.set_color(ch, "fixed", ["ff6b3d"])
-    except Exception as exc:
-        print("  FAILED:", exc)
-        continue
-    input(f"  {ch} should be solid orange now. Enter to turn off + continue.")
-    hub.set_color(ch, "fixed", ["000000"])
 
-print("\n=== addressing test, path 2: OpenRGB (hub LEDs incl. channel 1, mobo, RAM) ===")
-if not rgb.connected and not rgb.connect():
-    print("Could not connect to OpenRGB:", rgb.last_error)
-else:
-    # Known-good counts from this session's manual verification in OpenRGB's
-    # own GUI - this hub can't report them itself (see scan.py), so this is
-    # a test-only stand-in for what the real setup screen will get from a
-    # human picking the fan model.
-    VERIFIED_COUNTS = {"led1": 36, "led3": 24, "led4": 36, "led5": 16}
+def test_fans():
+    h = hub()
+    print("Channels:", h.channels)
+    raw = h._run("status", "--verbose", match=h.match)
+    print(f"\nraw stdout:\n{raw}")
+    for r in h.status():
+        print(" ", r)
+    for ch in h.channels.get("fan", []):
+        print(f"{ch} rpm ->", h.rpm(ch))
 
-    hub_devices = rgb.hub_leds()
-    if not hub_devices:
+
+def test_scan():
+    h = hub()
+    r = rgb()
+    scan = Scan(h, r)
+    scan.start(measure_curves=False)
+    while scan.running:
+        print(" ", scan.step)
+        time.sleep(1)
+    print(json.dumps(scan.state(), indent=2))
+
+
+def test_list_openrgb():
+    r = rgb()
+    print(json.dumps(r.describe_all(), indent=2))
+
+
+def test_hub_leds_openrgb():
+    r = rgb()
+    devices = r.hub_leds()
+    if not devices:
         print("Hub not found in OpenRGB.")
-    else:
-        device = hub_devices[0]
-        for entry in scan.results:
-            ch = entry["led_channel"]
-            if not ch or ch not in VERIFIED_COUNTS:
-                continue
-            count = VERIFIED_COUNTS[ch]
-            print(f"\n{ch}: resizing to {count} LEDs, then orange via OpenRGB...")
-            if not rgb.resize_zone(device, ch, count):
-                print("  resize failed or zone not found")
-                continue
-            try:
-                rgb.set_zone_color(device, ch, (255, 107, 61))
-            except Exception as exc:
-                print("  FAILED:", exc)
-                continue
-            input(f"  {ch} should be solid orange now (via OpenRGB). Enter to turn off + continue.")
-            rgb.set_zone_color(device, ch, (0, 0, 0))
+        return
+    device = devices[0]
+    for ch, count in VERIFIED_COUNTS.items():
+        print(f"\n{ch}: resizing to {count} LEDs, then orange...")
+        if not r.resize_zone(device, ch, count):
+            print("  resize failed or zone not found")
+            continue
+        try:
+            r.set_zone_color(device, ch, ORANGE)
+        except Exception as exc:
+            print("  FAILED:", exc)
+            continue
+        input(f"  {ch} should be solid orange now. Enter to turn off + continue.")
+        r.set_zone_color(device, ch, (0, 0, 0))
 
-    mobo_devices = rgb.motherboard()
-    if not mobo_devices:
-        print("\nMotherboard not found in OpenRGB.")
-    else:
-        print("\nmobo: orange via OpenRGB...")
-        rgb.set_color(mobo_devices, (255, 107, 61))
-        input("  mobo should be solid orange now. Enter to turn off.")
-        rgb.set_color(mobo_devices, (0, 0, 0))
 
-    ram_devices = rgb.ram()
-    if not ram_devices:
-        print("\nRAM not found in OpenRGB.")
-    else:
-        print("\nram: orange via OpenRGB...")
-        rgb.set_color(ram_devices, (255, 107, 61))
-        input("  RAM should be solid orange now. Enter to turn off.")
-        rgb.set_color(ram_devices, (0, 0, 0))
+def test_mobo():
+    r = rgb()
+    devices = r.motherboard()
+    if not devices:
+        print("Motherboard not found in OpenRGB.")
+        return
+    r.set_color(devices, ORANGE)
+    input("mobo should be solid orange now. Enter to turn off.")
+    r.set_color(devices, (0, 0, 0))
 
-print("\nDone.")
+
+def test_ram():
+    r = rgb()
+    devices = r.ram()
+    if not devices:
+        print("RAM not found in OpenRGB.")
+        return
+    r.set_color(devices, ORANGE)
+    input("RAM should be solid orange now. Enter to turn off.")
+    r.set_color(devices, (0, 0, 0))
+
+
+MENU = {
+    "1": ("List every OpenRGB device + zone (raw)", test_list_openrgb),
+    "2": ("Fan PWM/RPM via liquidctl", test_fans),
+    "3": ("Full hardware scan (fans + LED presence + mobo/ram)", test_scan),
+    "4": ("Hub LEDs via OpenRGB (resized + coloured)", test_hub_leds_openrgb),
+    "5": ("Motherboard via OpenRGB", test_mobo),
+    "6": ("RAM via OpenRGB", test_ram),
+}
+
+if __name__ == "__main__":
+    print("What do you want to test?")
+    for key, (label, _) in MENU.items():
+        print(f"  {key}. {label}")
+    choice = input("> number(s), comma-separated: ").strip()
+    picks = [c.strip() for c in choice.split(",") if c.strip()]
+    unknown = [c for c in picks if c not in MENU]
+    if not picks or unknown:
+        print("Unknown choice(s):", unknown or "(nothing entered)")
+        sys.exit(1)
+    for pick in picks:
+        label, fn = MENU[pick]
+        print(f"\n=== {label} ===")
+        fn()
+    print("\nDone.")
