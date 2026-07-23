@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(messa
 
 from app.hub import Hub
 from app.openrgb_bridge import OpenRgbBridge
+from app.openrgb_raw import OpenRgbRaw
 from app.scan import Scan
 
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
@@ -107,6 +108,42 @@ def test_hub_leds_openrgb():
         r.set_zone_color(device, ch, (0, 0, 0))
 
 
+def test_hub_leds_raw():
+    """Uses app/openrgb_raw.py - our own protocol-5-speaking client - instead
+    of openrgb-python. Should show the hub's REAL per-channel LED counts
+    without any manual resizing, because protocol 5 doesn't have the
+    backward-compat lie that makes effects-only zones look like they have
+    0/1 LEDs (confirmed via OpenRGB's own server source this session)."""
+    client = OpenRgbRaw(**{k: v for k, v in CONFIG["openrgb"].items() if k != "protocol_version"})
+    client.connect()
+    try:
+        ctrl = client.find_controller("NZXT")
+        if ctrl is None:
+            print("Hub not found via raw client either.")
+            return
+        print(f"Found: {ctrl.name} (device index {ctrl.index})")
+        for zone in ctrl.zones:
+            print(f"  {zone.name}: leds_count={zone.leds_count} "
+                  f"(min={zone.leds_min}, max={zone.leds_max})")
+
+        static_mode = client.find_mode(ctrl, "Static")
+        if static_mode is None:
+            print("No 'Static' mode found - modes are:", [m.name for m in ctrl.modes])
+        else:
+            client.set_mode(ctrl.index, static_mode)
+
+        for zone in ctrl.zones:
+            if zone.leds_count == 0:
+                print(f"\n{zone.name}: 0 LEDs, skipping (empty channel).")
+                continue
+            print(f"\n{zone.name}: {zone.leds_count} LEDs, setting orange...")
+            client.set_zone_colors(ctrl.index, zone.index, [ORANGE] * zone.leds_count)
+            input(f"  {zone.name} should be solid orange now. Enter to turn off + continue.")
+            client.set_zone_colors(ctrl.index, zone.index, [(0, 0, 0)] * zone.leds_count)
+    finally:
+        client.close()
+
+
 def test_mobo():
     r = rgb()
     devices = r.motherboard()
@@ -130,12 +167,13 @@ def test_ram():
 
 
 MENU = {
-    "1": ("List every OpenRGB device + zone (raw)", test_list_openrgb),
+    "1": ("List every OpenRGB device + zone (raw, via openrgb-python)", test_list_openrgb),
     "2": ("Fan PWM/RPM via liquidctl", test_fans),
     "3": ("Full hardware scan (fans + LED presence + mobo/ram)", test_scan),
-    "4": ("Hub LEDs via OpenRGB (resized + coloured)", test_hub_leds_openrgb),
+    "4": ("Hub LEDs via openrgb-python (protocol 4, needs manual sizes)", test_hub_leds_openrgb),
     "5": ("Motherboard via OpenRGB", test_mobo),
     "6": ("RAM via OpenRGB", test_ram),
+    "7": ("Hub LEDs via our own protocol-5 client (real sizes, no manual config)", test_hub_leds_raw),
 }
 
 if __name__ == "__main__":
