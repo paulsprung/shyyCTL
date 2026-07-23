@@ -740,16 +740,43 @@ def find_usbprint_path(vendor_id: int = TRYX_VENDOR_ID,
     return found_path
 
 
+_FILE_FLAG_OVERLAPPED = 0x40000000
+_ERROR_IO_PENDING = 997
+_WAIT_OBJECT_0 = 0x0
+_WAIT_TIMEOUT = 0x102
+
+
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_void_p),
+        ("InternalHigh", ctypes.c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
 class PanoramaPrint(_PanoramaBase):
     """Talks to the panel via Windows' native CreateFile/ReadFile/WriteFile
     on its usbprint.sys device path - the same access model KANALI itself
     uses, so this does not require touching any driver in Device Manager
     (unlike PanoramaUSB), but does still conflict with KANALI if it's
-    running at the same time, same as any single-open-handle device."""
+    running at the same time, same as any single-open-handle device.
+
+    Uses overlapped (asynchronous) I/O throughout, not plain synchronous
+    ReadFile/WriteFile - a plain synchronous ReadFile on a raw device
+    handle like this has no per-call timeout at all (that's a COM-port-only
+    concept, via SetCommTimeouts, which doesn't apply here) and simply
+    blocks forever if the device never answers. Confirmed hanging exactly
+    this way against real hardware this session. Overlapped I/O plus
+    WaitForSingleObject on the operation's event handle is the standard
+    way to get a real, cancelable timeout on an arbitrary Windows handle.
+    """
 
     def __init__(self, timeout: float = 1.0):
         super().__init__(timeout)
         self._handle = None
+        self._event = None
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # Same reasoning as _setupapi_dll(): CreateFileW/CloseHandle return
         # or take a 64-bit HANDLE, which ctypes truncates to 32 bits without
@@ -760,14 +787,27 @@ class PanoramaPrint(_PanoramaBase):
         self._kernel32.CreateFileW.restype = wintypes.HANDLE
         self._kernel32.ReadFile.argtypes = [
             wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_OVERLAPPED)]
         self._kernel32.ReadFile.restype = wintypes.BOOL
         self._kernel32.WriteFile.argtypes = [
             wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_OVERLAPPED)]
         self._kernel32.WriteFile.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        self._kernel32.CreateEventW.restype = wintypes.HANDLE
+        self._kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+        self._kernel32.ResetEvent.restype = wintypes.BOOL
+        self._kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self._kernel32.GetOverlappedResult.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_OVERLAPPED),
+            ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        self._kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        self._kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(_OVERLAPPED)]
+        self._kernel32.CancelIoEx.restype = wintypes.BOOL
 
     def connect(self) -> bool:
         path = find_usbprint_path()
@@ -777,47 +817,83 @@ class PanoramaPrint(_PanoramaBase):
             return False
         handle = self._kernel32.CreateFileW(
             path, _GENERIC_READ | _GENERIC_WRITE,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING, 0, None)
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING,
+            _FILE_FLAG_OVERLAPPED, None)
         if handle is None or handle == _INVALID_HANDLE_VALUE:
             log.warning("CreateFileW failed on %s (gle=%d) - probably still open "
                         "elsewhere (KANALI's UDB.exe?)", path, ctypes.get_last_error())
             return False
+        event = self._kernel32.CreateEventW(None, True, False, None)  # manual-reset, initially unsignaled
+        if event is None:
+            log.warning("CreateEventW failed (gle=%d)", ctypes.get_last_error())
+            self._kernel32.CloseHandle(handle)
+            return False
         self._handle = handle
+        self._event = event
         return True
 
     def disconnect(self):
         if self._handle is not None:
             self._kernel32.CloseHandle(self._handle)
             self._handle = None
+        if self._event is not None:
+            self._kernel32.CloseHandle(self._event)
+            self._event = None
 
     @property
     def connected(self) -> bool:
         return self._handle is not None
 
-    def _write(self, frame: bytes):
-        written = wintypes.DWORD(0)
-        ok = self._kernel32.WriteFile(self._handle, frame, len(frame), ctypes.byref(written), None)
+    def _overlapped_call(self, io_func, buf, length: int, timeout_s: float) -> int:
+        """Issues one overlapped ReadFile/WriteFile call and waits for it to
+        complete or time out, returning the number of bytes transferred (0
+        on timeout). Cancels the operation itself on timeout, rather than
+        leaving it dangling on the handle."""
+        self._kernel32.ResetEvent(self._event)
+        ov = _OVERLAPPED()
+        ov.hEvent = self._event
+        ok = io_func(self._handle, buf, length, None, ctypes.byref(ov))
         if not ok:
-            raise PanoramaError(f"WriteFile failed (gle={ctypes.get_last_error()})")
+            err = ctypes.get_last_error()
+            if err != _ERROR_IO_PENDING:
+                raise PanoramaError(f"{io_func.__name__} failed (gle={err})")
+            wait_result = self._kernel32.WaitForSingleObject(
+                self._event, max(int(timeout_s * 1000), 1))
+            if wait_result == _WAIT_TIMEOUT:
+                self._kernel32.CancelIoEx(self._handle, ctypes.byref(ov))
+                # Still call GetOverlappedResult after cancelling - lets the
+                # cancellation actually complete and reports any bytes that
+                # made it through before the cancel took effect.
+                transferred = wintypes.DWORD(0)
+                self._kernel32.GetOverlappedResult(
+                    self._handle, ctypes.byref(ov), ctypes.byref(transferred), True)
+                return transferred.value
+            if wait_result != _WAIT_OBJECT_0:
+                raise PanoramaError(f"WaitForSingleObject returned {wait_result} (gle={ctypes.get_last_error()})")
+        transferred = wintypes.DWORD(0)
+        self._kernel32.GetOverlappedResult(
+            self._handle, ctypes.byref(ov), ctypes.byref(transferred), True)
+        return transferred.value
+
+    def _write(self, frame: bytes):
+        buf = ctypes.create_string_buffer(frame, len(frame))
+        transferred = self._overlapped_call(self._kernel32.WriteFile, buf, len(frame), self.timeout)
+        if transferred != len(frame):
+            raise PanoramaError(f"WriteFile only sent {transferred}/{len(frame)} bytes")
 
     def _read_frame(self, timeout_s: float) -> bytes:
         deadline = time.monotonic() + timeout_s
         buf = bytearray()
         chunk = ctypes.create_string_buffer(512)
-        read = wintypes.DWORD(0)
         while time.monotonic() < deadline:
-            ok = self._kernel32.ReadFile(self._handle, chunk, 512, ctypes.byref(read), None)
-            if ok and read.value:
-                buf += chunk.raw[:read.value]
+            remaining = max(deadline - time.monotonic(), 0.05)
+            transferred = self._overlapped_call(self._kernel32.ReadFile, chunk, 512, remaining)
+            if transferred:
+                buf += chunk.raw[:transferred]
                 if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
                     break
-            elif not ok:
-                # A synchronous ReadFile with nothing available typically
-                # just blocks rather than erroring on a real device; this
-                # branch is here mainly so a genuine I/O error doesn't spin
-                # silently for the full timeout.
-                log.debug("ReadFile returned an error (gle=%d)", ctypes.get_last_error())
-                break
+            else:
+                break  # timed out this round - nothing more coming within the deadline
         return bytes(buf)
 
 
