@@ -61,13 +61,20 @@ def _openrgb_groups():
     from openrgb import OpenRGBClient
     from openrgb.utils import DeviceType
     client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
-    for device in client.devices:
-        print(f"{device.name}  type={device.type}  leds={len(device.leds)}  "
-              f"modes={[m.name for m in device.modes]}")
+    devices = [d for d in client.devices if d is not None]
+    if len(devices) != len(client.devices):
+        print(f"({len(client.devices) - len(devices)} device(s) came back as None from "
+              "OpenRGB and were skipped - probably still settling after a restart)")
+    for device in devices:
+        try:
+            modes = [m.name for m in device.modes]
+        except Exception as exc:
+            modes = f"<error reading modes: {exc}>"
+        print(f"{device.name}  type={device.type}  leds={len(device.leds)}  modes={modes}")
     return {
-        "hub (fan LEDs)": [d for d in client.devices if "NZXT" in d.name],
-        "mobo": [d for d in client.devices if d.type == DeviceType.MOTHERBOARD],
-        "ram": [d for d in client.devices if d.type == DeviceType.DRAM],
+        "hub (fan LEDs)": [d for d in devices if "NZXT" in d.name],
+        "mobo": [d for d in devices if d.type == DeviceType.MOTHERBOARD],
+        "ram": [d for d in devices if d.type == DeviceType.DRAM],
     }
 
 
@@ -126,7 +133,7 @@ def verify_rgb():
     except ImportError:
         print("pip install openrgb-python")
         return
-    except Exception as exc:
+    except OSError as exc:
         print("Could not reach OpenRGB SDK server:", exc)
         return
 
