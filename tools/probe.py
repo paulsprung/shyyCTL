@@ -6,11 +6,15 @@ Close NZXT CAM first - it holds the HID handle open and liquidctl will not
 see the device while CAM is running.
 
 Usage:
-    python tools/probe.py hub       # NZXT Control Hub: list + status
-    python tools/probe.py identify  # map each fan/led channel to a physical unit
-    python tools/probe.py aura      # ASUS Aura LED Controller: mobo RGB headers
-    python tools/probe.py aio       # look for the Panorama pump as its own device
-    python tools/probe.py ram       # G.Skill RAM via a running OpenRGB (SDK server on)
+    python tools/probe.py hub    # NZXT Control Hub: list + status
+    python tools/probe.py verify # does control actually work? fans + fan LEDs, all at once
+    python tools/probe.py aura   # ASUS Aura LED Controller (mobo LED), all channels at once
+    python tools/probe.py aio    # look for the Panorama pump as its own device
+    python tools/probe.py ram    # G.Skill RAM via a running OpenRGB (SDK server on)
+
+None of this cares which physical fan/LED is which channel - that mapping
+happens later, in the webUI's own setup screen. This just confirms every
+piece of hardware actually responds to a command.
 
 Two liquidctl devices are now on this system (Control Hub + Aura) and both
 name their channels led1/led2/... - every call below is scoped with --match
@@ -44,10 +48,6 @@ def run(*args: str, match: str | None = None):
         print("stderr:", result.stderr.strip())
 
 
-def confirm(prompt: str) -> bool:
-    return input(f"{prompt} [y/N] ").strip().lower() == "y"
-
-
 FAN_CHANNELS = [f"fan{i}" for i in range(1, 6)]
 LED_CHANNELS = [f"led{i}" for i in range(1, 6)]
 
@@ -60,50 +60,42 @@ def probe_hub():
     print("\n=== Control Hub status ===")
     run("status", "--verbose", match=m)
 
-    print("\nRun 'python tools/probe.py identify' next to map each channel to a physical unit.")
+    print("\nRun 'python tools/probe.py verify' next to confirm control actually works.")
 
 
-def identify_hub():
-    """One channel at a time: fan to 0%, LED to green. Holds until you press Enter."""
+def verify_hub():
+    """All fan channels down together, all LED channels green together. One look, done."""
     m = "control hub"
 
-    print("=== fans: one stops, the rest keep spinning ===")
+    print("=== fans: all channels to 0% at once ===")
     for ch in FAN_CHANNELS:
         run("set", ch, "speed", "0", match=m)
-        input(f"{ch} at 0% now - note which physical fan stopped. Enter to restore + continue.")
+    input("Fans should be noticeably slower/off now. Enter to restore to 40%.")
+    for ch in FAN_CHANNELS:
         run("set", ch, "speed", "40", match=m)
 
-    print("\n=== LEDs: all off first, then one channel green at a time ===")
-    for ch in LED_CHANNELS:
-        run("set", ch, "color", "off", match=m)
+    print("\n=== fan LEDs: all channels to green at once ===")
     for ch in LED_CHANNELS:
         run("set", ch, "color", "fixed", "00ff00", match=m)
-        input(f"{ch} lit green now - note which physical unit that is. Enter to turn off + continue.")
+    input("Fan LEDs should be green now. Enter to turn off.")
+    for ch in LED_CHANNELS:
         run("set", ch, "color", "off", match=m)
 
-    print("\nSend back the fan->unit and led->unit mapping you noted.")
+    print("\nDid fans + fan LEDs both react? That's all this checks.")
 
 
 def probe_aura():
     m = "aura"
-    print("=== ASUS Aura LED Controller: mobo RGB headers ===")
-    print("led1 = 12V RGB header, led2-4 = 5V ARGB headers (per liquidctl's aura driver)")
+    print("=== ASUS Aura LED Controller (mobo LED) - all 4 channels at once ===")
     run("status", "--verbose", match=m)
 
-    if confirm("\nSet led1 (12V RGB header) to solid orange to confirm which header it is?"):
-        run("set", "led1", "color", "static", "ff6b3d", match=m)
-        input("Which physical header/strip lit up orange? Note it down, Enter to continue.")
+    for ch in ("led1", "led2", "led3", "led4"):
+        run("set", ch, "color", "static", "ff6b3d", match=m)
+    input("\nMobo LED should be solid orange now. Enter to turn off.")
+    for ch in ("led1", "led2", "led3", "led4"):
+        run("set", ch, "color", "off", match=m)
 
-    for ch in ("led2", "led3", "led4"):
-        if confirm(f"\nSet {ch} (a 5V ARGB header) to solid orange too?"):
-            run("set", ch, "color", "static", "ff6b3d", match=m)
-            input(f"Which header lit up for {ch}? Note it down, Enter to continue.")
-
-    if confirm("\nClear all four channels back to off?"):
-        for ch in ("led1", "led2", "led3", "led4"):
-            run("set", ch, "color", "off", match=m)
-
-    print("\nPaste the status output back, plus which physical header each channel turned out to be.")
+    print("\nDid the mobo LED react? That's all this checks.")
 
 
 def probe_aio():
@@ -122,6 +114,7 @@ def probe_aio():
 def probe_ram():
     try:
         from openrgb import OpenRGBClient
+        from openrgb.utils import RGBColor
     except ImportError:
         print("pip install openrgb-python")
         return
@@ -136,8 +129,19 @@ def probe_ram():
         for zone in device.zones:
             print(f"  zone: {zone.name}  leds={zone.leds_count}")
 
+    if not client.devices:
+        print("\nNo devices - is the RAM detected inside OpenRGB itself?")
+        return
+    for device in client.devices:
+        device.set_color(RGBColor(0, 255, 0))
+    input("\nRAM should be solid green now. Enter to turn off.")
+    for device in client.devices:
+        device.set_color(RGBColor(0, 0, 0))
 
-COMMANDS = {"hub": probe_hub, "identify": identify_hub, "aura": probe_aura,
+    print("\nDid the RAM react? That's all this checks.")
+
+
+COMMANDS = {"hub": probe_hub, "verify": verify_hub, "aura": probe_aura,
             "aio": probe_aio, "ram": probe_ram}
 
 if __name__ == "__main__":
