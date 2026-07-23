@@ -377,11 +377,19 @@ class OpenRgbRaw:
 
     @staticmethod
     def _skip_segment(r: _Reader, version: int):
+        # Confirmed against RGBController.cpp's GetSegmentDescriptionData:
+        # the matrix map + flags fields are gated on protocol >= 6, NOT >= 5
+        # (unlike the zone-level and controller-level flags, which really
+        # are >= 5). Getting this one wrong shifted every read after the
+        # first zone that had any segments.
         r.string()  # name
         r.i32()     # zone type
         r.u32()     # start_idx
         r.u32()     # leds_count
-        if version >= 5:
+        if version >= 6:
+            matrix_size = r.u16()
+            if matrix_size:
+                r.read(matrix_size)
             r.u32()  # segment flags
 
     # -- control -----------------------------------------------------------
