@@ -122,8 +122,13 @@ class Hub:
     def _run(self, *args: str, match: str | None = None) -> str | None:
         cmd = ["liquidctl"] + (["-m", match] if match else []) + list(args)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=30, env=_ENV)
+            # encoding="utf-8" explicitly, not just text=True: the child is
+            # forced to write utf-8 via PYTHONIOENCODING below, but without
+            # this the parent decodes its stdout using the platform default
+            # (cp1252 on Windows) and mangles every box-drawing character,
+            # which then breaks every downstream regex silently.
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                     errors="replace", timeout=30, env=_ENV)
         except FileNotFoundError:
             log.error("liquidctl not found on PATH")
             return None

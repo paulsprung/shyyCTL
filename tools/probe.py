@@ -49,7 +49,11 @@ def run(*args: str, match: str | None = None):
     full = (["-m", match] if match else []) + list(args)
     print(f"\n$ liquidctl {' '.join(full)}")
     try:
-        result = subprocess.run(["liquidctl", *full], capture_output=True, text=True,
+        # encoding="utf-8" explicitly - text=True alone decodes the child's
+        # stdout with the platform default (cp1252 on Windows), mangling the
+        # box-drawing characters the child was just forced to write as utf-8.
+        result = subprocess.run(["liquidctl", *full], capture_output=True,
+                                 encoding="utf-8", errors="replace",
                                  timeout=30, env=_ENV)
     except FileNotFoundError:
         print("liquidctl not found on PATH - pip install liquidctl")
