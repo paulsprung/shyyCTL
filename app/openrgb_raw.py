@@ -64,8 +64,35 @@ PKT_RGBCONTROLLER_UPDATEMODE = 1101
 PROTOCOL_VERSION = 5  # what we ask for; server may negotiate us down
 
 
+def hex_window(data: bytes, around: int, before: int = 96, after: int = 64) -> str:
+    """A small, pasteable hex+ascii dump centred on a byte offset - for
+    reporting exactly where parsing broke down without dumping the whole
+    (often multi-KB) payload."""
+    start = max(0, around - before)
+    end = min(len(data), around + after)
+    lines = []
+    for row in range(start - start % 16, end, 16):
+        chunk = data[row:row + 16]
+        hexed = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        marker = " <== failure here" if row <= around < row + 16 else ""
+        lines.append(f"{row:6d}: {hexed:<48} {asc}{marker}")
+    return "\n".join(lines)
+
+
 class OpenRgbRawError(Exception):
     pass
+
+
+class ReadOverrunError(OpenRgbRawError):
+    """Raised with enough context (the full payload + where reading broke
+    down) to print a hex dump around the failure point for debugging,
+    instead of just a message."""
+
+    def __init__(self, message: str, data: bytes, offset: int):
+        super().__init__(message)
+        self.data = data
+        self.offset = offset
 
 
 @dataclass
@@ -122,9 +149,10 @@ class _Reader:
 
     def read(self, n: int) -> bytes:
         if self.pos + n > len(self.data):
-            raise OpenRgbRawError(
+            raise ReadOverrunError(
                 f"tried to read {n} bytes at offset {self.pos} with only "
-                f"{self.bytes_left()} left ({len(self.data)} total)")
+                f"{self.bytes_left()} left ({len(self.data)} total)",
+                self.data, self.pos)
         chunk = self.data[self.pos:self.pos + n]
         self.pos += n
         return chunk
@@ -221,7 +249,11 @@ class OpenRgbRaw:
     def controller_data(self, index: int) -> ControllerInfo:
         self._send(index, PKT_REQUEST_CONTROLLER_DATA, struct.pack("I", self.negotiated_version))
         _, _, payload = self._recv()
-        return self._parse_controller(index, payload)
+        try:
+            return self._parse_controller(index, payload)
+        except ReadOverrunError as exc:
+            log.error("controller #%d: %s\n%s", index, exc, hex_window(exc.data, exc.offset))
+            raise
 
     def all_controllers(self) -> list[ControllerInfo]:
         controllers = []
