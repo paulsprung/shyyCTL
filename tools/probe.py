@@ -104,13 +104,20 @@ def _ensure_sized(devices, counts=None, default=40):
     i = 0
     for device in devices:
         for zone in device.zones:
-            if len(zone.leds) == 0:
-                size = counts[i] if counts and i < len(counts) else default
-                i += 1
-                try:
-                    zone.resize(size)
-                except Exception as exc:
-                    print(f"  could not resize zone {zone.name}: {exc}")
+            before = len(zone.leds)
+            if before != 0:
+                print(f"  zone '{zone.name}' already has {before} LEDs, leaving as is")
+                continue
+            size = counts[i] if counts and i < len(counts) else default
+            i += 1
+            try:
+                zone.resize(size)
+            except Exception as exc:
+                print(f"  resize FAILED on zone '{zone.name}' (requested {size}): {exc}")
+                continue
+            after = len(zone.leds)
+            print(f"  zone '{zone.name}': resize({size}) called, now reports {after} LEDs"
+                  + ("" if after else "  <- still 0, resize had no effect"))
 
 
 def verify_rgb():
