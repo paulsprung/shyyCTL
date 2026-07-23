@@ -24,6 +24,7 @@ Usage:
     python tools/probe.py all     # fans, then hubrgb, then mobo, then ramrgb
     python tools/probe.py hub     # liquidctl list/status/initialize - info only
     python tools/probe.py aio     # look for the Panorama pump as its own liquidctl device
+    python tools/probe.py conflicts  # processes/services that might be fighting over lighting
 """
 
 import os
@@ -158,13 +159,25 @@ def _verify_openrgb(label, devices):
         for device in devices:
             device.set_color(RGBColor(*color))
         time.sleep(SETTLE)
+        for device in devices:
+            active = device.modes[device.active_mode].name if device.modes else "?"
+            print(f"  {device.name}: active mode right after this write is '{active}'")
 
     print(f"\n=== {label}: off, then orange, then off ===")
     set_static((0, 0, 0))
     input(f"{label} should be off now. Enter to light it up.")
     set_static(ORANGE_RGB)
-    input(f"{label} should be solid orange now (Static mode - stays even if you close "
-          "OpenRGB/this script). Enter to turn off + continue.")
+    print("  waiting 4s, then re-checking the mode - if it changed on its own, "
+          "something else is overwriting this (see 'python tools/probe.py conflicts')")
+    time.sleep(4)
+    for device in devices:
+        try:
+            active = device.modes[device.active_mode].name if device.modes else "?"
+        except Exception as exc:
+            active = f"<could not re-read: {exc}>"
+        print(f"  {device.name}: mode after the wait is '{active}'")
+    input(f"{label} - still solid orange, or did it change/blink off on its own? "
+          "Enter to turn off + continue.")
     set_static((0, 0, 0))
 
 
@@ -190,6 +203,43 @@ def verify_ram_rgb():
         print("Could not reach OpenRGB SDK server:", exc)
         return
     _verify_openrgb("ram", devices)
+
+
+SUSPECT_KEYWORDS = [
+    "cam", "armoury", "aura", "lighting", "icue", "corsair", "mystic",
+    "signalrgb", "fanxpert", "aisuite", "kanali",
+]
+
+
+def check_conflicts():
+    """Anything below marked Running is a candidate for fighting over who
+    controls the lighting - close the process / stop the service, then
+    retest. A blink-then-revert-to-off pattern is the classic symptom."""
+    print("=== running processes matching known RGB/lighting software ===")
+    try:
+        result = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                                 capture_output=True, text=True, timeout=15)
+        hits = [line for line in result.stdout.splitlines()
+                if any(k in line.lower() for k in SUSPECT_KEYWORDS)]
+        print("\n".join(hits) if hits else "  none of the known suspects found running.")
+    except Exception as exc:
+        print("Could not list processes:", exc)
+
+    print("\n=== Windows services matching the same list ===")
+    pattern = "|".join(SUSPECT_KEYWORDS)
+    ps_cmd = (
+        f"Get-Service | Where-Object {{ $_.DisplayName -match '{pattern}' -or "
+        f"$_.Name -match '{pattern}' }} | Select-Object Name,DisplayName,Status,StartType "
+        "| Format-Table -AutoSize"
+    )
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                                 capture_output=True, text=True, timeout=20, env=_ENV)
+        print(result.stdout.strip() or "  (no matching services)")
+        if result.stderr.strip():
+            print("stderr:", result.stderr.strip())
+    except Exception as exc:
+        print("Could not query services:", exc)
 
 
 def verify_all():
@@ -224,7 +274,7 @@ def probe_aio():
 
 COMMANDS = {"fans": verify_fans, "hubrgb": verify_hub_rgb, "debug1": debug_channel1,
             "mobo": verify_mobo, "ramrgb": verify_ram_rgb, "all": verify_all,
-            "hub": probe_hub, "aio": probe_aio}
+            "hub": probe_hub, "aio": probe_aio, "conflicts": check_conflicts}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
