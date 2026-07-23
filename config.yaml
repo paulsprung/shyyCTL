@@ -10,11 +10,12 @@ hub:
 openrgb:
   host: "127.0.0.1"
   port: 6742
-  # Diagnostic: openrgb-python was seen negotiating protocol 4 while OpenRGB
-  # itself advertises 5 (SDK Client tab). Forcing 5 here to test whether
-  # that's why the hub's device data fails to parse. Remove this key to go
-  # back to auto-negotiation once that's settled.
-  protocol_version: 5
+  # Confirmed this session: openrgb-python 0.3.6 (and its current GitHub
+  # master) hard-caps at protocol 4 - forcing 5 makes it refuse to connect
+  # at all ("Requested protocol version 5 is greater than maximum supported
+  # version 4"). Leave this unset/at auto. The hub's device data still fails
+  # to parse under v4 - that's a client-library limitation to work around
+  # elsewhere, not something a config value fixes.
 
 sensors:
   librehardwaremonitor_url: "http://127.0.0.1:8085/data.json"
