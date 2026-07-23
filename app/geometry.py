@@ -22,9 +22,22 @@ approximate preview on that model.
 Because the per-gap density isn't the same across models, LED count no
 longer safely inverts to a fan count for an arbitrary total (see
 `fans_from_leds`) - only exact-match lookup against a known model is safe.
-This matters less than it used to: this project's hub can't report an LED
-count at all (see scan.py), so the model is always chosen by a human during
-setup, never inferred from a scanned number.
+
+The hub can't report an LED count directly (see scan.py) - but it does
+report a raw numeric accessory ID per channel via liquidctl's Python API
+(hub.accessory_ids(); the CLI discards this, only printing "Unknown" since
+these IDs aren't in liquidctl's Hue2Accessory name table yet). Confirmed
+against real hardware this session:
+
+    0x20 (32)  ->  F120X  (1 fan,  16 LEDs)
+    0x22 (34)  ->  F240X  (2 fans, 24 LEDs)
+    0x24 (36)  ->  F360X  (3 fans, 36 LEDs)
+
+Sequential IDs, +2 per additional fan in the frame - looks like NZXT's own
+internal model numbering, not something coincidental. This makes automatic
+per-channel model detection possible via `identify_by_accessory_id()`,
+without asking a human every time - falling back to manual model choice
+in the setup screen only for an ID that isn't in this table yet.
 
 UNVERIFIED: whether the strip is one continuous loop or has breaks. The setup
 screen's LED walk answers that empirically instead of guessing from a product
@@ -49,15 +62,19 @@ class Model:
     # False means the cap/side split below is inferred from the confirmed
     # total, not independently walked on real hardware for this model.
     geometry_walked: bool = True
+    # Raw accessory ID from hub.accessory_ids() - None until confirmed
+    # against real hardware for that model (see module docstring).
+    accessory_id: int | None = None
 
 
 MODELS = (
-    Model("F120X", 1, 16, 120, False),
-    Model("F240X", 2, 24, 240, True),
-    Model("F360X", 3, 36, 360, True, geometry_walked=False),
+    Model("F120X", 1, 16, 120, False, accessory_id=0x20),
+    Model("F240X", 2, 24, 240, True, accessory_id=0x22),
+    Model("F360X", 3, 36, 360, True, geometry_walked=False, accessory_id=0x24),
 )
 
 BY_LEDS = {m.leds: m for m in MODELS}
+BY_ACCESSORY_ID = {m.accessory_id: m for m in MODELS if m.accessory_id is not None}
 
 
 def _side_leds_per_gap(model: Model) -> int:
@@ -83,6 +100,14 @@ def fans_from_leds(leds: int) -> int | None:
 def identify(leds: int) -> Model | None:
     """Map a reported LED count onto a known model."""
     return BY_LEDS.get(leds)
+
+
+def identify_by_accessory_id(accessory_id: int) -> Model | None:
+    """Map the hub's raw per-channel accessory ID onto a known model - the
+    actual auto-detection path, since the hub never reports an LED count
+    directly. Returns None for an ID not yet in the table, which should
+    fall back to asking the human once (and is worth adding here afterwards)."""
+    return BY_ACCESSORY_ID.get(accessory_id)
 
 
 def expected_leds(fans: int) -> int | None:

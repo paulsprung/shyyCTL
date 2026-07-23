@@ -7,14 +7,16 @@ none of that is guessable from software and is left for the human via the
 webUI's setup screen.
 
 Confirmed against real hardware, not assumed: this hub's LED channel count
-can't be read automatically. liquidctl's 'initialize' only ever reports
-"Unknown" for accessory type (never a number), and OpenRGB's zones start at
-0 LEDs with no auto-detected size either. So unlike the fan side (which the
-tach probe below determines directly), LED count is never guessed here -
-every populated LED channel comes back with confidence "unknown" and a
-"needs" entry asking the setup screen to let the user pick the real fan
-model. Only once that's known should anything call
-OpenRGBridge.resize_zone with a real, geometry-derived count.
+can't be read via liquidctl's CLI or OpenRGB - the CLI's 'initialize' only
+ever prints "Unknown" for accessory type, and OpenRGB's zones start at 0
+LEDs with no auto-detected size either. The CLI's "Unknown" turned out to
+be a labelling gap, not a missing measurement though: the hub does report a
+real numeric accessory ID per channel (hub.accessory_ids(), via liquidctl's
+Python API), and this session found the actual IDs used by the X-series
+fans (see geometry.ACCESSORY-related lookups). Where that ID is recognised,
+the model and LED count are certain, straight from hardware - no picking
+required. An unrecognised ID still falls back to confidence "unknown" and
+asks the setup screen for a manual pick, same as before.
 
 Runs in a background thread and reports progress, because the fan probing
 needs real settling time and the UI should show what is happening.
@@ -23,6 +25,8 @@ needs real settling time and the UI should show what is happening.
 import logging
 import threading
 import time
+
+from . import geometry
 
 log = logging.getLogger("scan")
 
@@ -111,12 +115,18 @@ class Scan:
         self.step = f"Reading channel list ({len(fans)} fan, {len(leds)} led)"
         self.progress = 0.06
 
+        try:
+            accessory_ids = self.hub.accessory_ids()
+        except Exception as exc:
+            log.warning("Could not read accessory IDs (falling back to manual model pick): %s", exc)
+            accessory_ids = {}
+
         total = len(fans)
         for index, channel in enumerate(fans):
             if self._cancel.is_set():
                 return
             base = 0.08 + 0.62 * (index / total)
-            entry = self._probe_channel(channel, measure_curves, base, 0.62 / total)
+            entry = self._probe_channel(channel, measure_curves, base, 0.62 / total, accessory_ids)
             self.results.append(entry)
 
         self.step = "Checking motherboard and RAM lighting"
@@ -126,20 +136,25 @@ class Scan:
         self.step = "Done"
         self.progress = 1.0
 
-    def _probe_channel(self, channel, measure_curves, base, budget) -> dict:
+    def _probe_channel(self, channel, measure_curves, base, budget, accessory_ids) -> dict:
         number = channel[3:] if channel.startswith("fan") else None
         led_channel = f"led{number}" if number else None
         has_led = led_channel in self.hub.channels.get("led", [])
 
+        model = None
+        if has_led and led_channel in accessory_ids:
+            model = geometry.identify_by_accessory_id(accessory_ids[led_channel])
+
         entry = {
             "fan_channel": channel,
             "led_channel": led_channel if has_led else None,
-            "leds": None,
+            "leds": model.leds if model else None,
+            "model": model.name if model else None,
             "present": False,
             "start_duty": None,
             "max_rpm": None,
             "rpm_at_probe": None,
-            "confidence": "unknown" if has_led else "none",
+            "confidence": "certain" if model else ("unknown" if has_led else "none"),
             "needs": [],
         }
 
@@ -167,11 +182,14 @@ class Scan:
 
         entry["present"] = True
 
-        if has_led:
+        if has_led and not model:
+            raw_id = accessory_ids.get(led_channel)
             entry["needs"].append(
-                "LED count can't be auto-detected on this hub - pick the fan "
-                "model in setup so the real count can be sent to OpenRGB")
-        else:
+                f"unrecognised accessory id {raw_id!r} - pick the fan model in "
+                "setup so the real count can be sent to OpenRGB" if raw_id is not None
+                else "LED count can't be auto-detected on this hub - pick the fan "
+                     "model in setup so the real count can be sent to OpenRGB")
+        elif not has_led:
             entry["needs"].append("hub did not detect an LED accessory on this channel")
 
         # 2. Curve measurement.
