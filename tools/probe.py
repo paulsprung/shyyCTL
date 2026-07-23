@@ -206,8 +206,9 @@ def verify_ram_rgb():
 
 
 SUSPECT_KEYWORDS = [
-    "cam", "armoury", "aura", "lighting", "icue", "corsair", "mystic",
-    "signalrgb", "fanxpert", "aisuite", "kanali",
+    "nzxt", "armoury crate", "auracreator", "lightingservice",
+    "icue", "corsair", "mysticlight", "signalrgb", "fanxpert",
+    "ai suite", "kanali",
 ]
 
 
