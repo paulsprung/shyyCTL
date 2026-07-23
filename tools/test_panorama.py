@@ -46,6 +46,33 @@ def panel() -> Panorama:
     return _panel
 
 
+def test_list_ports():
+    import serial.tools.list_ports
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports detected at all - Windows may not have a driver "
+              "for the panel (check Device Manager > Ports (COM & LPT); if it's "
+              "sitting under 'Other devices' with a warning icon instead, that's "
+              "the problem, not this script).")
+        return
+    for p in ports:
+        print(f"  {p.device}: {p.description}  (hwid={p.hwid})")
+
+
+def test_handshake_on_port():
+    port_name = input("COM port to test directly (e.g. COM5): ").strip()
+    p = Panorama(port_name)
+    if not p.connect():
+        print("Could not open that port.")
+        return
+    try:
+        print("Sending handshake...")
+        info = p.handshake()
+        print("Result:", info if info is not None else "no/invalid response")
+    finally:
+        p.disconnect()
+
+
 def test_find():
     p = panel()
     print("Connected:", p.connected, "on", p.port_name)
@@ -114,6 +141,8 @@ MENU = {
     "3": ("Brightness sweep (20 -> 100 -> 60)", test_brightness),
     "4": ("List media on the panel (via adb)", test_media_list),
     "5": ("Upload an image and set it as the default/boot screen", test_set_default_image),
+    "6": ("List every serial port Windows/pyserial can see (no handshake)", test_list_ports),
+    "7": ("Handshake on a specific COM port you name", test_handshake_on_port),
 }
 
 if __name__ == "__main__":
