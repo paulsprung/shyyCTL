@@ -309,26 +309,43 @@ class OpenRgbRaw:
         r.string()  # serial
         r.string()  # location
 
+        log.debug("[%s] name=%r pos=%d after metadata", index, name, r.pos)
         num_modes = r.u16()
         active_mode = r.i32()
-        modes = [self._parse_mode(r, version, i) for i in range(num_modes)]
+        log.debug("[%s] num_modes=%d active_mode=%d pos=%d", index, num_modes, active_mode, r.pos)
+        modes = []
+        for i in range(num_modes):
+            mode = self._parse_mode(r, version, i)
+            log.debug("[%s]   mode %d: name=%r flags=%d colors=%d pos=%d",
+                      index, i, mode.name, mode.flags, len(mode.colors), r.pos)
+            modes.append(mode)
 
         num_zones = r.u16()
-        zones = [self._parse_zone(r, version, i) for i in range(num_zones)]
+        log.debug("[%s] num_zones=%d pos=%d", index, num_zones, r.pos)
+        zones = []
+        for i in range(num_zones):
+            zone = self._parse_zone(r, version, i)
+            log.debug("[%s]   zone %d: name=%r leds_count=%d pos=%d",
+                      index, i, zone.name, zone.leds_count, r.pos)
+            zones.append(zone)
 
         num_leds = r.u16()
+        log.debug("[%s] num_leds=%d pos=%d payload_len=%d", index, num_leds, r.pos, len(payload))
         for _ in range(num_leds):
             self._skip_led(r, version)
 
         num_colors = r.u16()
+        log.debug("[%s] num_colors=%d pos=%d", index, num_colors, r.pos)
         for _ in range(num_colors):
             r.rgbcolor()
 
         if version >= 5:
             num_led_names = r.u16()
+            log.debug("[%s] num_led_names=%d pos=%d", index, num_led_names, r.pos)
             for _ in range(num_led_names):
                 r.string()
             r.u32()  # controller flags
+        log.debug("[%s] finished at pos=%d of %d", index, r.pos, len(payload))
 
         return ControllerInfo(index, name, device_type, zones, num_leds, modes, active_mode)
 
