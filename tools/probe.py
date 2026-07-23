@@ -1,24 +1,19 @@
 """Manual hardware probe - no shyyctl app involved, just liquidctl/OpenRGB directly.
 
-Run this against the real hardware before building anything on top of it. It
-only runs commands and prints what comes back; it does not decide anything.
-Close NZXT CAM first - it holds the HID handle open and liquidctl will not
-see the device while CAM is running.
+liquidctl's Control Hub LED driver has a confirmed bug (channel 1 doesn't
+apply colour even though OpenRGB's independent driver reaches it fine), so
+RGB now goes exclusively through OpenRGB - for the hub's own LEDs too, not
+just RAM/mobo. liquidctl is only used here for fan speed.
+
+Close NZXT CAM and Armoury Crate/Aura Creator first - they hold devices open
+or fight over who's driving the lighting.
 
 Usage:
-    python tools/probe.py hub    # NZXT Control Hub: list + status
-    python tools/probe.py verify # does control actually work? fans + fan LEDs, all at once
-    python tools/probe.py aura   # ASUS Aura LED Controller (mobo LED), all channels at once
-    python tools/probe.py aio    # look for the Panorama pump as its own device
-    python tools/probe.py ram    # G.Skill RAM via a running OpenRGB (SDK server on)
-
-None of this cares which physical fan/LED is which channel - that mapping
-happens later, in the webUI's own setup screen. This just confirms every
-piece of hardware actually responds to a command.
-
-Two liquidctl devices are now on this system (Control Hub + Aura) and both
-name their channels led1/led2/... - every call below is scoped with --match
-so liquidctl never has to guess which device a channel name belongs to.
+    python tools/probe.py fans   # each fan channel off, one at a time
+    python tools/probe.py rgb    # hub LEDs, mobo, RAM - each off/orange/off in turn
+    python tools/probe.py all    # fans then rgb
+    python tools/probe.py hub    # liquidctl list/status/initialize - info only
+    python tools/probe.py aio    # look for the Panorama pump as its own liquidctl device
 """
 
 import os
@@ -29,6 +24,9 @@ import sys
 # characters liquidctl's human-readable output uses. Forcing the child
 # process's own stdout to utf-8 avoids it crashing mid-print.
 _ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+FAN_CHANNELS = [f"fan{i}" for i in range(1, 6)]
+ORANGE = (255, 107, 61)
 
 
 def run(*args: str, match: str | None = None):
@@ -48,57 +46,78 @@ def run(*args: str, match: str | None = None):
         print("stderr:", result.stderr.strip())
 
 
-FAN_CHANNELS = [f"fan{i}" for i in range(1, 6)]
-LED_CHANNELS = [f"led{i}" for i in range(1, 6)]
+def verify_fans():
+    m = "control hub"
+    print("=== fans: one channel at a time ===")
+    for ch in FAN_CHANNELS:
+        run("set", ch, "speed", "0", match=m)
+        input(f"{ch} at 0% now - note whether it stopped (or was already empty). Enter to restore.")
+        run("set", ch, "speed", "40", match=m)
+
+
+def _openrgb_groups():
+    from openrgb import OpenRGBClient
+    from openrgb.utils import DeviceType
+    client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
+    for device in client.devices:
+        print(f"{device.name}  type={device.type}  leds={len(device.leds)}  "
+              f"modes={[m.name for m in device.modes]}")
+    return {
+        "hub (fan LEDs)": [d for d in client.devices if "NZXT" in d.name],
+        "mobo": [d for d in client.devices if d.type == DeviceType.MOTHERBOARD],
+        "ram": [d for d in client.devices if d.type == DeviceType.DRAM],
+    }
+
+
+def _set_static(devices, color):
+    from openrgb.utils import RGBColor
+    for device in devices:
+        for i, mode in enumerate(device.modes):
+            if mode.name.lower() == "static":
+                device.set_mode(i)
+                break
+    for device in devices:
+        device.set_color(RGBColor(*color))
+
+
+def verify_rgb():
+    try:
+        groups = _openrgb_groups()
+    except ImportError:
+        print("pip install openrgb-python")
+        return
+    except Exception as exc:
+        print("Could not reach OpenRGB SDK server:", exc)
+        return
+
+    for label, devices in groups.items():
+        if not devices:
+            print(f"\n{label}: nothing found in OpenRGB.")
+            continue
+        print(f"\n=== {label}: off, then orange, then off ===")
+        _set_static(devices, (0, 0, 0))
+        input(f"{label} should be off now. Enter to light it up.")
+        _set_static(devices, ORANGE)
+        input(f"{label} should be solid orange now (Static mode - stays even if you close "
+              "OpenRGB/this script). Enter to turn off + continue.")
+        _set_static(devices, (0, 0, 0))
+
+    print("\nWhich of the three groups actually reacted?")
+
+
+def verify_all():
+    verify_fans()
+    verify_rgb()
 
 
 def probe_hub():
     m = "control hub"
     print("=== everything liquidctl can see ===")
     run("list", "--verbose")
-
     print("\n=== Control Hub status ===")
     run("status", "--verbose", match=m)
-
     print("\n=== LED/accessory detection (status can't show this - write-only) ===")
     run("initialize", match=m)
-
-    print("\nRun 'python tools/probe.py verify' next to confirm control actually works.")
-
-
-def verify_hub():
-    """All fan channels down together, all LED channels green together. One look, done."""
-    m = "control hub"
-
-    print("=== fans: all channels to 0% at once ===")
-    for ch in FAN_CHANNELS:
-        run("set", ch, "speed", "0", match=m)
-    input("Fans should be noticeably slower/off now. Enter to restore to 40%.")
-    for ch in FAN_CHANNELS:
-        run("set", ch, "speed", "40", match=m)
-
-    print("\n=== fan LEDs: all channels to green at once ===")
-    for ch in LED_CHANNELS:
-        run("set", ch, "color", "fixed", "00ff00", match=m)
-    input("Fan LEDs should be green now. Enter to turn off.")
-    for ch in LED_CHANNELS:
-        run("set", ch, "color", "off", match=m)
-
-    print("\nDid fans + fan LEDs both react? That's all this checks.")
-
-
-def probe_aura():
-    m = "aura"
-    print("=== ASUS Aura LED Controller (mobo LED) - all 4 channels at once ===")
-    run("status", "--verbose", match=m)
-
-    for ch in ("led1", "led2", "led3", "led4"):
-        run("set", ch, "color", "static", "ff6b3d", match=m)
-    input("\nMobo LED should be solid orange now. Enter to turn off.")
-    for ch in ("led1", "led2", "led3", "led4"):
-        run("set", ch, "color", "off", match=m)
-
-    print("\nDid the mobo LED react? That's all this checks.")
 
 
 def probe_aio():
@@ -114,49 +133,8 @@ def probe_aio():
     )
 
 
-def probe_ram():
-    try:
-        from openrgb import OpenRGBClient
-        from openrgb.utils import RGBColor, DeviceType
-    except ImportError:
-        print("pip install openrgb-python")
-        return
-    print("Requires OpenRGB running with SDK Server enabled (Settings > SDK Server, port 6742).")
-    try:
-        client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
-    except Exception as exc:
-        print("Could not reach OpenRGB SDK server:", exc)
-        return
-    for device in client.devices:
-        print(f"\n{device.name}  type={device.type}  leds={len(device.leds)}"
-              f"  modes={[m.name for m in device.modes]}  active={device.active_mode}")
-        for zone in device.zones:
-            print(f"  zone: {zone.name}  leds={len(zone.leds)}")
-
-    ram = [d for d in client.devices if d.type == DeviceType.DRAM]
-    if not ram:
-        print("\nNo DRAM devices among the above - is the RAM detected inside OpenRGB itself?")
-        return
-
-    # set_color is a no-op on some devices unless they're already in Direct
-    # mode - a static/effect mode just ignores externally pushed colours.
-    for device in ram:
-        for i, mode in enumerate(device.modes):
-            if mode.name.lower() == "direct":
-                device.set_mode(i)
-                break
-
-    for device in ram:
-        device.set_color(RGBColor(0, 255, 0))
-    input(f"\nOnly the {len(ram)} RAM stick(s) should be green now - keyboard/mobo untouched. Enter to turn off.")
-    for device in ram:
-        device.set_color(RGBColor(0, 0, 0))
-
-    print("\nDid just the RAM react this time?")
-
-
-COMMANDS = {"hub": probe_hub, "verify": verify_hub, "aura": probe_aura,
-            "aio": probe_aio, "ram": probe_ram}
+COMMANDS = {"fans": verify_fans, "rgb": verify_rgb, "all": verify_all,
+            "hub": probe_hub, "aio": probe_aio}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
