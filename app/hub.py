@@ -11,8 +11,12 @@ Facts confirmed against real hardware, not assumptions:
 - 'initialize' must run once per power-on before fan control or lighting is
   reliable (this is documented liquidctl behaviour for the whole NZXT Smart
   Device family, not specific to this hub).
-- 'initialize's accessory detection reports "Unknown", never an LED count -
-  it's only useful here to learn which LED channels have anything at all.
+- 'initialize's accessory detection reports "Unknown" via the CLI, never an
+  LED count - the CLI only prints Hue2Accessory's name, and this hub's
+  F120X/F240X/F360X units use IDs liquidctl doesn't have names for yet.
+  The raw numeric ID is still there via the Python API (accessory_ids()) -
+  once a real ID is matched to a model by hand, it's a genuine
+  auto-detection key, not a permanent dead end.
 - super-fixed (per-LED colour) is NOT supported by this driver's mode list:
   only off / fixed / fading / spectrum-wave / covering-marquee /
   super-rainbow - all whole-channel firmware effects, all persist after
@@ -116,6 +120,39 @@ class Hub:
         only isolate a whole channel, never a single LED within one."""
         for ch in self.channels.get("led", []):
             self.set_color(ch, "fixed", ["ff0000"] if ch == except_channel else ["000000"])
+
+    # -- accessory identification -------------------------------------------
+
+    def accessory_ids(self) -> dict[str, int]:
+        """Real numeric accessory ID per populated LED channel, straight
+        from liquidctl's Python API rather than the CLI.
+
+        The CLI only ever prints Hue2Accessory's *name* ('Unknown' for any
+        ID not in its table - confirmed this is exactly what our F120X/
+        F240X/F360X units hit, since liquidctl's known IDs are for older
+        RGB/RGB Core fans, not the X series). The underlying numeric ID is
+        still read from the hardware and is model-specific - once a real ID
+        here is matched to a known fan (once, by hand, via Identify), every
+        future scan can recognise that same model automatically, without
+        asking again. This is the actual auto-detection path; the CLI never
+        exposed the piece needed for it.
+        """
+        from liquidctl.driver.control_hub import ControlHub
+
+        ids: dict[str, int] = {}
+        for device in ControlHub.find_supported_devices():
+            if self.match.lower() not in device.description.lower():
+                continue
+            device.connect()
+            try:
+                for key, value, _unit in device.initialize():
+                    found = re.match(r"LED (\d+) accessory 1$", key)
+                    if found:
+                        ids[f"led{found.group(1)}"] = getattr(value, "value", value)
+            finally:
+                device.disconnect()
+            break
+        return ids
 
     # -- internals -----------------------------------------------------
 

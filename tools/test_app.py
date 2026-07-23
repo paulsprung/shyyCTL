@@ -71,6 +71,23 @@ def test_fans():
         print(f"{ch} rpm ->", h.rpm(ch))
 
 
+def test_accessory_ids():
+    h = hub()
+    try:
+        ids = h.accessory_ids()
+    except ImportError as exc:
+        print("Needs liquidctl's Python package importable (not just the CLI on PATH):", exc)
+        return
+    if not ids:
+        print("No accessory IDs read - is the hub connected and initialized?")
+        return
+    for channel, raw_id in ids.items():
+        print(f"  {channel}: raw accessory id = {raw_id} (0x{raw_id:02x})")
+    print("\nNote which channel is which real fan model (F120X/F240X/F360X) - "
+          "once we have that mapping we can teach geometry.py to recognise "
+          "these IDs automatically.")
+
+
 def test_scan():
     h = hub()
     r = rgb()
@@ -198,6 +215,7 @@ MENU = {
     "5": ("Motherboard via OpenRGB", test_mobo),
     "6": ("RAM via OpenRGB", test_ram),
     "7": ("Hub LEDs via our own protocol-5 client (real sizes, no manual config)", test_hub_leds_raw),
+    "8": ("Raw accessory IDs via liquidctl's Python API (for real model auto-detection)", test_accessory_ids),
 }
 
 if __name__ == "__main__":
