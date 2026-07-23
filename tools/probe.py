@@ -125,20 +125,30 @@ def probe_ram():
         print("Could not reach OpenRGB SDK server:", exc)
         return
     for device in client.devices:
-        print(f"\n{device.name}  type={device.type}  leds={len(device.leds)}")
+        print(f"\n{device.name}  type={device.type}  leds={len(device.leds)}"
+              f"  modes={[m.name for m in device.modes]}  active={device.active_mode}")
         for zone in device.zones:
             print(f"  zone: {zone.name}  leds={len(zone.leds)}")
 
     if not client.devices:
         print("\nNo devices - is the RAM detected inside OpenRGB itself?")
         return
+
+    # set_color is a no-op on some devices unless they're already in Direct
+    # mode - a static/effect mode just ignores externally pushed colours.
+    for device in client.devices:
+        for i, mode in enumerate(device.modes):
+            if mode.name.lower() == "direct":
+                device.set_mode(i)
+                break
+
     for device in client.devices:
         device.set_color(RGBColor(0, 255, 0))
-    input("\nRAM should be solid green now. Enter to turn off.")
+    input("\nEverything should be solid green now (RAM, mobo, anything else OpenRGB found). Enter to turn off.")
     for device in client.devices:
         device.set_color(RGBColor(0, 0, 0))
 
-    print("\nDid the RAM react? That's all this checks.")
+    print("\nWhich of the listed devices actually reacted?")
 
 
 COMMANDS = {"hub": probe_hub, "verify": verify_hub, "aura": probe_aura,
