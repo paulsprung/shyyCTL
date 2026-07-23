@@ -9,17 +9,21 @@ Close NZXT CAM and Armoury Crate/Aura Creator first - they hold devices open
 or fight over who's driving the lighting.
 
 Usage:
-    python tools/probe.py fans   # each fan channel off, one at a time
-    python tools/probe.py rgb    # hub LEDs, mobo, RAM - each off/orange/off in turn
-    python tools/probe.py all    # fans then rgb
-    python tools/probe.py hub    # liquidctl list/status/initialize - info only
-    python tools/probe.py aio    # look for the Panorama pump as its own liquidctl device
+    python tools/probe.py fans    # each fan channel off, one at a time
+    python tools/probe.py rgb     # hub LEDs, mobo, RAM - each off/orange/off, one group at a time
+    python tools/probe.py hubrgb  # just the hub's LEDs (isolated, to rule out cross-device timing)
+    python tools/probe.py mobo    # just the mobo LED
+    python tools/probe.py ramrgb  # just the RAM
+    python tools/probe.py all     # fans then rgb
+    python tools/probe.py hub     # liquidctl list/status/initialize - info only
+    python tools/probe.py aio     # look for the Panorama pump as its own liquidctl device
 """
 
 import os
 import re
 import subprocess
 import sys
+import time
 
 # Windows consoles default to cp1252, which can't encode the box-drawing
 # characters liquidctl's human-readable output uses. Forcing the child
@@ -127,32 +131,70 @@ def _ensure_sized(devices, counts=None, default=40):
                   + ("" if after else "  <- still 0, resize had no effect"))
 
 
-def verify_rgb():
+SETTLE = 0.5  # give the SDK server time to actually apply a write before checking/moving on
+
+
+def _verify_group(label, devices):
+    if not devices:
+        print(f"\n{label}: nothing found in OpenRGB.")
+        return
+    print(f"\n=== {label}: off, then orange, then off ===")
+    _set_static(devices, (0, 0, 0))
+    time.sleep(SETTLE)
+    input(f"{label} should be off now. Enter to light it up.")
+    _set_static(devices, ORANGE)
+    time.sleep(SETTLE)
+    input(f"{label} should be solid orange now (Static mode - stays even if you close "
+          "OpenRGB/this script). Enter to turn off + continue.")
+    _set_static(devices, (0, 0, 0))
+    time.sleep(SETTLE)
+
+
+def _connect_groups():
     try:
-        groups = _openrgb_groups()
+        return _openrgb_groups()
     except ImportError:
         print("pip install openrgb-python")
-        return
+        return None
     except OSError as exc:
         print("Could not reach OpenRGB SDK server:", exc)
-        return
+        return None
 
+
+def verify_hub_rgb():
+    groups = _connect_groups()
+    if groups is None:
+        return
+    counts = _hub_led_counts()
+    _ensure_sized(groups["hub (fan LEDs)"], counts=counts)
+    _verify_group("hub (fan LEDs)", groups["hub (fan LEDs)"])
+
+
+def verify_mobo():
+    groups = _connect_groups()
+    if groups is None:
+        return
+    _verify_group("mobo", groups["mobo"])
+
+
+def verify_ram_rgb():
+    groups = _connect_groups()
+    if groups is None:
+        return
+    _verify_group("ram", groups["ram"])
+
+
+def verify_rgb():
+    """All three, one group fully finished (incl. a settle pause) before the next starts."""
+    groups = _connect_groups()
+    if groups is None:
+        return
     counts = _hub_led_counts()
     _ensure_sized(groups["hub (fan LEDs)"], counts=counts)
 
     for label, devices in groups.items():
-        if not devices:
-            print(f"\n{label}: nothing found in OpenRGB.")
-            continue
-        print(f"\n=== {label}: off, then orange, then off ===")
-        _set_static(devices, (0, 0, 0))
-        input(f"{label} should be off now. Enter to light it up.")
-        _set_static(devices, ORANGE)
-        input(f"{label} should be solid orange now (Static mode - stays even if you close "
-              "OpenRGB/this script). Enter to turn off + continue.")
-        _set_static(devices, (0, 0, 0))
-
-    print("\nWhich of the three groups actually reacted?")
+        _verify_group(label, devices)
+        time.sleep(SETTLE)
 
 
 def verify_all():
@@ -184,6 +226,7 @@ def probe_aio():
 
 
 COMMANDS = {"fans": verify_fans, "rgb": verify_rgb, "all": verify_all,
+            "hubrgb": verify_hub_rgb, "mobo": verify_mobo, "ramrgb": verify_ram_rgb,
             "hub": probe_hub, "aio": probe_aio}
 
 if __name__ == "__main__":
