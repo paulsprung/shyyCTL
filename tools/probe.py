@@ -6,10 +6,11 @@ Close NZXT CAM first - it holds the HID handle open and liquidctl will not
 see the device while CAM is running.
 
 Usage:
-    python tools/probe.py hub     # NZXT Control Hub: channels, fans, LEDs
-    python tools/probe.py aura    # ASUS Aura LED Controller: mobo RGB headers
-    python tools/probe.py aio     # look for the Panorama pump as its own device
-    python tools/probe.py ram     # G.Skill RAM via a running OpenRGB (SDK server on)
+    python tools/probe.py hub       # NZXT Control Hub: list + status
+    python tools/probe.py identify  # map each fan/led channel to a physical unit
+    python tools/probe.py aura      # ASUS Aura LED Controller: mobo RGB headers
+    python tools/probe.py aio       # look for the Panorama pump as its own device
+    python tools/probe.py ram       # G.Skill RAM via a running OpenRGB (SDK server on)
 
 Two liquidctl devices are now on this system (Control Hub + Aura) and both
 name their channels led1/led2/... - every call below is scoped with --match
@@ -19,7 +20,6 @@ so liquidctl never has to guess which device a channel name belongs to.
 import os
 import subprocess
 import sys
-import time
 
 # Windows consoles default to cp1252, which can't encode the box-drawing
 # characters liquidctl's human-readable output uses. Forcing the child
@@ -48,6 +48,10 @@ def confirm(prompt: str) -> bool:
     return input(f"{prompt} [y/N] ").strip().lower() == "y"
 
 
+FAN_CHANNELS = [f"fan{i}" for i in range(1, 6)]
+LED_CHANNELS = [f"led{i}" for i in range(1, 6)]
+
+
 def probe_hub():
     m = "control hub"
     print("=== everything liquidctl can see ===")
@@ -56,19 +60,28 @@ def probe_hub():
     print("\n=== Control Hub status ===")
     run("status", "--verbose", match=m)
 
-    if confirm("\nDrive fan1 to 50% for 5s (confirms control + tach response)?"):
-        run("set", "fan1", "speed", "50", match=m)
-        time.sleep(5)
-        run("status", match=m)
-        run("set", "fan1", "speed", "40", match=m)
+    print("\nRun 'python tools/probe.py identify' next to map each channel to a physical unit.")
 
-    if confirm("\nTest super-fixed (per-LED) on led1 with two different colours?"):
-        run("set", "led1", "color", "super-fixed", "ff0000", "0000ff", match=m)
-        input("Look at the strip: did only the first LED/segment go red, "
-              "rest something else? Enter to continue.")
-        run("set", "led1", "color", "fixed", "000000", match=m)
 
-    print("\nPaste everything above back, plus your answers to the two questions.")
+def identify_hub():
+    """One channel at a time: fan to 0%, LED to green. Holds until you press Enter."""
+    m = "control hub"
+
+    print("=== fans: one stops, the rest keep spinning ===")
+    for ch in FAN_CHANNELS:
+        run("set", ch, "speed", "0", match=m)
+        input(f"{ch} at 0% now - note which physical fan stopped. Enter to restore + continue.")
+        run("set", ch, "speed", "40", match=m)
+
+    print("\n=== LEDs: all off first, then one channel green at a time ===")
+    for ch in LED_CHANNELS:
+        run("set", ch, "color", "off", match=m)
+    for ch in LED_CHANNELS:
+        run("set", ch, "color", "fixed", "00ff00", match=m)
+        input(f"{ch} lit green now - note which physical unit that is. Enter to turn off + continue.")
+        run("set", ch, "color", "off", match=m)
+
+    print("\nSend back the fan->unit and led->unit mapping you noted.")
 
 
 def probe_aura():
@@ -124,7 +137,8 @@ def probe_ram():
             print(f"  zone: {zone.name}  leds={zone.leds_count}")
 
 
-COMMANDS = {"hub": probe_hub, "aura": probe_aura, "aio": probe_aio, "ram": probe_ram}
+COMMANDS = {"hub": probe_hub, "identify": identify_hub, "aura": probe_aura,
+            "aio": probe_aio, "ram": probe_ram}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
