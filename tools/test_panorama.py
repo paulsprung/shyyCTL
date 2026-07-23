@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
-from app.panorama import Panorama, PanoramaUSB, Media, find_device, find_usb_panel, usb_probe
+from app.panorama import Panorama, PanoramaUSB, Media, find_device, find_usb_panel, usb_probe, build_frame
 
 _panel: PanoramaUSB | None = None
 
@@ -180,6 +180,39 @@ def test_usb_probe():
             print(f"    -> {dev['likely_cause']}")
 
 
+def test_raw_handshake_dump():
+    """Bypasses build_frame()/parse_response()'s strict 0x5A...0x5A framing -
+    writes the exact same 'conn' request option 2 sends, then dumps every
+    raw read attempt for a few seconds regardless of shape. Option 2 came
+    back "no/invalid response", which is ambiguous between "device said
+    nothing" and "device replied but not wrapped the way reed-tpse's
+    protocol.cpp does" - this pins down which one it actually is."""
+    import usb.core
+    p = panel()
+    frame = build_frame("POST", "conn")
+    print(f"Writing {len(frame)} bytes: {frame.hex()}")
+    written = p.ep_out.write(frame, timeout=2000)
+    print(f"ep_out.write() reported {written} bytes written")
+
+    deadline = time.monotonic() + 3.0
+    total = 0
+    while time.monotonic() < deadline:
+        try:
+            chunk = p.ep_in.read(512, timeout=300)
+        except usb.core.USBError as exc:
+            if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                continue
+            print("read error:", exc)
+            break
+        if chunk:
+            data = bytes(chunk)
+            total += len(data)
+            print(f"  got {len(data)} bytes: {data.hex()}")
+            print(f"    ascii: {data!r}")
+    if total == 0:
+        print("Nothing at all came back on the IN endpoint in 3s after writing.")
+
+
 MENU = {
     "1": ("Find + connect over WinUSB (handshake test)", test_find),
     "2": ("Full handshake info", test_handshake),
@@ -190,6 +223,8 @@ MENU = {
     "7": ("[Linux/legacy] Handshake on a specific COM port you name", test_handshake_on_port),
     "8": ("Check raw USB visibility (pyusb, VID 0x391A) - run this first if "
           "1-5 fail to connect", test_usb_probe),
+    "9": ("Raw handshake byte dump (diagnostic - use if option 2 says "
+          "'no/invalid response')", test_raw_handshake_dump),
 }
 
 if __name__ == "__main__":
