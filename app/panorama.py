@@ -654,6 +654,37 @@ class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
     ]
 
 
+def _setupapi_dll():
+    """Loads setupapi with explicit argtypes/restype on every function used
+    here. Not optional: without this, ctypes defaults HDEVINFO's return
+    type to a 32-bit int, silently truncating the real (pointer-sized,
+    64-bit) handle - which doesn't error, it just corrupts the handle so
+    every subsequent call quietly fails, seen exactly this way against
+    real hardware this session (Device Manager confirmed the device was
+    genuinely present and bound to usbprint.sys, but find_usbprint_path()
+    still came back empty until this was added)."""
+    setupapi = ctypes.WinDLL("setupapi")
+
+    setupapi.SetupDiGetClassDevsW.argtypes = [
+        ctypes.POINTER(_GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+    setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(_GUID),
+        wintypes.DWORD, ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA)]
+    setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA),
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+    setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+
+    return setupapi
+
+
 def find_usbprint_path(vendor_id: int = TRYX_VENDOR_ID,
                        product_id: int = PANORAMA_PRODUCT_ID) -> str | None:
     """Find the Windows device path for a usbprint.sys-bound device with the
@@ -663,12 +694,12 @@ def find_usbprint_path(vendor_id: int = TRYX_VENDOR_ID,
     the same mechanism Windows itself uses to hand this path to any
     application, including presumably KANALI. Returns None if nothing
     matching is currently present (wrong driver bound, or not plugged in)."""
-    setupapi = ctypes.WinDLL("setupapi")
+    setupapi = _setupapi_dll()
     guid = _guid_from_string(GUID_DEVINTERFACE_USBPRINT)
 
     devinfo = setupapi.SetupDiGetClassDevsW(
         ctypes.byref(guid), None, None, _DIGCF_PRESENT | _DIGCF_DEVICEINTERFACE)
-    if devinfo == _INVALID_HANDLE_VALUE:
+    if devinfo is None or devinfo == _INVALID_HANDLE_VALUE:
         log.warning("SetupDiGetClassDevsW failed (gle=%d)", ctypes.get_last_error())
         return None
 
@@ -720,6 +751,23 @@ class PanoramaPrint(_PanoramaBase):
         super().__init__(timeout)
         self._handle = None
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Same reasoning as _setupapi_dll(): CreateFileW/CloseHandle return
+        # or take a 64-bit HANDLE, which ctypes truncates to 32 bits without
+        # an explicit restype/argtypes - must be declared, not left implicit.
+        self._kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        self._kernel32.CreateFileW.restype = wintypes.HANDLE
+        self._kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        self._kernel32.ReadFile.restype = wintypes.BOOL
+        self._kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        self._kernel32.WriteFile.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
 
     def connect(self) -> bool:
         path = find_usbprint_path()
@@ -730,7 +778,7 @@ class PanoramaPrint(_PanoramaBase):
         handle = self._kernel32.CreateFileW(
             path, _GENERIC_READ | _GENERIC_WRITE,
             _FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING, 0, None)
-        if handle == _INVALID_HANDLE_VALUE:
+        if handle is None or handle == _INVALID_HANDLE_VALUE:
             log.warning("CreateFileW failed on %s (gle=%d) - probably still open "
                         "elsewhere (KANALI's UDB.exe?)", path, ctypes.get_last_error())
             return False
