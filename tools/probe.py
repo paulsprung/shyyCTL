@@ -80,6 +80,19 @@ def _set_static(devices, color):
         device.set_color(RGBColor(*color))
 
 
+def _ensure_sized(devices, size=40):
+    """Resizable zones (addressable strips OpenRGB can't measure on its own,
+    which is what the hub's leds=0 zones are) need an explicit length before
+    set_color has anything to write into."""
+    for device in devices:
+        for zone in device.zones:
+            if len(zone.leds) == 0:
+                try:
+                    zone.resize(size)
+                except Exception as exc:
+                    print(f"  could not resize zone {zone.name}: {exc}")
+
+
 def verify_rgb():
     try:
         groups = _openrgb_groups()
@@ -89,6 +102,8 @@ def verify_rgb():
     except Exception as exc:
         print("Could not reach OpenRGB SDK server:", exc)
         return
+
+    _ensure_sized(groups["hub (fan LEDs)"])
 
     for label, devices in groups.items():
         if not devices:
