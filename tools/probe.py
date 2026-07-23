@@ -114,7 +114,7 @@ def probe_aio():
 def probe_ram():
     try:
         from openrgb import OpenRGBClient
-        from openrgb.utils import RGBColor
+        from openrgb.utils import RGBColor, DeviceType
     except ImportError:
         print("pip install openrgb-python")
         return
@@ -130,25 +130,26 @@ def probe_ram():
         for zone in device.zones:
             print(f"  zone: {zone.name}  leds={len(zone.leds)}")
 
-    if not client.devices:
-        print("\nNo devices - is the RAM detected inside OpenRGB itself?")
+    ram = [d for d in client.devices if d.type == DeviceType.DRAM]
+    if not ram:
+        print("\nNo DRAM devices among the above - is the RAM detected inside OpenRGB itself?")
         return
 
     # set_color is a no-op on some devices unless they're already in Direct
     # mode - a static/effect mode just ignores externally pushed colours.
-    for device in client.devices:
+    for device in ram:
         for i, mode in enumerate(device.modes):
             if mode.name.lower() == "direct":
                 device.set_mode(i)
                 break
 
-    for device in client.devices:
+    for device in ram:
         device.set_color(RGBColor(0, 255, 0))
-    input("\nEverything should be solid green now (RAM, mobo, anything else OpenRGB found). Enter to turn off.")
-    for device in client.devices:
+    input(f"\nOnly the {len(ram)} RAM stick(s) should be green now - keyboard/mobo untouched. Enter to turn off.")
+    for device in ram:
         device.set_color(RGBColor(0, 0, 0))
 
-    print("\nWhich of the listed devices actually reacted?")
+    print("\nDid just the RAM react this time?")
 
 
 COMMANDS = {"hub": probe_hub, "verify": verify_hub, "aura": probe_aura,
