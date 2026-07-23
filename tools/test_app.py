@@ -110,10 +110,19 @@ def test_hub_leds_openrgb():
 
 def test_hub_leds_raw():
     """Uses app/openrgb_raw.py - our own protocol-5-speaking client - instead
-    of openrgb-python. Should show the hub's REAL per-channel LED counts
-    without any manual resizing, because protocol 5 doesn't have the
-    backward-compat lie that makes effects-only zones look like they have
-    0/1 LEDs (confirmed via OpenRGB's own server source this session)."""
+    of openrgb-python.
+
+    Correction from earlier: protocol 5 does NOT give free auto-detected LED
+    counts - "effects-only manually configurable" zones default to 0 and
+    stay there until something resizes them (this hub genuinely cannot
+    report its own LED count, confirmed independently via liquidctl's
+    initialize showing "Unknown" too - a real hardware limit, not a
+    detection bug). What protocol 5 actually buys us: avoiding protocol 4's
+    backward-compat lie, so OUR OWN resize_zone() call can work at all,
+    instead of requiring the user to pre-configure sizes by hand in
+    OpenRGB's GUI. This test proves that: it resizes using the counts this
+    session already verified for these channels, with no GUI step first.
+    """
     client = OpenRgbRaw(**{k: v for k, v in CONFIG["openrgb"].items() if k != "protocol_version"})
     client.connect()
     try:
@@ -131,6 +140,21 @@ def test_hub_leds_raw():
             print("No 'Static' mode found - modes are:", [m.name for m in ctrl.modes])
         else:
             client.set_mode(ctrl.index, static_mode)
+
+        print("\n=== resizing the known channels ourselves, no GUI step first ===")
+        for channel, count in VERIFIED_COUNTS.items():
+            zone = client.zone_for_channel(ctrl, channel)
+            if zone is None:
+                print(f"  {channel}: no matching zone found")
+                continue
+            print(f"  {channel} -> {zone.name}: resizing to {count} LEDs "
+                  f"(was {zone.leds_count})")
+            client.resize_zone(ctrl.index, zone.index, count)
+
+        print("\n=== re-reading the controller to confirm the resize actually stuck ===")
+        ctrl = client.controller_data(ctrl.index)
+        for zone in ctrl.zones:
+            print(f"  {zone.name}: leds_count={zone.leds_count}")
 
         for zone in ctrl.zones:
             if zone.leds_count == 0:
