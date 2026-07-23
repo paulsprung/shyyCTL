@@ -25,6 +25,7 @@ Usage:
     python tools/probe.py hub     # liquidctl list/status/initialize - info only
     python tools/probe.py aio     # look for the Panorama pump as its own liquidctl device
     python tools/probe.py conflicts  # processes/services that might be fighting over lighting
+    python tools/probe.py zones      # hub LED zones' index ranges, to spot overlaps
 """
 
 import os
@@ -142,6 +143,36 @@ def _openrgb_group(device_type_name: str, name_contains: str | None = None):
     dtype = getattr(DeviceType, device_type_name)
     return [d for d in devices
             if d.type == dtype and (name_contains is None or name_contains in d.name)]
+
+
+def show_zones():
+    """Print each zone's LED index range, to spot overlapping zones directly
+    (which is what makes one zone's write bleed into another's LEDs)."""
+    try:
+        devices = _openrgb_group("LEDSTRIP", "NZXT")
+    except ImportError:
+        print("pip install openrgb-python")
+        return
+    except OSError as exc:
+        print("Could not reach OpenRGB SDK server:", exc)
+        return
+    if not devices:
+        print("Hub not found in OpenRGB.")
+        return
+    for device in devices:
+        print(f"\n{device.name}  total leds={len(device.leds)}")
+        for zone in device.zones:
+            ids = [getattr(led, "id", None) for led in zone.leds]
+            print(f"  zone '{zone.name}': {len(zone.leds)} LEDs, ids={ids}")
+        seen = {}
+        for zone in device.zones:
+            for led in zone.leds:
+                lid = getattr(led, "id", None)
+                if lid in seen:
+                    print(f"  OVERLAP: LED id {lid} is claimed by both "
+                          f"'{seen[lid]}' and '{zone.name}'")
+                else:
+                    seen[lid] = zone.name
 
 
 def _verify_openrgb(label, devices):
@@ -275,7 +306,8 @@ def probe_aio():
 
 COMMANDS = {"fans": verify_fans, "hubrgb": verify_hub_rgb, "debug1": debug_channel1,
             "mobo": verify_mobo, "ramrgb": verify_ram_rgb, "all": verify_all,
-            "hub": probe_hub, "aio": probe_aio, "conflicts": check_conflicts}
+            "hub": probe_hub, "aio": probe_aio, "conflicts": check_conflicts,
+            "zones": show_zones}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
