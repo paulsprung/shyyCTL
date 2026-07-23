@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -40,10 +41,11 @@ def run(*args: str, match: str | None = None):
         sys.exit(1)
     except subprocess.TimeoutExpired:
         print("(timed out)")
-        return
+        return ""
     print(result.stdout.strip() or "(no stdout)")
     if result.stderr.strip():
         print("stderr:", result.stderr.strip())
+    return result.stdout
 
 
 def verify_fans():
@@ -80,13 +82,31 @@ def _set_static(devices, color):
         device.set_color(RGBColor(*color))
 
 
-def _ensure_sized(devices, size=40):
+def _hub_led_counts():
+    """Ask the hub itself how many LEDs are on each channel - liquidctl's
+    'initialize' is where NZXT's own accessory detection surfaces (same thing
+    CAM reads to know it's an F120X vs F240X). Never hardcode/guess this."""
+    output = run("initialize", match="control hub")
+    counts = [int(n) for n in re.findall(r"(\d+)\s*LEDs?", output, re.IGNORECASE)]
+    if not counts:
+        print("Could not parse LED counts from 'initialize' output - falling back to a guess of 40.")
+        return None
+    print(f"Parsed LED counts per channel from the hub itself: {counts}")
+    return counts
+
+
+def _ensure_sized(devices, counts=None, default=40):
     """Resizable zones (addressable strips OpenRGB can't measure on its own,
     which is what the hub's leds=0 zones are) need an explicit length before
-    set_color has anything to write into."""
+    set_color has anything to write into. Uses the hub's own reported counts
+    where we have them, in channel order - falls back to a flat guess
+    otherwise, only to keep this probe usable before that's confirmed."""
+    i = 0
     for device in devices:
         for zone in device.zones:
             if len(zone.leds) == 0:
+                size = counts[i] if counts and i < len(counts) else default
+                i += 1
                 try:
                     zone.resize(size)
                 except Exception as exc:
@@ -103,7 +123,8 @@ def verify_rgb():
         print("Could not reach OpenRGB SDK server:", exc)
         return
 
-    _ensure_sized(groups["hub (fan LEDs)"])
+    counts = _hub_led_counts()
+    _ensure_sized(groups["hub (fan LEDs)"], counts=counts)
 
     for label, devices in groups.items():
         if not devices:
