@@ -8,22 +8,35 @@ walked yet. The firmware family is presumably shared, but treat every
 command in this file as unverified until it's actually run against this
 specific panel - the same rule as everywhere else in this codebase.
 
-IMPORTANT, found by reading this project's own real KANALI logs (not from
-reed-tpse, which only documents Linux): on Windows this panel is NOT a
-CDC-ACM serial device. There is no COM port for it at all - that's why
-Device Manager shows nothing under Ports (COM & LPT). KANALI's own driver
-stack (UDB.exe) opens it as a raw WinUSB device at
-VID 0x391A / PID 0x1011 and re-exposes it internally via a named pipe.
+IMPORTANT, worked out from real hardware + KANALI's own driver install
+this session (not from reed-tpse, which only documents Linux): on Windows
+this panel (VID 0x391A / PID 0x1011, shows up as "RK PANO" - RK = Rockchip,
+its SoC) is NOT a CDC-ACM serial device - there is no COM port for it, which
+is why Device Manager shows nothing under Ports (COM & LPT). It also is NOT
+meant to be a raw WinUSB device: KANALI's own installer sets it up with
+Windows' built-in USB Printing Support class driver (usbprint.sys) -
+confirmed directly against this hardware's Device Manager entry, correcting
+an earlier assumption in this file that WinUSB was the intended driver
+(that assumption was based on a different USB path seen in KANALI's logs,
+which most likely belongs to a different Tryx USB component entirely, e.g.
+the AIO's pump/fan controller, not this display).
+
+Concretely, on Windows this panel is talked to via CreateFile/ReadFile/
+WriteFile on its USBPRINT device interface (PanoramaPrint below) - not via
+libusb/pyusb at all, which cannot open a usbprint.sys-bound device (see
+usb_probe()'s "not supported"/NotImplementedError case, hit when trying
+exactly that). PanoramaUSB (WinUSB via Zadig) is kept only as a fallback/
+diagnostic path - using it requires replacing usbprint.sys, which breaks
+KANALI's own access, and is not the vendor's intended setup.
 reed-tpse's serial framing (find_device()/Panorama below) is confirmed
-correct only for the Linux CDC-ACM case; on Windows, `usb_probe()` is the
-one that actually matches what's on the bus, and `find_device()`'s serial
-scan will never find this panel here regardless of any driver or KANALI
-question - it's simply looking at the wrong transport.
+correct only for the Linux CDC-ACM case and never applies on Windows at
+all for this panel - it's simply the wrong transport here.
 
 Two separate channels, confirmed from reed-tpse's own README, not guessed:
-- USB serial control channel - handshake, brightness, screen config.
-  On Linux this is CDC-ACM (/dev/ttyACM*, 115200 baud 8N1). On Windows it's
-  WinUSB (VID 0x391A:0x1011) instead of a COM port - see usb_probe() below.
+- USB control channel - handshake, brightness, screen config. On Linux
+  this is CDC-ACM (/dev/ttyACM*, 115200 baud 8N1). On Windows it's
+  usbprint.sys (VID 0x391A:0x1011) instead of a COM port - see
+  PanoramaPrint below.
 - ADB (adb.exe on Windows, must be on PATH): file transfer only, media is
   pushed to /sdcard/pcMedia/ on the panel's own (Android-based) storage.
   liquidctl/OpenRGB are never involved here - this is a third, independent
@@ -567,13 +580,205 @@ class PanoramaUSB(_PanoramaBase):
 
 
 def find_usb_panel(timeout: float = 1.0) -> "PanoramaUSB | None":
-    """Connect to the panel over WinUSB and return it ready to use, or None -
-    the WinUSB equivalent of find_device() above, and the one to actually
-    use on Windows now that usb_probe() has confirmed this transport works
-    against real hardware. Does not itself distinguish *why* it failed
-    (nothing on the bus vs. wrong driver still bound) - call usb_probe()
-    for that."""
+    """Connect to the panel over WinUSB and return it ready to use, or None.
+
+    Fallback/diagnostic path only - confirmed this session that KANALI's
+    own installer sets up usbprint.sys for this device, not WinUSB, so
+    using this requires replacing that driver via Zadig, which breaks
+    KANALI's own access. Prefer find_print_panel() below, which uses the
+    vendor-intended driver and doesn't require touching anything in Device
+    Manager. Does not itself distinguish *why* it failed (nothing on the
+    bus vs. wrong driver still bound) - call usb_probe() for that."""
     panel = PanoramaUSB(timeout=timeout)
+    if not panel.connect():
+        return None
+    return panel
+
+
+# -- usbprint.sys transport (CreateFile/ReadFile/WriteFile) -----------------
+#
+# The vendor-intended transport on Windows, confirmed this session: KANALI's
+# own installer sets up Windows' built-in USB Printing Support class driver
+# (usbprint.sys) for this device, not WinUSB - a known technique some
+# vendors use to get raw bulk I/O without needing a signed custom driver,
+# since usbprint.sys is inbox and exposes a plain CreateFile/ReadFile/
+# WriteFile interface. libusb/pyusb (PanoramaUSB above) cannot open a
+# device in this state at all - hence this separate, lower-level transport
+# using ctypes directly against kernel32/setupapi.
+#
+# Unverified end to end against this panel - the device-path discovery
+# (SetupAPI GUID_DEVINTERFACE_USBPRINT enumeration) follows the standard,
+# widely-documented Windows pattern, but has not been run for real; treat
+# this the same as everything else ported from documentation rather than
+# a live test in this codebase.
+
+import ctypes
+from ctypes import wintypes
+
+GUID_DEVINTERFACE_USBPRINT = "{28D78FAD-5A12-11D1-AE5B-0000F803A8C2}"
+
+_DIGCF_PRESENT = 0x02
+_DIGCF_DEVICEINTERFACE = 0x10
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
+_OPEN_EXISTING = 3
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def _guid_from_string(text: str) -> _GUID:
+    """'{28D78FAD-5A12-11D1-AE5B-0000F803A8C2}' -> _GUID struct."""
+    text = text.strip("{}")
+    data1, data2, data3, data4a, data4b = text.split("-")
+    data4_bytes = bytes.fromhex(data4a) + bytes.fromhex(data4b)
+    return _GUID(int(data1, 16), int(data2, 16), int(data3, 16),
+                 (ctypes.c_ubyte * 8)(*data4_bytes))
+
+
+class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("InterfaceClassGuid", _GUID),
+        ("Flags", wintypes.DWORD),
+        ("Reserved", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+def find_usbprint_path(vendor_id: int = TRYX_VENDOR_ID,
+                       product_id: int = PANORAMA_PRODUCT_ID) -> str | None:
+    """Find the Windows device path for a usbprint.sys-bound device with the
+    given VID/PID, via the standard SetupAPI device-interface enumeration
+    (SetupDiGetClassDevs + SetupDiEnumDeviceInterfaces +
+    SetupDiGetDeviceInterfaceDetail against GUID_DEVINTERFACE_USBPRINT) -
+    the same mechanism Windows itself uses to hand this path to any
+    application, including presumably KANALI. Returns None if nothing
+    matching is currently present (wrong driver bound, or not plugged in)."""
+    setupapi = ctypes.WinDLL("setupapi")
+    guid = _guid_from_string(GUID_DEVINTERFACE_USBPRINT)
+
+    devinfo = setupapi.SetupDiGetClassDevsW(
+        ctypes.byref(guid), None, None, _DIGCF_PRESENT | _DIGCF_DEVICEINTERFACE)
+    if devinfo == _INVALID_HANDLE_VALUE:
+        log.warning("SetupDiGetClassDevsW failed (gle=%d)", ctypes.get_last_error())
+        return None
+
+    match_fragment = f"vid_{vendor_id:04x}&pid_{product_id:04x}".lower()
+    found_path = None
+    try:
+        index = 0
+        while True:
+            did = _SP_DEVICE_INTERFACE_DATA()
+            did.cbSize = ctypes.sizeof(did)
+            if not setupapi.SetupDiEnumDeviceInterfaces(
+                    devinfo, None, ctypes.byref(guid), index, ctypes.byref(did)):
+                break  # ERROR_NO_MORE_ITEMS - done
+
+            required = wintypes.DWORD(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(
+                devinfo, ctypes.byref(did), None, 0, ctypes.byref(required), None)
+            buf = ctypes.create_string_buffer(required.value)
+            # SP_DEVICE_INTERFACE_DETAIL_DATA_W: DWORD cbSize followed by a
+            # WCHAR[] DevicePath. cbSize itself must be set to the size of
+            # just the struct's fixed header (DWORD + one WCHAR) - 6 bytes
+            # logically, but a long-documented Windows quirk requires 8 on
+            # 64-bit and 5 (well, 6) on 32-bit for this call to succeed
+            # regardless of the buffer's real total size. Hardcoding 8 since
+            # this project only targets 64-bit Windows.
+            ctypes.memmove(buf, ctypes.byref(wintypes.DWORD(8)), ctypes.sizeof(wintypes.DWORD))
+            ok = setupapi.SetupDiGetDeviceInterfaceDetailW(
+                devinfo, ctypes.byref(did), buf, required, None, None)
+            if ok:
+                path = ctypes.wstring_at(ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD))
+                if match_fragment in path.lower():
+                    found_path = path
+                    break
+            index += 1
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(devinfo)
+
+    return found_path
+
+
+class PanoramaPrint(_PanoramaBase):
+    """Talks to the panel via Windows' native CreateFile/ReadFile/WriteFile
+    on its usbprint.sys device path - the same access model KANALI itself
+    uses, so this does not require touching any driver in Device Manager
+    (unlike PanoramaUSB), but does still conflict with KANALI if it's
+    running at the same time, same as any single-open-handle device."""
+
+    def __init__(self, timeout: float = 1.0):
+        super().__init__(timeout)
+        self._handle = None
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def connect(self) -> bool:
+        path = find_usbprint_path()
+        if path is None:
+            log.warning("no usbprint.sys device found for VID 0x391A:0x1011 - "
+                        "wrong driver bound, or not plugged in")
+            return False
+        handle = self._kernel32.CreateFileW(
+            path, _GENERIC_READ | _GENERIC_WRITE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING, 0, None)
+        if handle == _INVALID_HANDLE_VALUE:
+            log.warning("CreateFileW failed on %s (gle=%d) - probably still open "
+                        "elsewhere (KANALI's UDB.exe?)", path, ctypes.get_last_error())
+            return False
+        self._handle = handle
+        return True
+
+    def disconnect(self):
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    @property
+    def connected(self) -> bool:
+        return self._handle is not None
+
+    def _write(self, frame: bytes):
+        written = wintypes.DWORD(0)
+        ok = self._kernel32.WriteFile(self._handle, frame, len(frame), ctypes.byref(written), None)
+        if not ok:
+            raise PanoramaError(f"WriteFile failed (gle={ctypes.get_last_error()})")
+
+    def _read_frame(self, timeout_s: float) -> bytes:
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        chunk = ctypes.create_string_buffer(512)
+        read = wintypes.DWORD(0)
+        while time.monotonic() < deadline:
+            ok = self._kernel32.ReadFile(self._handle, chunk, 512, ctypes.byref(read), None)
+            if ok and read.value:
+                buf += chunk.raw[:read.value]
+                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
+                    break
+            elif not ok:
+                # A synchronous ReadFile with nothing available typically
+                # just blocks rather than erroring on a real device; this
+                # branch is here mainly so a genuine I/O error doesn't spin
+                # silently for the full timeout.
+                log.debug("ReadFile returned an error (gle=%d)", ctypes.get_last_error())
+                break
+        return bytes(buf)
+
+
+def find_print_panel(timeout: float = 1.0) -> "PanoramaPrint | None":
+    """Connect to the panel via its usbprint.sys device path and return it
+    ready to use, or None - the transport to actually use on Windows, since
+    it matches what KANALI's own installer sets up (see module docstring).
+    """
+    panel = PanoramaPrint(timeout=timeout)
     if not panel.connect():
         return None
     return panel
