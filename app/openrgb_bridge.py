@@ -30,9 +30,16 @@ RETRY_DELAY = 1.5
 
 
 class OpenRgbBridge:
-    def __init__(self, host: str = "127.0.0.1", port: int = 6742):
+    def __init__(self, host: str = "127.0.0.1", port: int = 6742,
+                 protocol_version: int | None = None):
         self.host = host
         self.port = port
+        # openrgb-python has been seen negotiating protocol 4 even against a
+        # server that advertises 5 (confirmed via OpenRGB's own SDK Client
+        # tab this session) - v5 added new device/zone fields, which lines
+        # up with exactly one (newly-added) device failing to parse. Forcing
+        # this explicitly is a diagnostic, not a permanent fix.
+        self.protocol_version = protocol_version
         self.client = None
         self.connected = False
         self.last_error: str | None = None
@@ -45,7 +52,10 @@ class OpenRgbBridge:
             self.connected = False
             return False
         try:
-            self.client = OpenRGBClient(address=self.host, port=self.port, name="shyyctl")
+            kwargs = {"address": self.host, "port": self.port, "name": "shyyctl"}
+            if self.protocol_version is not None:
+                kwargs["protocol_version"] = self.protocol_version
+            self.client = OpenRGBClient(**kwargs)
             self.connected = True
             self.last_error = None
             return True

@@ -10,6 +10,11 @@ hub:
 openrgb:
   host: "127.0.0.1"
   port: 6742
+  # Diagnostic: openrgb-python was seen negotiating protocol 4 while OpenRGB
+  # itself advertises 5 (SDK Client tab). Forcing 5 here to test whether
+  # that's why the hub's device data fails to parse. Remove this key to go
+  # back to auto-negotiation once that's settled.
+  protocol_version: 5
 
 sensors:
   librehardwaremonitor_url: "http://127.0.0.1:8085/data.json"
