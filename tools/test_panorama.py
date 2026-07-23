@@ -6,15 +6,20 @@ Needs:
     adb.exe on PATH (Android platform-tools - just the zip, no Android
     Studio: https://developer.android.com/tools/releases/platform-tools)
 
-Nothing here is verified yet - the protocol was ported from reed-tpse,
-which tested against the Panorama SE/360, not this project's 240mm/2-fan
-unit. Real KANALI logs from this hardware showed this panel is WinUSB
-(VID 0x391A:0x1011) on Windows, not a COM port - so start with option 8
-("raw USB visibility"), not option 1/6, since those only look at serial
-ports and can never see this device here. Once option 8 confirms the
-device is visible and accessible, the serial handshake in this file would
-still need porting to WinUSB bulk transfers before anything past that
-point works - not done yet.
+Real KANALI logs from this hardware showed this panel is WinUSB
+(VID 0x391A:0x1011) on Windows, not a COM port - confirmed against real
+hardware this session, along with the fact that Windows binds its generic
+usbprint.sys class driver here by default, which has to be replaced with
+WinUSB via Zadig (https://zadig.akeo.ie, "List All Devices", target driver
+WinUSB, Replace Driver) before pyusb/this file can open it at all - see
+option 8 ("raw USB visibility") if anything below fails to connect.
+
+Options 1-5 now go over the real WinUSB transport (PanoramaUSB) and are
+confirmed to reach the device at the USB level - the frame protocol itself
+(handshake/brightness/screen config, ported from reed-tpse) is still
+unverified against this specific panel until a handshake actually succeeds.
+Options 6/7/serial support are kept only for the Linux CDC-ACM case and are
+known NOT to work for this panel on Windows.
 
 Usage:
     python tools/test_panorama.py
@@ -30,24 +35,23 @@ sys.path.insert(0, str(ROOT))
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
-from app.panorama import Panorama, Media, find_device, usb_probe
+from app.panorama import Panorama, PanoramaUSB, Media, find_device, find_usb_panel, usb_probe
 
-_panel: Panorama | None = None
+_panel: PanoramaUSB | None = None
 
 
-def panel() -> Panorama:
+def panel() -> PanoramaUSB:
     global _panel
     if _panel is not None and _panel.connected:
         return _panel
-    print("Searching for the panel on every serial port (tries handshake on each)...")
-    port = find_device()
-    if port is None:
-        print("No panel found. Is it plugged in? Close KANALI if it's running "
-              "(likely holds the port open, same story as NZXT CAM).")
+    print("Connecting to the panel over WinUSB (VID 0x391A:0x1011)...")
+    found = find_usb_panel()
+    if found is None:
+        print("No panel found over USB. Run option 8 for details (needs WinUSB bound "
+              "via Zadig, not the default usbprint.sys driver).")
         sys.exit(1)
-    print(f"Found on {port}")
-    _panel = Panorama(port)
-    _panel.connect()
+    print("Connected.")
+    _panel = found
     return _panel
 
 
@@ -80,7 +84,7 @@ def test_handshake_on_port():
 
 def test_find():
     p = panel()
-    print("Connected:", p.connected, "on", p.port_name)
+    print("Connected:", p.connected)
 
 
 def test_handshake():
@@ -114,28 +118,41 @@ def test_media_list():
 
 
 def test_set_default_image():
-    """Uploads the image and sets it as the persistent boot/default screen -
-    single image, full screen, looping. This is the one CAM/KANALI-free
-    thing this whole project exists to prove out for the display."""
-    image_path = input("Path to the image to upload (local file): ").strip().strip('"')
-    if not Path(image_path).is_file():
-        print("File not found:", image_path)
+    """Uploads one or more local images/gifs and sets them as the persistent
+    boot/default screen - full screen, looping through all of them if more
+    than one. This is the one CAM/KANALI-free thing this whole project
+    exists to prove out for the display.
+
+    A single file uses playMode "Single"; more than one uses "Sequence" -
+    that second value is an assumption (reed-tpse documents the config
+    shape but not every valid playMode string), so if a multi-file upload
+    only shows the first image, that value is the first thing to check."""
+    raw = input("Path(s) to upload, comma-separated for a slideshow (images/gifs): ").strip()
+    paths = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
+    if not paths:
+        print("Nothing entered.")
         return
-    remote_name = Path(image_path).name
+    missing = [p for p in paths if not Path(p).is_file()]
+    if missing:
+        print("File(s) not found:", missing)
+        return
+    remote_names = [Path(p).name for p in paths]
 
     media = Media()
     if not media.is_connected():
         print("adb doesn't see the panel - see option 4 for details.")
         return
-    print(f"Pushing {image_path} -> /sdcard/pcMedia/{remote_name} ...")
-    if not media.push(image_path, remote_name):
-        print("Push failed.")
-        return
+    for local_path, remote_name in zip(paths, remote_names):
+        print(f"Pushing {local_path} -> /sdcard/pcMedia/{remote_name} ...")
+        if not media.push(local_path, remote_name):
+            print("Push failed for", local_path)
+            return
     print("Pushed. Setting screen config...")
 
     p = panel()
-    resp = p.set_screen_config([remote_name], screen_mode="Full Screen",
-                               ratio="2:1", play_mode="Single")
+    play_mode = "Single" if len(remote_names) == 1 else "Sequence"
+    resp = p.set_screen_config(remote_names, screen_mode="Full Screen",
+                               ratio="2:1", play_mode=play_mode)
     print("response:", resp)
     print("Should be showing now - and should persist across a reboot, per reed-tpse's README.")
 
@@ -164,15 +181,15 @@ def test_usb_probe():
 
 
 MENU = {
-    "1": ("Find + connect (handshake test, serial - see option 8 first)", test_find),
+    "1": ("Find + connect over WinUSB (handshake test)", test_find),
     "2": ("Full handshake info", test_handshake),
     "3": ("Brightness sweep (20 -> 100 -> 60)", test_brightness),
     "4": ("List media on the panel (via adb)", test_media_list),
-    "5": ("Upload an image and set it as the default/boot screen", test_set_default_image),
-    "6": ("List every serial port Windows/pyserial can see (no handshake)", test_list_ports),
-    "7": ("Handshake on a specific COM port you name", test_handshake_on_port),
-    "8": ("Check raw USB visibility (pyusb, VID 0x391A) - works with no "
-          "driver/COM port, regardless of KANALI", test_usb_probe),
+    "5": ("Upload image(s)/gif(s) and set them as the default/boot screen", test_set_default_image),
+    "6": ("[Linux/legacy] List every serial port Windows/pyserial can see", test_list_ports),
+    "7": ("[Linux/legacy] Handshake on a specific COM port you name", test_handshake_on_port),
+    "8": ("Check raw USB visibility (pyusb, VID 0x391A) - run this first if "
+          "1-5 fail to connect", test_usb_probe),
 }
 
 if __name__ == "__main__":

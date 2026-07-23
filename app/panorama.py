@@ -156,37 +156,34 @@ def parse_response(data: bytes) -> Response | None:
     return Response(message, version, status, body, json_value)
 
 
-# -- serial control channel ------------------------------------------------
+# -- shared command layer: identical over serial and raw USB ---------------
+#
+# The frame protocol (build_frame/parse_response above) doesn't care how the
+# bytes get to the device - CDC-ACM serial and raw USB bulk endpoints both
+# just move bytes. Only _write()/_read_frame()/connect()/disconnect() differ
+# between transports; every actual command (handshake, brightness, screen
+# config) is transport-agnostic and lives here once.
 
-class Panorama:
-    def __init__(self, port: str, timeout: float = 1.0):
-        self.port_name = port
+class _PanoramaBase:
+    def __init__(self, timeout: float = 1.0):
         self.timeout = timeout
-        self.ser = None
         self._seq = 0
-
-    def connect(self) -> bool:
-        import serial
-        try:
-            self.ser = serial.Serial(
-                port=self.port_name, baudrate=BAUD_RATE,
-                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE, rtscts=False, dsrdtr=False,
-                xonxoff=False, timeout=self.timeout)
-            return True
-        except Exception as exc:
-            log.warning("could not open %s: %s", self.port_name, exc)
-            self.ser = None
-            return False
-
-    def disconnect(self):
-        if self.ser is not None:
-            self.ser.close()
-            self.ser = None
 
     @property
     def connected(self) -> bool:
-        return self.ser is not None and self.ser.is_open
+        raise NotImplementedError
+
+    def connect(self) -> bool:
+        raise NotImplementedError
+
+    def disconnect(self):
+        raise NotImplementedError
+
+    def _write(self, frame: bytes):
+        raise NotImplementedError
+
+    def _read_frame(self, timeout_s: float) -> bytes:
+        raise NotImplementedError
 
     def send_command(self, request_state: str, cmd_type: str, content: str = "",
                      wait_response: bool = True) -> Response | None:
@@ -194,26 +191,14 @@ class Panorama:
             raise PanoramaError("not connected")
         self._seq += 1
         frame = build_frame(request_state, cmd_type, content, "1", self._seq)
-        self.ser.write(frame)
-        self.ser.flush()
+        self._write(frame)
         if not wait_response:
             return None
         time.sleep(0.5)  # matches reed-tpse's fixed pre-read delay
-        raw = self._read_frame(timeout_s=1.0)
+        raw = self._read_frame(timeout_s=2.0)
         if not raw:
             return None
         return parse_response(raw)
-
-    def _read_frame(self, timeout_s: float) -> bytes:
-        deadline = time.monotonic() + timeout_s
-        buf = bytearray()
-        while time.monotonic() < deadline:
-            chunk = self.ser.read(256)
-            if chunk:
-                buf += chunk
-                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
-                    break
-        return bytes(buf)
 
     def handshake(self) -> dict | None:
         response = self.send_command("POST", "conn")
@@ -258,6 +243,58 @@ class Panorama:
 
     def delete_media(self, filenames: list[str]) -> Response | None:
         return self.send_command("POST", "mediaDelete", json.dumps({"include": filenames}))
+
+
+# -- serial (CDC-ACM) transport ---------------------------------------------
+#
+# Correct on Linux (/dev/ttyACM*). Confirmed WRONG for this panel on Windows
+# this session - it has no COM port there at all (see PanoramaUSB below).
+# Kept for Linux and in case some future firmware/driver combo exposes a COM
+# port here after all.
+
+class Panorama(_PanoramaBase):
+    def __init__(self, port: str, timeout: float = 1.0):
+        super().__init__(timeout)
+        self.port_name = port
+        self.ser = None
+
+    def connect(self) -> bool:
+        import serial
+        try:
+            self.ser = serial.Serial(
+                port=self.port_name, baudrate=BAUD_RATE,
+                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE, rtscts=False, dsrdtr=False,
+                xonxoff=False, timeout=self.timeout)
+            return True
+        except Exception as exc:
+            log.warning("could not open %s: %s", self.port_name, exc)
+            self.ser = None
+            return False
+
+    def disconnect(self):
+        if self.ser is not None:
+            self.ser.close()
+            self.ser = None
+
+    @property
+    def connected(self) -> bool:
+        return self.ser is not None and self.ser.is_open
+
+    def _write(self, frame: bytes):
+        self.ser.write(frame)
+        self.ser.flush()
+
+    def _read_frame(self, timeout_s: float) -> bytes:
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            chunk = self.ser.read(256)
+            if chunk:
+                buf += chunk
+                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
+                    break
+        return bytes(buf)
 
 
 def find_device(timeout: float = 1.0) -> str | None:
@@ -404,6 +441,115 @@ def usb_probe() -> dict:
                 )
         result["devices"].append(info)
     return result
+
+
+# -- raw USB (WinUSB bulk) transport -----------------------------------------
+#
+# The confirmed-correct transport for this panel on Windows. Requires WinUSB
+# actually bound to the device's interface first (Windows binds its generic
+# usbprint.sys class driver by default on this hardware, per this session's
+# Device Manager check - use Zadig, https://zadig.akeo.ie, "List All
+# Devices", target driver WinUSB, Replace Driver). usb_probe() reports which
+# state a given machine is in.
+#
+# Endpoints confirmed against real hardware this session: one bulk OUT
+# (0x01) and one bulk IN (0x81) on the panel's single interface - the same
+# two-endpoint shape a CDC-ACM data interface would have, just addressed
+# directly instead of through a COM port. The frame protocol riding on top
+# is unverified against this specific panel until a real handshake succeeds.
+
+class PanoramaUSB(_PanoramaBase):
+    def __init__(self, timeout: float = 1.0):
+        super().__init__(timeout)
+        self.dev = None
+        self.ep_out = None
+        self.ep_in = None
+
+    def connect(self) -> bool:
+        import usb.core
+        import usb.util
+
+        backend = None
+        try:
+            import libusb_package
+            backend = libusb_package.get_libusb1_backend()
+        except Exception as exc:
+            log.debug("libusb_package backend unavailable, falling back to pyusb's default search: %s", exc)
+
+        find_kwargs = {"idVendor": TRYX_VENDOR_ID, "idProduct": PANORAMA_PRODUCT_ID}
+        if backend is not None:
+            find_kwargs["backend"] = backend
+        dev = usb.core.find(**find_kwargs)
+        if dev is None:
+            log.warning("panel not found on the USB bus (VID 0x391A:0x1011) - "
+                        "see usb_probe() for what's actually visible")
+            return False
+
+        try:
+            dev.set_configuration()
+        except usb.core.USBError as exc:
+            log.debug("set_configuration (often harmless if already configured): %s", exc)
+
+        cfg = dev.get_active_configuration()
+        intf = cfg[(0, 0)]
+        ep_out = usb.util.find_descriptor(
+            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
+        ep_in = usb.util.find_descriptor(
+            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
+        if ep_out is None or ep_in is None:
+            log.warning("panel found on the bus but its interface has no bulk IN/OUT pair")
+            return False
+
+        self.dev = dev
+        self.ep_out = ep_out
+        self.ep_in = ep_in
+        return True
+
+    def disconnect(self):
+        if self.dev is not None:
+            import usb.util
+            usb.util.dispose_resources(self.dev)
+        self.dev = None
+        self.ep_out = None
+        self.ep_in = None
+
+    @property
+    def connected(self) -> bool:
+        return self.dev is not None
+
+    def _write(self, frame: bytes):
+        self.ep_out.write(frame, timeout=max(int(self.timeout * 1000), 1000))
+
+    def _read_frame(self, timeout_s: float) -> bytes:
+        import usb.core
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        packet_size = self.ep_in.wMaxPacketSize or 512
+        while time.monotonic() < deadline:
+            try:
+                chunk = self.ep_in.read(packet_size, timeout=250)
+            except usb.core.USBError as exc:
+                if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                    continue
+                raise
+            if chunk:
+                buf += bytes(chunk)
+                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
+                    break
+        return bytes(buf)
+
+
+def find_usb_panel(timeout: float = 1.0) -> "PanoramaUSB | None":
+    """Connect to the panel over WinUSB and return it ready to use, or None -
+    the WinUSB equivalent of find_device() above, and the one to actually
+    use on Windows now that usb_probe() has confirmed this transport works
+    against real hardware. Does not itself distinguish *why* it failed
+    (nothing on the bus vs. wrong driver still bound) - call usb_probe()
+    for that."""
+    panel = PanoramaUSB(timeout=timeout)
+    if not panel.connect():
+        return None
+    return panel
 
 
 # -- media transfer over ADB -----------------------------------------------
