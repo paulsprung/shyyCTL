@@ -16,16 +16,23 @@ name their channels led1/led2/... - every call below is scoped with --match
 so liquidctl never has to guess which device a channel name belongs to.
 """
 
+import os
 import subprocess
 import sys
 import time
+
+# Windows consoles default to cp1252, which can't encode the box-drawing
+# characters liquidctl's human-readable output uses. Forcing the child
+# process's own stdout to utf-8 avoids it crashing mid-print.
+_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 def run(*args: str, match: str | None = None):
     full = (["-m", match] if match else []) + list(args)
     print(f"\n$ liquidctl {' '.join(full)}")
     try:
-        result = subprocess.run(["liquidctl", *full], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["liquidctl", *full], capture_output=True, text=True,
+                                 timeout=30, env=_ENV)
     except FileNotFoundError:
         print("liquidctl not found on PATH - pip install liquidctl")
         sys.exit(1)
