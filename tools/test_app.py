@@ -32,11 +32,12 @@ if not hub.connect():
 print("Connected:", hub.description)
 print("Channels:", hub.channels)
 
-print("\nConnecting to OpenRGB...")
-if not rgb.connect():
-    print("FAILED (not fatal - scan will note it):", rgb.last_error)
-else:
-    print("Connected.")
+# OpenRGB is deliberately NOT connected here. scan.py connects it itself,
+# only after fan probing is done (see _scan_openrgb) - the leading theory
+# for last run's all-empty fan results is that connecting OpenRGB first
+# held the hub open in a way that made liquidctl's own status/set calls
+# fail silently (empty stdout) during the fan probe loop. Untested until
+# this run; keep this ordering either way unless it's ruled out.
 
 print("\nRunning scan (no curve measurement, quick)...")
 scan = Scan(hub, rgb)
