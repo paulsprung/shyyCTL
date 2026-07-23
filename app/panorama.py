@@ -368,18 +368,40 @@ def usb_probe() -> dict:
             info["endpoints"] = [
                 f"0x{ep.bEndpointAddress:02x}" for intf in cfg for ep in intf
             ]
-        except usb.core.USBError as exc:
+        except Exception as exc:
+            # Broad except deliberately: libusb's Windows backend raises
+            # NotImplementedError (not usb.core.USBError) when the bound
+            # driver isn't one it can open (needs WinUSB/libusb0/libusbK
+            # specifically), which is the expected failure mode here, not
+            # a bug - it means the device enumerated but nothing suitable
+            # is bound to talk to it.
             info["accessible"] = False
-            info["access_error"] = str(exc)
+            info["access_error"] = f"{type(exc).__name__}: {exc}"
             lowered = str(exc).lower()
-            info["likely_cause"] = (
-                "Another process already has it open exclusively - most likely KANALI's "
-                "UDB.exe (even a stuck/background instance after 'closing' the app). Check "
-                "Task Manager and end it, then retry."
-                if "access" in lowered or "denied" in lowered or "busy" in lowered
-                else "Device is visible but its configuration couldn't be read - may need "
-                     "the WinUSB driver (re)bound via Zadig, or running this as Administrator."
-            )
+            if "access" in lowered or "denied" in lowered or "busy" in lowered:
+                info["likely_cause"] = (
+                    "Another process already has it open exclusively - most likely KANALI's "
+                    "UDB.exe (even a stuck/background instance after 'closing' the app). Check "
+                    "Task Manager and end it, then retry."
+                )
+            elif "not supported" in lowered or "not implemented" in lowered:
+                info["likely_cause"] = (
+                    "Device enumerates (Windows sees the VID/PID) but no WinUSB/libusb0/libusbK "
+                    "compatible driver is currently bound to this interface, so libusb can't open "
+                    "it - not a cabling problem. In Device Manager, find this device (search "
+                    "hardware ID VID_391A&PID_1011 under View > Devices by container, or check "
+                    "'Other devices'/'Universal Serial Bus devices'), then either: (a) right-click "
+                    "> Uninstall device (tick 'delete the driver'), unplug/replug or reboot, and "
+                    "let Windows/KANALI reinstall it fresh, or (b) use Zadig (zadig.akeo.ie) to "
+                    "force-bind WinUSB to this specific device so this tool can open it directly "
+                    "without KANALI at all. Worth trying (a) first since KANALI's own logs show "
+                    "it failing the same way - the current driver binding may just be stuck."
+                )
+            else:
+                info["likely_cause"] = (
+                    "Device is visible but its configuration couldn't be read - may need the "
+                    "WinUSB driver (re)bound via Zadig, or running this as Administrator."
+                )
         result["devices"].append(info)
     return result
 
