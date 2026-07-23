@@ -127,7 +127,7 @@ def probe_ram():
     for device in client.devices:
         print(f"\n{device.name}  type={device.type}  leds={len(device.leds)}")
         for zone in device.zones:
-            print(f"  zone: {zone.name}  leds={zone.leds_count}")
+            print(f"  zone: {zone.name}  leds={len(zone.leds)}")
 
     if not client.devices:
         print("\nNo devices - is the RAM detected inside OpenRGB itself?")
