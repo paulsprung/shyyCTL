@@ -17,7 +17,8 @@ or fight over who's driving the lighting.
 
 Usage:
     python tools/probe.py fans    # each fan channel off, one at a time (initializes first)
-    python tools/probe.py hubrgb  # each hub LED channel off/colour/off (initializes first)
+    python tools/probe.py hubrgb  # all LEDs off, then each channel tested y/n, summary at the end
+    python tools/probe.py debug1  # compare working vs broken channel with --debug + candidate fixes
     python tools/probe.py mobo    # mobo LED via OpenRGB
     python tools/probe.py ramrgb  # RAM via OpenRGB
     python tools/probe.py all     # fans, then hubrgb, then mobo, then ramrgb
@@ -78,14 +79,55 @@ def verify_fans():
 def verify_hub_rgb():
     m = "control hub"
     _init_hub()
-    print("\n=== hub LEDs: one channel at a time ===")
+
+    print("\n=== clean baseline: all hub LED channels off ===")
     for ch in LED_CHANNELS:
         run("set", ch, "color", "off", match=m)
-        input(f"{ch} off now. Enter to light it up orange.")
+    time.sleep(SETTLE)
+
+    print("\n=== testing each channel, one at a time - just answer y/n ===")
+    results = {}
+    for ch in LED_CHANNELS:
         run("set", ch, "color", "fixed", ORANGE_HEX, match=m)
-        input(f"{ch} should be solid orange now (hub firmware - stays without shyyctl running). "
-              "Enter to turn off + continue.")
+        time.sleep(SETTLE)
+        answer = input(f"Did {ch} light up orange? [y/N] ").strip().lower()
+        results[ch] = answer == "y"
         run("set", ch, "color", "off", match=m)
+        time.sleep(SETTLE)
+
+    print("\n=== summary ===")
+    for ch, ok in results.items():
+        print(f"  {ch}: {'reacted' if ok else 'NO REACTION'}")
+
+
+def debug_channel1():
+    """Compare the raw USB report for a known-working channel against the
+    broken one, plus a couple of cheap candidate fixes (resend, other mode).
+    Paste the full output back - if the reports differ by an obvious byte,
+    hub.py can send a corrected report directly over HID, bypassing whatever
+    is wrong in liquidctl's driver for this one channel."""
+    m = "control hub"
+    _init_hub()
+
+    print("\n=== led5 (known working) with --debug ===")
+    run("set", "led5", "color", "fixed", ORANGE_HEX, "--debug", match=m)
+    input("Enter to continue (led5 should be orange now).")
+    run("set", "led5", "color", "off", match=m)
+
+    print("\n=== led1 (broken) with --debug, same command ===")
+    run("set", "led1", "color", "fixed", ORANGE_HEX, "--debug", match=m)
+    input("Enter to continue (led1 - note if anything happened).")
+
+    print("\n=== led1 again, sent twice in a row (in case the first write gets dropped) ===")
+    run("set", "led1", "color", "fixed", ORANGE_HEX, match=m)
+    run("set", "led1", "color", "fixed", ORANGE_HEX, match=m)
+    input("Enter to continue (note if anything happened this time).")
+    run("set", "led1", "color", "off", match=m)
+
+    print("\n=== led1 with a different mode (fixed might specifically be broken, not the channel) ===")
+    run("set", "led1", "color", "spectrum-wave", match=m)
+    input("Enter to continue (note if led1 does ANYTHING - even the wrong colour/animation counts).")
+    run("set", "led1", "color", "off", match=m)
 
 
 def _openrgb_group(device_type_name: str, name_contains: str | None = None):
@@ -180,8 +222,8 @@ def probe_aio():
     )
 
 
-COMMANDS = {"fans": verify_fans, "hubrgb": verify_hub_rgb, "mobo": verify_mobo,
-            "ramrgb": verify_ram_rgb, "all": verify_all,
+COMMANDS = {"fans": verify_fans, "hubrgb": verify_hub_rgb, "debug1": debug_channel1,
+            "mobo": verify_mobo, "ramrgb": verify_ram_rgb, "all": verify_all,
             "hub": probe_hub, "aio": probe_aio}
 
 if __name__ == "__main__":
