@@ -7,6 +7,7 @@ Run from the repo root:
 """
 
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import yaml
+
+logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
 from app.hub import Hub
 from app.openrgb_bridge import OpenRgbBridge
@@ -32,12 +35,21 @@ if not hub.connect():
 print("Connected:", hub.description)
 print("Channels:", hub.channels)
 
+print("\n=== direct status() check, right after connect, before any scan ===")
+raw = hub._run("status", "--verbose", match=hub.match)
+print(f"raw stdout ({len(raw or '')} chars):")
+print(repr(raw))
+readings = hub.status()
+print(f"\nparsed into {len(readings)} readings:")
+for r in readings:
+    print(" ", r)
+print(f"\nhub.rpm('fan1') -> {hub.rpm('fan1')}")
+input("\nEnter to continue to the scan.")
+
 # OpenRGB is deliberately NOT connected here. scan.py connects it itself,
-# only after fan probing is done (see _scan_openrgb) - the leading theory
-# for last run's all-empty fan results is that connecting OpenRGB first
-# held the hub open in a way that made liquidctl's own status/set calls
-# fail silently (empty stdout) during the fan probe loop. Untested until
-# this run; keep this ordering either way unless it's ruled out.
+# only after fan probing is done (see _scan_openrgb) - connecting it early
+# was ruled out as the cause of the all-empty fan results (same result with
+# or without it), kept anyway since it's still the more correct order.
 
 print("\nRunning scan (no curve measurement, quick)...")
 scan = Scan(hub, rgb)
