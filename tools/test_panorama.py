@@ -213,6 +213,34 @@ def test_raw_handshake_dump():
         print("Nothing at all came back on the IN endpoint in 3s after writing.")
 
 
+def test_passive_listen():
+    """Reads the IN endpoint for several seconds without writing anything
+    first - checks whether the device is chatty on its own (some firmware
+    sends periodic status/telemetry unprompted), and rules out one specific
+    explanation for option 9 coming back silent: that our write is somehow
+    breaking the pipe rather than the device just never having anything to
+    say back to an unrecognized request."""
+    import usb.core
+    p = panel()
+    print("Listening for 5s with nothing sent...")
+    deadline = time.monotonic() + 5.0
+    total = 0
+    while time.monotonic() < deadline:
+        try:
+            chunk = p.ep_in.read(512, timeout=300)
+        except usb.core.USBError as exc:
+            if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                continue
+            print("read error:", exc)
+            break
+        if chunk:
+            data = bytes(chunk)
+            total += len(data)
+            print(f"  got {len(data)} bytes: {data.hex()}")
+    if total == 0:
+        print("Silent - nothing sent by the device on its own either.")
+
+
 MENU = {
     "1": ("Find + connect over WinUSB (handshake test)", test_find),
     "2": ("Full handshake info", test_handshake),
@@ -225,6 +253,7 @@ MENU = {
           "1-5 fail to connect", test_usb_probe),
     "9": ("Raw handshake byte dump (diagnostic - use if option 2 says "
           "'no/invalid response')", test_raw_handshake_dump),
+    "10": ("Passive listen, 5s, nothing sent (diagnostic)", test_passive_listen),
 }
 
 if __name__ == "__main__":
