@@ -1,26 +1,31 @@
 """Manual hardware probe - no shyyctl app involved, just liquidctl/OpenRGB directly.
 
-liquidctl's Control Hub LED driver has a confirmed bug (channel 1 doesn't
-apply colour even though OpenRGB's independent driver reaches it fine), so
-RGB now goes exclusively through OpenRGB - for the hub's own LEDs too, not
-just RAM/mobo. liquidctl is only used here for fan speed.
+liquidctl docs for the NZXT Smart Device family (V1/V2, HUE 2, and presumably
+Control Hub) are explicit: after power-on or any hardware change, the device
+needs 'initialize' once before fan control and lighting are reliable. Earlier
+runs of this script never called it before touching LEDs, which is the
+leading suspect for why channel 1 looked broken - so it's now called first,
+every time, right before the commands that depend on it, in the same
+liquidctl session.
+
+RGB is back on liquidctl for the hub (all channels, tested individually) -
+OpenRGB couldn't drive any of the hub's channels even after resizing, but is
+solid for mobo/RAM, so it stays for those.
 
 Close NZXT CAM and Armoury Crate/Aura Creator first - they hold devices open
 or fight over who's driving the lighting.
 
 Usage:
-    python tools/probe.py fans    # each fan channel off, one at a time
-    python tools/probe.py rgb     # hub LEDs, mobo, RAM - each off/orange/off, one group at a time
-    python tools/probe.py hubrgb  # just the hub's LEDs (isolated, to rule out cross-device timing)
-    python tools/probe.py mobo    # just the mobo LED
-    python tools/probe.py ramrgb  # just the RAM
-    python tools/probe.py all     # fans then rgb
+    python tools/probe.py fans    # each fan channel off, one at a time (initializes first)
+    python tools/probe.py hubrgb  # each hub LED channel off/colour/off (initializes first)
+    python tools/probe.py mobo    # mobo LED via OpenRGB
+    python tools/probe.py ramrgb  # RAM via OpenRGB
+    python tools/probe.py all     # fans, then hubrgb, then mobo, then ramrgb
     python tools/probe.py hub     # liquidctl list/status/initialize - info only
     python tools/probe.py aio     # look for the Panorama pump as its own liquidctl device
 """
 
 import os
-import re
 import subprocess
 import sys
 import time
@@ -31,7 +36,10 @@ import time
 _ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 FAN_CHANNELS = [f"fan{i}" for i in range(1, 6)]
-ORANGE = (255, 107, 61)
+LED_CHANNELS = [f"led{i}" for i in range(1, 6)]
+ORANGE_HEX = "ff6b3d"
+ORANGE_RGB = (255, 107, 61)
+SETTLE = 0.5  # give the device/SDK server time to apply a write before checking
 
 
 def run(*args: str, match: str | None = None):
@@ -52,154 +60,101 @@ def run(*args: str, match: str | None = None):
     return result.stdout
 
 
+def _init_hub():
+    print("=== initialize (required once per power-on before fans/LEDs are reliable) ===")
+    run("initialize", match="control hub")
+
+
 def verify_fans():
     m = "control hub"
-    print("=== fans: one channel at a time ===")
+    _init_hub()
+    print("\n=== fans: one channel at a time ===")
     for ch in FAN_CHANNELS:
         run("set", ch, "speed", "0", match=m)
         input(f"{ch} at 0% now - note whether it stopped (or was already empty). Enter to restore.")
         run("set", ch, "speed", "40", match=m)
 
 
-def _openrgb_groups():
+def verify_hub_rgb():
+    m = "control hub"
+    _init_hub()
+    print("\n=== hub LEDs: one channel at a time ===")
+    for ch in LED_CHANNELS:
+        run("set", ch, "color", "off", match=m)
+        input(f"{ch} off now. Enter to light it up orange.")
+        run("set", ch, "color", "fixed", ORANGE_HEX, match=m)
+        input(f"{ch} should be solid orange now (hub firmware - stays without shyyctl running). "
+              "Enter to turn off + continue.")
+        run("set", ch, "color", "off", match=m)
+
+
+def _openrgb_group(device_type_name: str, name_contains: str | None = None):
     from openrgb import OpenRGBClient
     from openrgb.utils import DeviceType
     client = OpenRGBClient(address="127.0.0.1", port=6742, name="shyyctl-probe")
     devices = [d for d in client.devices if d is not None]
     if len(devices) != len(client.devices):
         print(f"({len(client.devices) - len(devices)} device(s) came back as None from "
-              "OpenRGB and were skipped - probably still settling after a restart)")
-    for device in devices:
-        try:
-            modes = [m.name for m in device.modes]
-        except Exception as exc:
-            modes = f"<error reading modes: {exc}>"
-        print(f"{device.name}  type={device.type}  leds={len(device.leds)}  modes={modes}")
-    return {
-        "hub (fan LEDs)": [d for d in devices if "NZXT" in d.name],
-        "mobo": [d for d in devices if d.type == DeviceType.MOTHERBOARD],
-        "ram": [d for d in devices if d.type == DeviceType.DRAM],
-    }
+              "OpenRGB - probably still settling after a restart)")
+    dtype = getattr(DeviceType, device_type_name)
+    return [d for d in devices
+            if d.type == dtype and (name_contains is None or name_contains in d.name)]
 
 
-def _set_static(devices, color):
-    from openrgb.utils import RGBColor
-    for device in devices:
-        for i, mode in enumerate(device.modes):
-            if mode.name.lower() == "static":
-                device.set_mode(i)
-                break
-    for device in devices:
-        device.set_color(RGBColor(*color))
-
-
-def _hub_led_counts():
-    """Ask the hub itself how many LEDs are on each channel - liquidctl's
-    'initialize' is where NZXT's own accessory detection surfaces (same thing
-    CAM reads to know it's an F120X vs F240X). Never hardcode/guess this."""
-    output = run("initialize", match="control hub")
-    counts = [int(n) for n in re.findall(r"(\d+)\s*LEDs?", output, re.IGNORECASE)]
-    if not counts:
-        print("Could not parse LED counts from 'initialize' output - falling back to a guess of 40.")
-        return None
-    print(f"Parsed LED counts per channel from the hub itself: {counts}")
-    return counts
-
-
-def _ensure_sized(devices, counts=None, default=40):
-    """Resizable zones (addressable strips OpenRGB can't measure on its own,
-    which is what the hub's leds=0 zones are) need an explicit length before
-    set_color has anything to write into. Uses the hub's own reported counts
-    where we have them, in channel order - falls back to a flat guess
-    otherwise, only to keep this probe usable before that's confirmed."""
-    i = 0
-    for device in devices:
-        for zone in device.zones:
-            before = len(zone.leds)
-            if before != 0:
-                print(f"  zone '{zone.name}' already has {before} LEDs, leaving as is")
-                continue
-            size = counts[i] if counts and i < len(counts) else default
-            i += 1
-            try:
-                zone.resize(size)
-            except Exception as exc:
-                print(f"  resize FAILED on zone '{zone.name}' (requested {size}): {exc}")
-                continue
-            after = len(zone.leds)
-            print(f"  zone '{zone.name}': resize({size}) called, now reports {after} LEDs"
-                  + ("" if after else "  <- still 0, resize had no effect"))
-
-
-SETTLE = 0.5  # give the SDK server time to actually apply a write before checking/moving on
-
-
-def _verify_group(label, devices):
+def _verify_openrgb(label, devices):
     if not devices:
         print(f"\n{label}: nothing found in OpenRGB.")
         return
+    from openrgb.utils import RGBColor
+
+    def set_static(color):
+        for device in devices:
+            for i, mode in enumerate(device.modes):
+                if mode.name.lower() == "static":
+                    device.set_mode(i)
+                    break
+        for device in devices:
+            device.set_color(RGBColor(*color))
+        time.sleep(SETTLE)
+
     print(f"\n=== {label}: off, then orange, then off ===")
-    _set_static(devices, (0, 0, 0))
-    time.sleep(SETTLE)
+    set_static((0, 0, 0))
     input(f"{label} should be off now. Enter to light it up.")
-    _set_static(devices, ORANGE)
-    time.sleep(SETTLE)
+    set_static(ORANGE_RGB)
     input(f"{label} should be solid orange now (Static mode - stays even if you close "
           "OpenRGB/this script). Enter to turn off + continue.")
-    _set_static(devices, (0, 0, 0))
-    time.sleep(SETTLE)
-
-
-def _connect_groups():
-    try:
-        return _openrgb_groups()
-    except ImportError:
-        print("pip install openrgb-python")
-        return None
-    except OSError as exc:
-        print("Could not reach OpenRGB SDK server:", exc)
-        return None
-
-
-def verify_hub_rgb():
-    groups = _connect_groups()
-    if groups is None:
-        return
-    counts = _hub_led_counts()
-    _ensure_sized(groups["hub (fan LEDs)"], counts=counts)
-    _verify_group("hub (fan LEDs)", groups["hub (fan LEDs)"])
+    set_static((0, 0, 0))
 
 
 def verify_mobo():
-    groups = _connect_groups()
-    if groups is None:
+    try:
+        devices = _openrgb_group("MOTHERBOARD")
+    except ImportError:
+        print("pip install openrgb-python")
         return
-    _verify_group("mobo", groups["mobo"])
+    except OSError as exc:
+        print("Could not reach OpenRGB SDK server:", exc)
+        return
+    _verify_openrgb("mobo", devices)
 
 
 def verify_ram_rgb():
-    groups = _connect_groups()
-    if groups is None:
+    try:
+        devices = _openrgb_group("DRAM")
+    except ImportError:
+        print("pip install openrgb-python")
         return
-    _verify_group("ram", groups["ram"])
-
-
-def verify_rgb():
-    """All three, one group fully finished (incl. a settle pause) before the next starts."""
-    groups = _connect_groups()
-    if groups is None:
+    except OSError as exc:
+        print("Could not reach OpenRGB SDK server:", exc)
         return
-    counts = _hub_led_counts()
-    _ensure_sized(groups["hub (fan LEDs)"], counts=counts)
-
-    for label, devices in groups.items():
-        _verify_group(label, devices)
-        time.sleep(SETTLE)
+    _verify_openrgb("ram", devices)
 
 
 def verify_all():
     verify_fans()
-    verify_rgb()
+    verify_hub_rgb()
+    verify_mobo()
+    verify_ram_rgb()
 
 
 def probe_hub():
@@ -225,8 +180,8 @@ def probe_aio():
     )
 
 
-COMMANDS = {"fans": verify_fans, "rgb": verify_rgb, "all": verify_all,
-            "hubrgb": verify_hub_rgb, "mobo": verify_mobo, "ramrgb": verify_ram_rgb,
+COMMANDS = {"fans": verify_fans, "hubrgb": verify_hub_rgb, "mobo": verify_mobo,
+            "ramrgb": verify_ram_rgb, "all": verify_all,
             "hub": probe_hub, "aio": probe_aio}
 
 if __name__ == "__main__":
