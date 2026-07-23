@@ -1,4 +1,4 @@
-"""Tryx Panorama display - USB CDC-ACM serial control channel + ADB for media.
+"""Tryx Panorama display - USB control channel + ADB for media.
 
 Protocol reverse-engineered by github.com/fadli0029/reed-tpse (MIT licence),
 read directly from its C++ source this session and ported here. That project
@@ -8,10 +8,22 @@ walked yet. The firmware family is presumably shared, but treat every
 command in this file as unverified until it's actually run against this
 specific panel - the same rule as everywhere else in this codebase.
 
+IMPORTANT, found by reading this project's own real KANALI logs (not from
+reed-tpse, which only documents Linux): on Windows this panel is NOT a
+CDC-ACM serial device. There is no COM port for it at all - that's why
+Device Manager shows nothing under Ports (COM & LPT). KANALI's own driver
+stack (UDB.exe) opens it as a raw WinUSB device at
+VID 0x391A / PID 0x1011 and re-exposes it internally via a named pipe.
+reed-tpse's serial framing (find_device()/Panorama below) is confirmed
+correct only for the Linux CDC-ACM case; on Windows, `usb_probe()` is the
+one that actually matches what's on the bus, and `find_device()`'s serial
+scan will never find this panel here regardless of any driver or KANALI
+question - it's simply looking at the wrong transport.
+
 Two separate channels, confirmed from reed-tpse's own README, not guessed:
-- USB CDC-ACM serial (a COM port on Windows, /dev/ttyACM* on Linux):
-  control commands - handshake, brightness, screen config. 115200 baud,
-  8N1, no flow control.
+- USB serial control channel - handshake, brightness, screen config.
+  On Linux this is CDC-ACM (/dev/ttyACM*, 115200 baud 8N1). On Windows it's
+  WinUSB (VID 0x391A:0x1011) instead of a COM port - see usb_probe() below.
 - ADB (adb.exe on Windows, must be on PATH): file transfer only, media is
   pushed to /sdcard/pcMedia/ on the panel's own (Android-based) storage.
   liquidctl/OpenRGB are never involved here - this is a third, independent
@@ -252,7 +264,12 @@ def find_device(timeout: float = 1.0) -> str | None:
     """Try every serial port on the system, handshake each, return the first
     one that answers with a real productId - mirrors reed-tpse's
     find_device(), which scans /dev/ttyACM* on Linux; ports on Windows have
-    no equivalent fixed naming, so every port has to be tried."""
+    no equivalent fixed naming, so every port has to be tried.
+
+    Confirmed this session to be the wrong transport for this panel on
+    Windows (see usb_probe() below) - kept only because it's still correct
+    on Linux, and in case some future firmware/driver combo does expose a
+    COM port here after all."""
     import serial.tools.list_ports
     for info in serial.tools.list_ports.comports():
         panel = Panorama(info.device, timeout=timeout)
@@ -265,6 +282,106 @@ def find_device(timeout: float = 1.0) -> str | None:
         finally:
             panel.disconnect()
     return None
+
+
+# -- raw USB visibility check (WinUSB, no COM port) -------------------------
+
+TRYX_VENDOR_ID = 0x391A
+PANORAMA_PRODUCT_ID = 0x1011
+
+
+def usb_probe() -> dict:
+    """Look for the panel at the raw USB bus level via pyusb/libusb - the one
+    check that works no matter what's bound to the device: no driver, the
+    WinUSB driver, KANALI running or not, COM port or not. This is what
+    Device Manager's Ports list can't show, and it's the only way left to
+    tell a real hardware/cabling problem apart from "something's just
+    holding the device open" once find_device() (see above) comes back
+    empty, since that function only ever looks at COM ports.
+
+    Never raises for the ordinary failure cases (nothing plugged in,
+    something else has it open) - those are exactly the cases this exists
+    to tell apart, and each comes back as reason/likely_cause text instead
+    of an exception. Only genuinely unexpected failures propagate.
+    """
+    try:
+        import usb.core
+        import usb.util
+    except ImportError:
+        return {
+            "ok": False,
+            "reason": "pyusb not installed (pip install pyusb libusb-package)",
+        }
+
+    backend = None
+    try:
+        import libusb_package
+        backend = libusb_package.get_libusb1_backend()
+    except Exception as exc:
+        log.debug("libusb_package backend unavailable, falling back to pyusb's default search: %s", exc)
+
+    try:
+        find_kwargs = {"find_all": True, "idVendor": TRYX_VENDOR_ID}
+        if backend is not None:
+            find_kwargs["backend"] = backend
+        devices = list(usb.core.find(**find_kwargs))
+    except usb.core.NoBackendError:
+        return {
+            "ok": False,
+            "reason": "no libusb backend found (pip install libusb-package, or "
+                      "put libusb-1.0.dll next to python.exe)",
+        }
+
+    if not devices:
+        return {
+            "ok": False,
+            "reason": (
+                f"No USB device with vendor id 0x{TRYX_VENDOR_ID:04x} (Tryx) is visible "
+                "on the bus at all. This is below any driver or software - Windows isn't "
+                "seeing the device electrically. Points at the physical connection: the "
+                "panel's internal USB 2.0 header cable to the motherboard (reseat it, try "
+                "a different header), or its power connector, not KANALI/drivers/software."
+            ),
+            "devices": [],
+        }
+
+    result = {"ok": True, "devices": []}
+    for dev in devices:
+        info = {
+            "vendor_id": f"0x{dev.idVendor:04x}",
+            "product_id": f"0x{dev.idProduct:04x}",
+            "is_panorama": dev.idProduct == PANORAMA_PRODUCT_ID,
+            "bus": dev.bus,
+            "address": dev.address,
+        }
+        try:
+            info["manufacturer"] = usb.util.get_string(dev, dev.iManufacturer) if dev.iManufacturer else None
+            info["product"] = usb.util.get_string(dev, dev.iProduct) if dev.iProduct else None
+        except Exception as exc:
+            info["manufacturer"] = None
+            info["product"] = None
+            info["string_read_error"] = str(exc)
+        try:
+            cfg = dev.get_active_configuration()
+            info["accessible"] = True
+            info["num_interfaces"] = cfg.bNumInterfaces
+            info["endpoints"] = [
+                f"0x{ep.bEndpointAddress:02x}" for intf in cfg for ep in intf
+            ]
+        except usb.core.USBError as exc:
+            info["accessible"] = False
+            info["access_error"] = str(exc)
+            lowered = str(exc).lower()
+            info["likely_cause"] = (
+                "Another process already has it open exclusively - most likely KANALI's "
+                "UDB.exe (even a stuck/background instance after 'closing' the app). Check "
+                "Task Manager and end it, then retry."
+                if "access" in lowered or "denied" in lowered or "busy" in lowered
+                else "Device is visible but its configuration couldn't be read - may need "
+                     "the WinUSB driver (re)bound via Zadig, or running this as Administrator."
+            )
+        result["devices"].append(info)
+    return result
 
 
 # -- media transfer over ADB -----------------------------------------------

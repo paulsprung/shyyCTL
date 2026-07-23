@@ -2,14 +2,19 @@
 display equivalent of tools/test_app.py.
 
 Needs:
-    pip install pyserial
+    pip install pyserial pyusb libusb-package
     adb.exe on PATH (Android platform-tools - just the zip, no Android
     Studio: https://developer.android.com/tools/releases/platform-tools)
 
 Nothing here is verified yet - the protocol was ported from reed-tpse,
 which tested against the Panorama SE/360, not this project's 240mm/2-fan
-unit. Run 'find' first; if handshake fails, the protocol may need
-adjusting for this specific panel before anything else will work.
+unit. Real KANALI logs from this hardware showed this panel is WinUSB
+(VID 0x391A:0x1011) on Windows, not a COM port - so start with option 8
+("raw USB visibility"), not option 1/6, since those only look at serial
+ports and can never see this device here. Once option 8 confirms the
+device is visible and accessible, the serial handshake in this file would
+still need porting to WinUSB bulk transfers before anything past that
+point works - not done yet.
 
 Usage:
     python tools/test_panorama.py
@@ -25,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
-from app.panorama import Panorama, Media, find_device
+from app.panorama import Panorama, Media, find_device, usb_probe
 
 _panel: Panorama | None = None
 
@@ -135,14 +140,39 @@ def test_set_default_image():
     print("Should be showing now - and should persist across a reboot, per reed-tpse's README.")
 
 
+def test_usb_probe():
+    """Checks the raw USB bus for VID 0x391A (Tryx), independent of any
+    driver/COM port/KANALI - start here, since this panel has no COM port
+    on Windows at all (confirmed from real KANALI logs this session)."""
+    result = usb_probe()
+    if not result["ok"]:
+        print("NOT FOUND:", result["reason"])
+        return
+    print(f"Found {len(result['devices'])} Tryx USB device(s):")
+    for dev in result["devices"]:
+        tag = " <-- Panorama (PID 0x1011)" if dev["is_panorama"] else ""
+        print(f"  bus={dev['bus']} addr={dev['address']} "
+              f"vid={dev['vendor_id']} pid={dev['product_id']}{tag}")
+        if dev.get("manufacturer") or dev.get("product"):
+            print(f"    manufacturer={dev.get('manufacturer')!r} product={dev.get('product')!r}")
+        if dev["accessible"]:
+            print(f"    accessible=True, interfaces={dev['num_interfaces']}, "
+                  f"endpoints={dev['endpoints']}")
+        else:
+            print(f"    accessible=False ({dev['access_error']})")
+            print(f"    -> {dev['likely_cause']}")
+
+
 MENU = {
-    "1": ("Find + connect (handshake test)", test_find),
+    "1": ("Find + connect (handshake test, serial - see option 8 first)", test_find),
     "2": ("Full handshake info", test_handshake),
     "3": ("Brightness sweep (20 -> 100 -> 60)", test_brightness),
     "4": ("List media on the panel (via adb)", test_media_list),
     "5": ("Upload an image and set it as the default/boot screen", test_set_default_image),
     "6": ("List every serial port Windows/pyserial can see (no handshake)", test_list_ports),
     "7": ("Handshake on a specific COM port you name", test_handshake_on_port),
+    "8": ("Check raw USB visibility (pyusb, VID 0x391A) - works with no "
+          "driver/COM port, regardless of KANALI", test_usb_probe),
 }
 
 if __name__ == "__main__":
