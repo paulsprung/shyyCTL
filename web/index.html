@@ -546,7 +546,7 @@ function drawStatusPreview(){
     if(u.kind === "display") continue;
     const key = unitColorKey(u);
     const color = key && lastAppliedColors[key] ? lastAppliedColors[key] : "var(--rule)";
-    const pts = layoutData.leds.filter(l=>l.unit===u.id).map(l=>[svgX(u.x+l._ox), svgY(u.y+l._oy)]);
+    const pts = layoutData.leds.filter(l=>l.unit===u.id).map(l=>[shapeX(u,l), shapeY(u,l)]);
     out += pts.map(([x,y])=>`<circle cx="${x}" cy="${y}" r="3" fill="${color}"/>`).join("");
   }
   svg.innerHTML = out;
@@ -794,10 +794,24 @@ function renderScan(){
    future multi-view mode) but the UI doesn't filter by it right now. */
 
 const CANVAS_W = 900, CANVAS_H = 600, CANVAS_PAD = 24;
-function svgX(nx){ return CANVAS_PAD + nx * (CANVAS_W - CANVAS_PAD*2); }
-function svgY(ny){ return CANVAS_PAD + ny * (CANVAS_H - CANVAS_PAD*2); }
-function invX(sx){ return (sx-CANVAS_PAD) / (CANVAS_W - CANVAS_PAD*2); }
-function invY(sy){ return (sy-CANVAS_PAD) / (CANVAS_H - CANVAS_PAD*2); }
+const PLOT_W = CANVAS_W - CANVAS_PAD*2, PLOT_H = CANVAS_H - CANVAS_PAD*2;
+// A unit's *position* can stretch to fill the whole (non-square) canvas
+// fine - that's just "where is it". A unit's *shape* (the LED offsets
+// around that position) must not: mapping x through PLOT_W and y through
+// PLOT_H at the same time as the position, like one early version did,
+// silently stretched every shape horizontally by PLOT_W/PLOT_H (~1.5x on
+// a 900x600 canvas) - confirmed as the cause of an F120X ring rendering
+// as a flattened oval instead of a circle, and made an "edge on" F360X
+// look like a bare two-row ladder instead of a recognisable capsule.
+// SHAPE_SCALE is one uniform px-per-normalised-unit factor applied to
+// offsets only, after the position has already been placed.
+const SHAPE_SCALE = Math.min(PLOT_W, PLOT_H);
+function svgX(nx){ return CANVAS_PAD + nx * PLOT_W; }
+function svgY(ny){ return CANVAS_PAD + ny * PLOT_H; }
+function invX(sx){ return (sx-CANVAS_PAD) / PLOT_W; }
+function invY(sy){ return (sy-CANVAS_PAD) / PLOT_H; }
+function shapeX(u, l){ return svgX(u.x) + l._ox * SHAPE_SCALE; }
+function shapeY(u, l){ return svgY(u.y) + l._oy * SHAPE_SCALE; }
 
 async function loadLayout(){
   try{ layoutData = await api("/api/layout"); }
@@ -845,7 +859,7 @@ function drawSetupCase(){
   for(const u of layoutData.units){
     const sel = selectedUnit === u.id;
     const pts = layoutData.leds.filter(l=>l.unit===u.id)
-      .map(l=>[svgX(u.x + l._ox), svgY(u.y + l._oy)]);
+      .map(l=>[shapeX(u,l), shapeY(u,l)]);
     if(!pts.length) continue;
     const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
     const x0 = Math.min(...xs)-10, y0 = Math.min(...ys)-10;

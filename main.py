@@ -111,6 +111,18 @@ async def get_panorama():
     global _panorama, _panorama_info
     async with _panorama_lock:
         if _panorama is not None and _panorama.connected:
+            if _panorama_info is None:
+                # The one handshake attempt for this connection didn't
+                # stick yet (e.g. it raced the device's own startup, or a
+                # reply timed out) - retry here instead of returning the
+                # same cached None for the rest of this connection's
+                # lifetime. Confirmed against a real run this was a
+                # genuine regression: once _panorama_info was None, every
+                # later call hit this fast path and never tried again.
+                try:
+                    _panorama_info = await asyncio.to_thread(_panorama.handshake)
+                except Exception as exc:
+                    log.warning("panorama handshake retry failed: %s", exc)
             return _panorama
         _panorama = await asyncio.to_thread(_find_panorama)
         _panorama_info = None
