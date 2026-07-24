@@ -260,11 +260,45 @@ async def set_curve(body: CurveRequest):
 
 # -- RGB: motherboard / RAM / hub -------------------------------------------
 
+def _open_hub_raw() -> OpenRgbRaw:
+    return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
+
+
+def _hub_via_raw() -> dict | None:
+    """The hub's real zone sizes, straight from the protocol-5 client -
+    see app/openrgb_raw.py's docstring. openrgb_bridge.py's describe_all()
+    can never show these correctly: OpenRGB's server deliberately reports
+    this hub's effects-only zones as 0/1 LEDs to any protocol-4 client,
+    by design, no matter what the real size is. Returns None on any
+    failure so the caller can fall back to whatever the v4 list already
+    has rather than losing the whole response over the hub specifically."""
+    try:
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                return None
+            return {
+                "name": ctrl.name,
+                "type": "LEDSTRIP",
+                "leds": ctrl.num_leds,
+                "modes": [m.name for m in ctrl.modes],
+                "zones": [{"name": z.name, "leds": z.leds_count} for z in ctrl.zones],
+            }
+    except Exception as exc:
+        log.warning("Could not fetch hub zones via the raw v5 client: %s", exc)
+        return None
+
+
 @app.get("/api/rgb/devices")
 async def rgb_devices():
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
-    return await asyncio.to_thread(openrgb.describe_all)
+    devices = await asyncio.to_thread(openrgb.describe_all)
+    hub_entry = await asyncio.to_thread(_hub_via_raw)
+    if hub_entry is not None:
+        devices = [d for d in devices if "NZXT" not in d["name"]]
+        devices.append(hub_entry)
+    return devices
 
 
 @app.get("/api/rgb/debug")
@@ -309,10 +343,6 @@ async def set_ram_color(body: ColorRequest):
 
 class ResizeRequest(BaseModel):
     leds: int
-
-
-def _open_hub_raw() -> OpenRgbRaw:
-    return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
 
 
 @app.post("/api/rgb/hub/{channel}/resize")
