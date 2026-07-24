@@ -280,7 +280,12 @@ def _hub_via_raw() -> dict | None:
             return {
                 "name": ctrl.name,
                 "type": "LEDSTRIP",
-                "leds": ctrl.num_leds,
+                # ctrl.num_leds (the controller-level LED array size, not
+                # the zones) doesn't reliably track zone resizes for this
+                # device - confirmed it can read back as 0 right after a
+                # zone was correctly resized to a real, verified count.
+                # The zones themselves are the source of truth here.
+                "leds": sum(z.leds_count for z in ctrl.zones),
                 "modes": [m.name for m in ctrl.modes],
                 "zones": [{"name": z.name, "leds": z.leds_count} for z in ctrl.zones],
             }
