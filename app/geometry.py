@@ -119,6 +119,18 @@ def expected_leds(fans: int) -> int | None:
     return None
 
 
+# Real fans cluster LEDs tightly at each frame corner and at each seam
+# between adjacent fans, rather than spreading them evenly around a smooth
+# capsule outline - confirmed by directly watching the LED-order test
+# animation (app/main.py's chase effect) run on real F120X/F240X/F360X
+# hardware and comparing against the Setup canvas: every model showed
+# groups of 4 LEDs bunched together at each corner/seam, not a continuous
+# even sweep. CLUSTER_FRACTION is how much of a cap's arc or a side's
+# per-gap span an actual cluster occupies - small enough that the group
+# reads as "bunched", not smeared back into a uniform spread.
+CLUSTER_FRACTION = 0.2
+
+
 def led_positions(model: Model, radius: float = 1.0,
                   vertical: bool = True) -> list[tuple[float, float]]:
     """LED coordinates in unit space, centred on (0, 0).
@@ -127,24 +139,55 @@ def led_positions(model: Model, radius: float = 1.0,
     straight side. Order is the assumed physical wiring order; the setup
     screen can reverse it if the LED walk shows the strip runs the other way.
 
+    Within each cap and each side, LEDs are grouped into tight clusters at
+    the real corners/seams (see CLUSTER_FRACTION above) rather than spread
+    evenly - this changes *where* a given index renders, not how many
+    LEDs exist or their traversal order, so it doesn't touch any
+    confirmed LED count (F120X/F240X/F360X are unaffected: still
+    16/24/36) and rotate()/reversed_leds keep working unchanged.
+
     `radius` is the fan radius. A 120 mm fan is 120 mm across, so in
     millimetres radius = 60.
     """
     gaps = model.fans - 1
     span = gaps * 2 * radius          # first fan centre to last fan centre
     side_per_gap = _side_leds_per_gap(model)
-    n_side = side_per_gap * gaps
     pts: list[tuple[float, float]] = []
 
     def arc(ox: float, oy: float, a0: float, a1: float):
-        for i in range(CAP_LEDS):
-            t = a0 + (a1 - a0) * ((i + 0.5) / CAP_LEDS)
+        # CAP_LEDS splits into two corner clusters, one bunched near a0
+        # and one near a1, instead of one smooth sweep across the whole
+        # a0..a1 range - each end of a fan has its own real corner.
+        half = CAP_LEDS // 2
+        full_span = a1 - a0
+        cluster = full_span * CLUSTER_FRACTION
+        for i in range(half):
+            t = a0 + cluster * ((i + 0.5) / half)
+            pts.append((ox + cos(t) * radius, oy + sin(t) * radius))
+        for i in range(half):
+            t = a1 - cluster * ((half - i - 0.5) / half)
             pts.append((ox + cos(t) * radius, oy + sin(t) * radius))
 
     def line(x0: float, y0: float, x1: float, y1: float):
-        for i in range(n_side):
-            t = (i + 0.5) / n_side
-            pts.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        # One tight cluster of side_per_gap LEDs per fan-to-fan seam,
+        # positioned at that seam's real midpoint - not side_per_gap*gaps
+        # points spread evenly along the whole multi-fan side. F240X (1
+        # gap) gets one cluster at the side's midpoint; F360X (2 gaps)
+        # gets two separate clusters, one per seam, matching what was
+        # actually observed rather than one smeared-out run twice as long.
+        if gaps == 0 or side_per_gap == 0:
+            return
+        dx, dy = (x1 - x0) / gaps, (y1 - y0) / gaps
+        seam_len = (dx ** 2 + dy ** 2) ** 0.5
+        cluster = seam_len * CLUSTER_FRACTION
+        norm = seam_len or 1.0
+        ux, uy = dx / norm, dy / norm
+        for g in range(gaps):
+            cx = x0 + dx * (g + 0.5)
+            cy = y0 + dy * (g + 0.5)
+            for i in range(side_per_gap):
+                t = (i + 0.5) / side_per_gap - 0.5
+                pts.append((cx + ux * cluster * t, cy + uy * cluster * t))
 
     if vertical:
         top, bottom = -span / 2, span / 2

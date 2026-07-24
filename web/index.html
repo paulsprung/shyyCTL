@@ -1301,14 +1301,19 @@ function renderUnitProps(){
     ${u.kind === "fan" && u.led_channel ? `
     <div class="prop"><label>Test LED order</label>
       <div class="note" style="line-height:1.6;margin-bottom:8px">
-        Runs the same slow chase on this fan and on the dots above at the
-        same time (LED 0 on, 1 on, 2 on, 3 on, then LED 0 turns off as 4
-        turns on, and so on around the strip) - watch both together to
-        confirm the wiring order actually matches, then adjust LED offset
-        above until they line up.
+        Split first sets the first half of the strip red and the second
+        half blue, on the fan and on the dots above - a quick check that
+        the overall direction/rotation lines up before worrying about
+        exact indices. Chase then runs a slow moving light (LED 0 on, 1
+        on, 2 on, 3 on, then LED 0 off as 4 turns on, around the strip)
+        for fine-tuning the exact order. Adjust LED offset above until
+        whichever test you're running matches on both sides.
       </div>
       <div class="row">
-        <button class="btn sm" onclick="startLedOrderTest('${u.id}')">Start</button>
+        <button class="btn sec sm" onclick="startSplitTest('${u.id}')">Split (red/blue)</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn sm" onclick="startLedOrderTest('${u.id}')">Chase</button>
         <button class="btn sec sm" onclick="stopLedOrderTest()">Stop</button>
       </div>
     </div>` : ""}
@@ -1375,6 +1380,25 @@ async function identifyUnit(id){
    led_offset correction) is right - not just a static single-LED colour. */
 let ledTestRaf = null;
 const LED_TEST_WINDOW = 4, LED_TEST_STEP_S = 0.7;
+
+async function startSplitTest(unitId){
+  const u = layoutData.units.find(x=>x.id===unitId);
+  if(!u || !u.led_channel) return;
+  stopLedOrderTestLocal();
+  const leds = layoutData.leds.filter(l=>l.unit===unitId).sort((a,b)=>a.index-b.index);
+  const n = leds.length;
+  if(!n) return;
+  const colors = leds.map((l,i)=> i < n/2 ? "#ff0000" : "#0040ff");
+  try{
+    await api("/api/rgb/effects/stop",{method:"POST"}); // stop a running chase first, it would overwrite this
+    await api(`/api/rgb/hub/${u.led_channel}/leds`,{method:"POST",body:JSON.stringify({colors})});
+    say("Split test applied - the red/blue boundary shows where the strip's midpoint really is.");
+  }catch(e){ say(e.message,"error"); return; }
+  leds.forEach((l,i)=>{
+    const el = document.getElementById(`setupLed-${unitId}-${l.index}`);
+    if(el) el.setAttribute("fill", colors[i]);
+  });
+}
 
 async function startLedOrderTest(unitId){
   const u = layoutData.units.find(x=>x.id===unitId);
