@@ -1212,9 +1212,9 @@ function drawSetupCase(){
     stroke="var(--ink-soft)" stroke-width="1.2" opacity=".4" rx="3"/>`;
   for(const u of layoutData.units){
     const sel = selectedUnit === u.id;
-    const pts = layoutData.leds.filter(l=>l.unit===u.id)
-      .map(l=>[shapeX(u,l), shapeY(u,l)]);
-    if(!pts.length) continue;
+    const leds = layoutData.leds.filter(l=>l.unit===u.id);
+    if(!leds.length) continue;
+    const pts = leds.map(l=>[shapeX(u,l), shapeY(u,l)]);
     const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
     const x0 = Math.min(...xs)-10, y0 = Math.min(...ys)-10;
     const x1 = Math.max(...xs)+10, y1 = Math.max(...ys)+10;
@@ -1224,7 +1224,7 @@ function drawSetupCase(){
         stroke="${sel?'var(--signal)':'var(--ink-soft)'}" stroke-width="${sel?2:1}" opacity="${sel?.95:.5}"/>
       <text x="${x0}" y="${y0-6}" font-family="monospace" font-size="10"
         fill="${sel?'var(--signal)':'var(--ink-soft)'}">${u.name}</text>
-      ${pts.map(([x,y])=>`<circle cx="${x}" cy="${y}" r="3"
+      ${leds.map((l,i)=>`<circle id="setupLed-${u.id}-${l.index}" cx="${pts[i][0]}" cy="${pts[i][1]}" r="3"
         fill="${sel?'var(--signal)':'var(--rule)'}"/>`).join("")}
     </g>`;
   }
@@ -1294,11 +1294,24 @@ function renderUnitProps(){
         onchange="editUnit('led_offset', parseInt(this.value)||0)">
       <div class="note" style="line-height:1.6;margin-top:6px">
         Shifts which physical LED index 0 maps to, without changing the
-        shape - use this if Advanced's colour highlights the wrong LED
-        (e.g. a "right side" LED that lights up in the middle of a long
-        side on the 360mm unit). Click through each LED in Advanced to
-        see exactly which one lights, then nudge this until they line up.
+        shape - use this if the LED order test below (or Advanced's
+        per-LED colour) highlights the wrong LED, e.g. a "right side" LED
+        that lights up in the middle of a long side on the 360mm unit.
       </div></div>
+    ${u.kind === "fan" && u.led_channel ? `
+    <div class="prop"><label>Test LED order</label>
+      <div class="note" style="line-height:1.6;margin-bottom:8px">
+        Runs the same slow chase on this fan and on the dots above at the
+        same time (LED 0 on, 1 on, 2 on, 3 on, then LED 0 turns off as 4
+        turns on, and so on around the strip) - watch both together to
+        confirm the wiring order actually matches, then adjust LED offset
+        above until they line up.
+      </div>
+      <div class="row">
+        <button class="btn sm" onclick="startLedOrderTest('${u.id}')">Start</button>
+        <button class="btn sec sm" onclick="stopLedOrderTest()">Stop</button>
+      </div>
+    </div>` : ""}
     <div class="prop"><label>Info</label>
       <div class="note" style="line-height:1.7">
         ${u.model || u.kind}<br>
@@ -1352,6 +1365,51 @@ async function identifyUnit(id){
     await api(`/api/layout/identify/${id}`,{method:"POST"});
     say("Identify sent - check the hardware.");
   }catch(e){ say(e.message,"error"); }
+}
+
+/* LED order test: the real chase (main.py's _run_chase_effect) runs on
+   the actual hub, driven by the backend; this runs the identical pattern
+   against the Setup canvas's own dots via requestAnimationFrame, using
+   the same window/step so a human can watch the fan and the screen
+   together and see directly whether the wiring-order assumption (and any
+   led_offset correction) is right - not just a static single-LED colour. */
+let ledTestRaf = null;
+const LED_TEST_WINDOW = 4, LED_TEST_STEP_S = 0.7;
+
+async function startLedOrderTest(unitId){
+  const u = layoutData.units.find(x=>x.id===unitId);
+  if(!u || !u.led_channel) return;
+  stopLedOrderTestLocal();
+  const leds = layoutData.leds.filter(l=>l.unit===unitId).sort((a,b)=>a.index-b.index);
+  const n = leds.length;
+  if(!n) return;
+  try{
+    await api(`/api/rgb/hub/${u.led_channel}/chase/start`,{method:"POST",body:JSON.stringify({
+      window: LED_TEST_WINDOW, step_s: LED_TEST_STEP_S,
+    })});
+    say("LED order test running - watch the fan and the canvas together.");
+  }catch(e){ say(e.message,"error"); return; }
+  const start = performance.now();
+  function frame(now){
+    const step = Math.floor((now - start) / 1000 / LED_TEST_STEP_S) % n;
+    for(const l of leds){
+      const on = ((step - l.index + n) % n) < LED_TEST_WINDOW;
+      const el = document.getElementById(`setupLed-${unitId}-${l.index}`);
+      if(el) el.setAttribute("fill", on ? "#ffffff" : "var(--rule)");
+    }
+    ledTestRaf = requestAnimationFrame(frame);
+  }
+  ledTestRaf = requestAnimationFrame(frame);
+}
+
+function stopLedOrderTestLocal(){
+  if(ledTestRaf !== null){ cancelAnimationFrame(ledTestRaf); ledTestRaf = null; }
+}
+
+async function stopLedOrderTest(){
+  stopLedOrderTestLocal();
+  try{ await api("/api/rgb/effects/stop",{method:"POST"}); }catch(e){}
+  drawSetupCase();
 }
 
 /* ---------- settings ---------- */

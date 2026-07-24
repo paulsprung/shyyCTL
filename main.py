@@ -762,6 +762,51 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
     _effect_status = {"running": False, "kind": None, "error": None}
 
 
+def _run_chase_effect(channel: str, window: int, step_s: float):
+    """A calibration tool, not a look - lights a sliding window of `window`
+    consecutive LEDs (in the strip's own wiring order, index 0..n-1) and
+    advances it one step at a time: LED 0 on, LED 1 on, ... once the
+    window is full the trailing LED turns off as the next one lights, so
+    with window=4 that's "LED 0 on, 1 on, 2 on, 3 on, then at step 4 LED 0
+    turns off while 4 turns on" - wrapping continuously around the strip.
+    Setup's canvas runs the same sequence on the same channel's LEDs at
+    the same step timing (see startLedOrderTest in the frontend) so a
+    human can watch the on-screen dot and the real fan side by side and
+    see directly whether shyyctl's assumed wiring order (app/geometry.py
+    - flagged there as an inferred, never-walked placeholder for F360X)
+    actually matches the hardware, rather than guessing from a static
+    colour."""
+    global _effect_status
+    try:
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                _effect_status = {"running": False, "kind": None,
+                                   "error": "no hub RGB device found"}
+                return
+            zone = raw.zone_for_channel(ctrl, channel)
+            if zone is None or zone.leds_count == 0:
+                _effect_status = {"running": False, "kind": None,
+                                   "error": f"channel '{channel}' has no sized LEDs"}
+                return
+            n = zone.leds_count
+            raw.select_mode(ctrl, "direct")
+            step = 0
+            while not _effect_stop.is_set():
+                colors = [
+                    (255, 255, 255) if (step - i) % n < window else (0, 0, 0)
+                    for i in range(n)
+                ]
+                raw.set_zone_colors(ctrl.index, zone.index, colors)
+                step = (step + 1) % n
+                _effect_stop.wait(step_s)
+    except Exception as exc:
+        log.warning("LED order test stopped: %s", exc)
+        _effect_status = {"running": False, "kind": None, "error": str(exc)}
+        return
+    _effect_status = {"running": False, "kind": None, "error": None}
+
+
 async def _stop_effect():
     global _effect_task
     _effect_stop.set()
@@ -771,6 +816,23 @@ async def _stop_effect():
         except Exception:
             pass
         _effect_task = None
+
+
+class ChaseEffectRequest(BaseModel):
+    window: int = 4
+    step_s: float = 0.7
+
+
+@app.post("/api/rgb/hub/{channel}/chase/start")
+async def start_chase_effect(channel: str, body: ChaseEffectRequest):
+    global _effect_task, _effect_status
+    if _effect_status.get("running"):
+        raise HTTPException(409, "an effect is already running - stop it first")
+    _effect_stop.clear()
+    _effect_status = {"running": True, "kind": "chase", "channel": channel, "error": None}
+    _effect_task = asyncio.create_task(
+        asyncio.to_thread(_run_chase_effect, channel, max(body.window, 1), max(body.step_s, 0.1)))
+    return {"ok": True}
 
 
 class WaveEffectRequest(BaseModel):

@@ -208,15 +208,47 @@ class OpenRgbBridge:
         with self._lock:
             return [d for d in self._devices() if "NZXT" in d.name]
 
+    def _settled_by_type(self, device_type, retries: int = 4, delay: float = 1.5) -> list:
+        """A *stable* device list - no Nones, non-empty - can still be
+        genuinely short of the real hardware if OpenRGB's own SMBus/RAM
+        SPD detection just hasn't found every device yet (confirmed
+        against a real run: a second RAM stick and the motherboard both
+        intermittently missing from these endpoints when called shortly
+        after startup, despite both showing up fine in OpenRGB's own
+        client moments later). _devices()'s own retry loop doesn't help
+        here - its fast path returns the instant a list has no Nones,
+        without ever calling client.update() again, and client.devices is
+        a plain cached attribute that openrgb-python only repopulates on
+        an explicit update() call (see class docstring) - just re-reading
+        it in a loop returns the exact same frozen list forever.
+        reconnect() is the one call already proven in this codebase to
+        force a genuinely fresh read (OpenRGBClient.__init__ calls
+        update() itself - see resize_zone's docstring for the same
+        reasoning applied to the hub), so each retry here fully
+        reconnects rather than hoping a cached client's list has grown on
+        its own."""
+        best: list = []
+        for attempt in range(retries):
+            current = [d for d in self._devices() if d.type == device_type]
+            if len(current) <= len(best) and best:
+                break
+            best = current
+            if attempt < retries - 1:
+                log.debug("%d device(s) of type %s so far, reconnecting to check for more",
+                           len(best), device_type)
+                time.sleep(delay)
+                self.reconnect()
+        return best
+
     def motherboard(self) -> list:
         from openrgb.utils import DeviceType
         with self._lock:
-            return [d for d in self._devices() if d.type == DeviceType.MOTHERBOARD]
+            return self._settled_by_type(DeviceType.MOTHERBOARD)
 
     def ram(self) -> list:
         from openrgb.utils import DeviceType
         with self._lock:
-            return [d for d in self._devices() if d.type == DeviceType.DRAM]
+            return self._settled_by_type(DeviceType.DRAM)
 
     def describe_all(self) -> list[dict]:
         """Raw device/zone breakdown, exactly what OpenRGB itself reports -
