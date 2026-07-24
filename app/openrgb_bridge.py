@@ -14,6 +14,18 @@ Facts confirmed against real hardware this session, not assumptions:
   visibly changed every other channel at once).
 - Devices can transiently come back as None from the SDK client right after
   OpenRGB (re)starts - retry rather than giving up on the first attempt.
+- An empty devices list is its own failure mode, distinct from the above:
+  openrgb-python only populates client.devices when something calls
+  client.update() - it does that once inside OpenRGBClient.__init__ and
+  never again on its own. If our SDK connection lands while OpenRGB's own
+  (slow - SMBus/RAM SPD probing has been observed taking well past 30s)
+  internal hardware detection hasn't finished yet, __init__'s one update()
+  call catches a device count of zero and nothing ever re-asks - the SDK
+  socket just sits there holding a stale empty list forever. Confirmed
+  against a real run: /api/status showed openrgb.connected: true (the TCP
+  handshake and initial update() both genuinely succeeded) while
+  /api/rgb/devices stayed [] indefinitely. Retrying here has to actively
+  call client.update() again, not just re-read the same cached attribute.
 - 'Static' mode is what survives closing OpenRGB/shyyctl (the controller IC
   holds it); 'Direct' mode is for host-driven per-LED effects and needs
   shyyctl running continuously.
@@ -25,8 +37,11 @@ import time
 
 log = logging.getLogger("openrgb")
 
-RECONNECT_RETRIES = 4
-RETRY_DELAY = 1.5
+# OpenRGB's own RAM/SMBus detection has been observed taking well past 30s
+# on real hardware (see _devices() below) - the retry budget has to cover
+# that, not just a brief SDK-side hiccup.
+RECONNECT_RETRIES = 20
+RETRY_DELAY = 2.0
 
 
 class OpenRgbBridge:
@@ -82,10 +97,21 @@ class OpenRgbBridge:
         for attempt in range(retries):
             all_devices = self.client.devices
             clean = [d for d in all_devices if d is not None]
-            if len(clean) == len(all_devices):
+            if all_devices and len(clean) == len(all_devices):
                 return clean
-            log.warning("%d device(s) came back None from OpenRGB, retry %d/%d",
-                        len(all_devices) - len(clean), attempt + 1, retries)
+            if not all_devices:
+                # Nothing cached yet - re-query rather than re-reading the
+                # same stale (possibly permanently empty) attribute; see
+                # the class docstring for why this is necessary.
+                log.warning("OpenRGB reports 0 devices (detection may still be running), "
+                            "re-querying, retry %d/%d", attempt + 1, retries)
+                try:
+                    self.client.update()
+                except Exception as exc:
+                    log.warning("OpenRGB update() failed: %s", exc)
+            else:
+                log.warning("%d device(s) came back None from OpenRGB, retry %d/%d",
+                            len(all_devices) - len(clean), attempt + 1, retries)
             time.sleep(RETRY_DELAY)
         log.warning("gave up waiting for OpenRGB to settle, proceeding with %d device(s)",
                     len(clean))
