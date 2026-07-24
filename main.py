@@ -97,9 +97,12 @@ def _launch_vendor_openrgb() -> bool:
     its SDK server enabled, only called when nothing is already listening
     on the configured port - never launches a second instance alongside
     one the user is already running themselves. --server enables the SDK
-    server per OpenRGB's own documented CLI flags; unverified whether
-    --minimize-to-tray (also documented) behaves as expected across
-    versions, so it's included best-effort rather than relied on.
+    server; --startminimized starts it minimized to tray (implies --gui) -
+    confirmed against a real run this session that the flag is spelled
+    --startminimized, not --minimize-to-tray (that guess made OpenRGB
+    reject it as an invalid option and exit immediately without ever
+    starting the SDK server - exactly why the very first real test of
+    this saw a connection timeout with no server ever listening).
 
     Elevated via a UAC prompt (openrgb.launch_elevated in config.yaml,
     default on) - confirmed by direct user report that OpenRGB's RAM
@@ -117,7 +120,7 @@ def _launch_vendor_openrgb() -> bool:
         return False
 
     elevated = CONFIG.get("openrgb", {}).get("launch_elevated", True)
-    args = "--server --minimize-to-tray"
+    args = "--server --startminimized"
     log.info("Starting bundled OpenRGB (%s) with its SDK server%s...",
             exe, " (elevated - expect a UAC prompt)" if elevated else "")
     if elevated:
@@ -138,7 +141,7 @@ def _launch_vendor_openrgb() -> bool:
         return True
 
     try:
-        subprocess.Popen([str(exe), "--server", "--minimize-to-tray"], cwd=str(exe.parent))
+        subprocess.Popen([str(exe), "--server", "--startminimized"], cwd=str(exe.parent))
     except OSError as exc:
         log.warning("Could not launch bundled OpenRGB: %s", exc)
         return False
