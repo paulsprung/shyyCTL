@@ -54,10 +54,13 @@ for this hardware, this part isn't protocol-specific):
 """
 
 import ctypes
+import datetime
 import logging
+import random
 import struct
 import subprocess
 import time
+from pathlib import Path
 
 log = logging.getLogger("panorama")
 
@@ -263,6 +266,133 @@ def build_commit_frame() -> bytes:
     return build_tryx_frame(pb_bytes_field(1, b"") + pb_bytes_field(201, b""))
 
 
+# -- media upload: the real mechanism, confirmed against two independent ----
+# -- real uploads (different files, different sessions), NOT adb -----------
+#
+# ADB genuinely isn't involved in getting a new image/gif onto the panel -
+# `adb devices` sees nothing at all, and this three-message exchange (all
+# over the same usbprint.sys connection as everything else) is what two
+# separate real captures showed happening instead, byte-for-byte identical
+# in structure between them:
+#
+#   f400 announce: {session_id, filename, size}       -> ack (f800)
+#   f401 data:     {session_id, <container bytes>}    -> ack (f801)
+#   f402 finalize: {session_id, "media"}               -> ack (f802)
+#
+# session_id is a fresh small integer per upload (56559 and 176425 in the
+# two captures) - nothing suggests it needs to be anything but different
+# from other in-flight uploads, so a random int is used here.
+#
+# The container bytes (f401's payload) are NOT the original image/gif -
+# confirmed by fully decoding a real one field-by-field:
+#
+#   u32-LE(66)                     length of the header block below
+#   + protobuf header (66 bytes):
+#       f1 varint  = 1297631300    magic/version constant (MEDIA_MAGIC)
+#       f2 string  = "Tryx media header v1, fps={F}, size={W}x{H}"
+#       f3 varint  = 2             assumed constant (codec id?), unconfirmed
+#       f4 varint  = 1             assumed constant, unconfirmed
+#       f5 varint  = fps
+#       f6 varint  = width
+#       f7 varint  = height
+#       f8 varint  = 1             assumed constant, unconfirmed
+#   + raw H.264 Annex-B elementary stream (starts with the standard
+#     00 00 00 01 NAL start code)
+#
+# The video stream's own embedded x264 metadata string in the real capture
+# documents the exact encoder settings used (fps=30, keyint=30, crf=18.0,
+# profile baseline, yuv420p) - reproduced in encode_to_h264() below via
+# ffmpeg/libx264, not guessed. f3/f4/f8 are only confirmed as constants in
+# the one real upload decoded so far, not proven to never vary.
+
+MEDIA_MAGIC = 1297631300
+MEDIA_FPS = 30
+
+
+def _media_envelope(session_id: int) -> bytes:
+    return pb_message_field(1, pb_varint_field(2, session_id))
+
+
+def build_media_announce_frame(session_id: int, filename: str, size: int) -> bytes:
+    body = _media_envelope(session_id) + pb_message_field(
+        400, pb_string_field(1, filename) + pb_varint_field(2, size))
+    return build_tryx_frame(body)
+
+
+def build_media_data_frame(session_id: int, container: bytes) -> bytes:
+    body = _media_envelope(session_id) + pb_message_field(401, pb_bytes_field(1, container))
+    return build_tryx_frame(body)
+
+
+def build_media_finalize_frame(session_id: int) -> bytes:
+    body = _media_envelope(session_id) + pb_message_field(402, pb_string_field(1, "media"))
+    return build_tryx_frame(body)
+
+
+def build_media_container(width: int, height: int, fps: int, h264_bytes: bytes) -> bytes:
+    header = (
+        pb_varint_field(1, MEDIA_MAGIC)
+        + pb_string_field(2, f"Tryx media header v1, fps={fps}, size={width}x{height}")
+        + pb_varint_field(3, 2)
+        + pb_varint_field(4, 1)
+        + pb_varint_field(5, fps)
+        + pb_varint_field(6, width)
+        + pb_varint_field(7, height)
+        + pb_varint_field(8, 1)
+    )
+    return struct.pack("<I", len(header)) + header + h264_bytes
+
+
+def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDIA_HEIGHT,
+                   fps: int = MEDIA_FPS, duration_s: float = 2.0,
+                   ffmpeg_path: str = "ffmpeg") -> bytes | None:
+    """Encodes a local image or gif to a raw H.264 Annex-B stream matching
+    the encoder settings seen in a real captured upload (keyint=fps,
+    crf=18, baseline profile, yuv420p) - not proven to be strict
+    requirements, just what's confirmed to work. Static images are looped
+    for duration_s; gifs keep their own frame content/timing, just
+    resampled to fps. Requires ffmpeg on PATH. Returns None (logging the
+    reason) on any failure rather than raising - encoding failures are an
+    expected, recoverable case for a media-upload UI, not a bug."""
+    is_gif = Path(local_path).suffix.lower() == ".gif"
+    cmd = [ffmpeg_path, "-y"]
+    if not is_gif:
+        cmd += ["-loop", "1", "-t", str(duration_s)]
+    cmd += [
+        "-i", local_path,
+        "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"),
+        "-r", str(fps),
+        "-c:v", "libx264", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+        "-x264-params", f"keyint={fps}:crf=18",
+        "-f", "h264", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+    except FileNotFoundError:
+        log.error("ffmpeg not found on PATH")
+        return None
+    except subprocess.TimeoutExpired:
+        log.error("ffmpeg timed out encoding %s", local_path)
+        return None
+    if result.returncode != 0:
+        log.error("ffmpeg failed encoding %s: %s", local_path,
+                  result.stderr.decode(errors="replace")[-800:])
+        return None
+    return result.stdout
+
+
+def default_media_name(local_path: str) -> str:
+    """Matches the naming pattern seen in real KANALI uploads exactly:
+    a millisecond-precision timestamp, a '.png' middle extension
+    REGARDLESS of the source file's real type (confirmed against a real
+    .jpg upload that still ended up named '....png.h264_WxH' - the middle
+    extension appears to just be a generic label, not tied to source
+    format), then the confirmed .h264_WxH suffix."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
+    return f"{ts}.png{MEDIA_SUFFIX}"
+
+
 # -- shared command layer: identical over every transport -------------------
 #
 # The protocol above doesn't care how the bytes get to the device - only
@@ -405,11 +535,52 @@ class _PanoramaBase:
         real KANALI action resent the whole config, this does the same."""
         return self.set_screen_config(self.last_media, value, timeout_s=timeout_s)
 
-    def set_media(self, remote_name: str, timeout_s: float = 2.0) -> bool:
-        """remote_name is the name the file was pushed to the device as
-        (via Media.push below) - media_filename() applies the confirmed
-        post-transcode suffix automatically."""
-        return self.set_screen_config(media_filename(remote_name), self.last_brightness, timeout_s=timeout_s)
+    def set_media(self, filename: str, timeout_s: float = 2.0) -> bool:
+        """Switches to a file already on the device (see list_media()) -
+        filename must already include the confirmed suffix (.h264_WxH),
+        e.g. one of the built-in defaults, or a name returned by
+        upload_media() below."""
+        return self.set_screen_config(filename, self.last_brightness, timeout_s=timeout_s)
+
+    def upload_media(self, local_path: str, remote_name: str | None = None,
+                     duration_s: float = 2.0, timeout_s: float = 15.0) -> str | None:
+        """Encodes local_path (image or gif) and uploads it directly over
+        this same connection - the confirmed real mechanism (see
+        build_media_announce_frame() and friends above), not ADB. Requires
+        ffmpeg on PATH. Returns the filename to pass to set_media()/
+        set_screen_config() on success, or None (logged) on failure -
+        anywhere in encode/announce/send/finalize.
+
+        Does not itself call set_screen_config() - apply the upload with a
+        separate set_media(name) call once this returns, mirroring how the
+        real protocol keeps "store a file" and "show a file" as separate
+        steps."""
+        if not self.connected:
+            raise PanoramaError("not connected")
+        if remote_name is None:
+            remote_name = default_media_name(local_path)
+        h264 = encode_to_h264(local_path, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, duration_s)
+        if h264 is None:
+            return None
+        container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264)
+        session_id = random.randint(1, 999_999)
+
+        self._write(build_media_announce_frame(session_id, remote_name, len(container)))
+        if self.read_message(timeout_s=timeout_s) is None:
+            log.warning("upload_media: no response to announce frame")
+            return None
+
+        self._write(build_media_data_frame(session_id, container))
+        if self.read_message(timeout_s=timeout_s) is None:
+            log.warning("upload_media: no response to data frame")
+            return None
+
+        self._write(build_media_finalize_frame(session_id))
+        if self.read_message(timeout_s=timeout_s) is None:
+            log.warning("upload_media: no response to finalize frame")
+            return None
+
+        return remote_name
 
 
 # -- raw USB visibility check (WinUSB, no COM port) -------------------------
