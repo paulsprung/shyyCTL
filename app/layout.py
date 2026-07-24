@@ -70,8 +70,14 @@ class Layout:
 
         ram = scan_state.get("ram") or []
         for i, r in enumerate(ram):
+            # Every stick on a kit reports the identical OpenRGB device
+            # name (confirmed against real hardware: two sticks, both
+            # "ENE DRAM") - appending the stick number here is the only
+            # thing that keeps them visually distinguishable in Setup,
+            # Advanced and Status. Only used as a first-adopt default (see
+            # _merge below) - a name the human already edited always wins.
             units.append(self._merge(current, {
-                "id": f"ram-{i}", "kind": "ram", "name": r["name"], "leds": r["leds"],
+                "id": f"ram-{i}", "kind": "ram", "name": f"{r['name']} ({i + 1})", "leds": r["leds"],
             }, i, len(ram)))
 
         units.append(self._merge(current, {

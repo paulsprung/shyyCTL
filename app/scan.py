@@ -392,10 +392,22 @@ class Scan:
         # detection can still be running well after this connection was
         # made) now lives in OpenRgbBridge.motherboard()/.ram() themselves
         # (see _settled_by_type there) - every caller gets it, not just a
-        # scan, so this just calls them directly.
+        # scan. That retry is deliberately lightweight (client.update() on
+        # the existing connection, not a reconnect - see its docstring for
+        # why hammering reconnect() on every web request broke things), but
+        # its ~6s budget only helps if OpenRGB is *actively* mid-detection
+        # right now; it can't recover a device list that's been sitting
+        # stale in this bridge's cache since server startup because
+        # nothing has called update() on it since. A scan is a deliberate,
+        # infrequent, user-initiated action (unlike a page load), so one
+        # full reconnect() here - the same "once per rare action" pattern
+        # already used for the hub in _resize_hub_zones - guarantees a
+        # genuinely fresh read right before the result actually gets
+        # reported to the user, on top of the lightweight retry below.
         if not self.openrgb.connected and not self.openrgb.connect():
             log.warning("OpenRGB not reachable during scan: %s", self.openrgb.last_error)
             return
+        self.openrgb.reconnect()
         try:
             mobo = self.openrgb.motherboard()
             self.mobo = {"name": mobo[0].name, "leds": len(mobo[0].leds)} if mobo else None

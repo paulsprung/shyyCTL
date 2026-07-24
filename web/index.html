@@ -735,7 +735,7 @@ function renderRamSticks(){
   }
   box.innerHTML = ramSticks.map(s=>`
     <div class="row" style="justify-content:space-between;margin-bottom:6px">
-      <span>${s.name} <span class="note">${s.leds} LED</span></span>
+      <span>Stick ${s.index+1} <span class="note">${s.name} &middot; ${s.leds} LED</span></span>
       <span class="row">
         <input type="color" id="ramStickColor-${s.index}" value="#4c79ff">
         <button class="btn sm" onclick="setRamStickColor(${s.index})">Apply</button>
