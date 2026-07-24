@@ -263,9 +263,18 @@ class Scan:
             log.warning("No OpenRGB hub device found, skipping zone resize")
             return
         device = devices[0]
+        first = True
         for entry in self.results:
             if entry["confidence"] != "certain" or not entry["led_channel"] or not entry["leds"]:
                 continue
+            if not first:
+                # Confirmed against a real run: firing RESIZEZONE at several
+                # channels on the same hub back-to-back had only the first
+                # one actually stick - the hub needs a beat between USB
+                # commands, not just a longer read-back retry (see
+                # openrgb_bridge.resize_zone's docstring).
+                time.sleep(0.5)
+            first = False
             try:
                 ok = self.openrgb.resize_zone(device, entry["led_channel"], entry["leds"])
                 if not ok:

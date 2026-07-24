@@ -161,16 +161,35 @@ class OpenRgbBridge:
                 return zone
         return None
 
-    def resize_zone(self, device, channel: str, led_count: int) -> bool:
+    def resize_zone(self, device, channel: str, led_count: int,
+                     retries: int = 6, retry_delay: float = 0.5) -> bool:
         """Never call this with a guessed count - only with a number that
         came from the user picking a real fan model (geometry.expected_leds)
-        or from a source that actually verified it against the hardware."""
+        or from a source that actually verified it against the hardware.
+
+        Confirmed against a real run this session: resizing several zones
+        on the same NZXT hub device back-to-back had only the first call
+        actually stick - the rest read back as still 0 immediately
+        afterwards. zone.resize() re-reads the device right after sending
+        the resize command, but the hub itself has to round-trip the
+        change over USB before OpenRGB's own state catches up, and that
+        clearly outlasted an immediate single re-read under load. Retry
+        with a short settle delay instead of trusting the first read."""
         zone = self.zone_for_channel(device, channel)
         if zone is None:
             return False
         if len(zone.leds) == led_count:
             return True
         zone.resize(led_count)
+        for attempt in range(retries):
+            if len(zone.leds) == led_count:
+                return True
+            time.sleep(retry_delay)
+            try:
+                zone.update()
+            except Exception as exc:
+                log.warning("zone.update() failed while confirming resize of '%s': %s",
+                            channel, exc)
         return len(zone.leds) == led_count
 
     # -- colour -----------------------------------------------------------
