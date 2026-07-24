@@ -408,11 +408,22 @@ class Scan:
             log.warning("OpenRGB not reachable during scan: %s", self.openrgb.last_error)
             return
         self.openrgb.reconnect()
+        # Neither motherboard() nor ram() know anything about this scan's
+        # cancel event - they're shared with every other caller in the app
+        # and their retries are a plain blocking time.sleep(), not this
+        # scan's own interruptible _wait(). Checking here can't interrupt
+        # a retry loop already in flight, but it does mean a cancel that
+        # arrives between the two calls (or before either starts) actually
+        # takes effect instead of being silently ignored until both finish.
+        if self._cancel.is_set():
+            return
         try:
             mobo = self.openrgb.motherboard()
             self.mobo = {"name": mobo[0].name, "leds": len(mobo[0].leds)} if mobo else None
         except Exception as exc:
             log.warning("Could not read motherboard from OpenRGB: %s", exc)
+        if self._cancel.is_set():
+            return
         try:
             ram = self.openrgb.ram()
             self.ram = [{"name": d.name, "leds": len(d.leds)} for d in ram]

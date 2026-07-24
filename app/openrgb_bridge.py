@@ -54,10 +54,24 @@ import time
 log = logging.getLogger("openrgb")
 
 # OpenRGB's own RAM/SMBus detection has been observed taking well past 30s
-# on real hardware (see _devices() below) - the retry budget has to cover
-# that, not just a brief SDK-side hiccup.
-RECONNECT_RETRIES = 20
-RETRY_DELAY = 2.0
+# on real hardware right after shyyctl launches it - that's what this
+# budget was originally sized for (a one-time wait during server startup,
+# see main.py's lifespan). _devices() is now also called from every live
+# request through motherboard()/ram(), though (RGB tab, Advanced, a
+# scan...), and on a system where OpenRGB's SMBus access is failing
+# outright (confirmed by a real user's server log: "PawnIO module
+# initialization aborted", OpenRGB's modern WinRing0 replacement, right
+# before repeated "device(s) came back None" warnings) every retry just
+# reproduces the identical failure - there's nothing to wait out. The
+# previous 20x2s=40s budget turned each of those calls into a real, felt
+# multi-second-to-a-minute hang with no way to cancel out of it
+# (confirmed by direct user report: RAM/mobo requests "extremely
+# delayed", a scan stuck on this step with Cancel doing nothing - Cancel
+# only takes effect between scan steps, and this retry loop is a single
+# uninterruptible step). Cut down significantly - still enough to ride
+# out a brief real hiccup, not to spend a minute retrying a hard failure.
+RECONNECT_RETRIES = 6
+RETRY_DELAY = 1.0
 
 
 class OpenRgbBridge:
@@ -208,7 +222,7 @@ class OpenRgbBridge:
         with self._lock:
             return [d for d in self._devices() if "NZXT" in d.name]
 
-    def _settled_by_type(self, device_type, retries: int = 4, delay: float = 1.5) -> list:
+    def _settled_by_type(self, device_type, retries: int = 2, delay: float = 1.0) -> list:
         """A *stable* device list - no Nones, non-empty - can still be
         genuinely short of the real hardware if OpenRGB's own SMBus/RAM
         SPD detection just hasn't found every device yet (confirmed
@@ -238,7 +252,13 @@ class OpenRgbBridge:
         re-asks the *same* connection for the current device count/data
         (this is exactly what _devices()'s own already-safe retry uses
         for the empty/None case), with no socket teardown and no new SDK
-        client entry created in OpenRGB's own client list each time."""
+        client entry created in OpenRGB's own client list each time.
+
+        retries/delay trimmed down from an earlier 4/1.5s: this runs on
+        every live request, and on a system where OpenRGB genuinely can't
+        detect a device (not just slow to), more retries just spend more
+        real seconds reproducing the same failure - see RECONNECT_RETRIES's
+        comment above for the concrete report that motivated this."""
         best: list = []
         for attempt in range(retries):
             current = [d for d in self._devices() if d.type == device_type]

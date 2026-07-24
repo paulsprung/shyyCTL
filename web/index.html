@@ -209,11 +209,11 @@
       <div class="split">
         <div class="card">
           <div class="card-title">Motherboard</div>
-          <div class="note" style="line-height:1.6;margin:0 0 10px">
-            Only the real onboard zone - the X870-F's other addressable
-            headers are unconnected on this build and are never shown.
+          <div class="row">
+            <input type="color" id="moboColor" value="#4c79ff">
+            <label class="inline"><input type="checkbox" id="moboPersist" checked> persistent</label>
+            <button class="btn sm" onclick="setMoboColor()">Apply</button>
           </div>
-          <div id="moboLedsList"><div class="note">Loading&hellip;</div></div>
         </div>
         <div class="card">
           <div class="card-title">RAM</div>
@@ -678,44 +678,25 @@ async function setDuty(channel, value){
 
 /* ---------- rgb ---------- */
 
-/* Only the motherboard's one real onboard zone is ever shown - the
-   X870-F's 3 other zones are unconnected combo headers, always 0 LEDs,
-   not worth surfacing (see openrgb_bridge.py's real_zone_index). Tracked
-   client-side per LED index, same "last sent, not read back" reasoning
-   as everywhere else - shared with the Advanced page below. */
-let moboLeds = null; // {name, zone_index, leds}
-let moboLedColors = [];
-
-async function loadMoboLeds(){
+/* Whole-device write, same as it was originally - simplest, fastest, and
+   the one confirmed to reliably work. The other 3 zones on this board
+   (unconnected combo headers, always 0 LEDs) contribute nothing to a
+   whole-device write (see openrgb_bridge.py's set_color docstring), so
+   there's nothing to hide here; no separate zone/LED breakdown needed
+   in this main flow. Advanced still offers real per-LED control on the
+   one populated zone for anyone who wants it - moboLedColors below is
+   only for that page, lazily filled in on first use there. */
+async function setMoboColor(){
+  const hex = document.getElementById("moboColor").value;
   try{
-    moboLeds = await api("/api/rgb/mobo/leds");
-    moboLedColors = new Array(moboLeds.leds || 0).fill("#4c79ff");
-  }catch(e){ moboLeds = null; }
-}
-
-function renderMoboLeds(){
-  const box = document.getElementById("moboLedsList");
-  if(!moboLeds || !moboLeds.leds){
-    box.innerHTML = `<div class="note">No motherboard RGB device found.</div>`;
-    return;
-  }
-  box.innerHTML = Array.from({length: moboLeds.leds}, (_, i) => `
-    <div class="row" style="justify-content:space-between;margin-bottom:6px">
-      <span>LED ${i}</span>
-      <input type="color" value="${moboLedColors[i]}" onchange="setMoboLedColor(${i}, this.value)">
-    </div>`).join("");
-}
-
-async function setMoboLedColor(index, hex){
-  moboLedColors[index] = hex;
-  try{
-    await api(`/api/rgb/mobo/led/${index}/color`,{method:"POST",body:JSON.stringify(
-      {color:hex, persistent:true})});
+    await api("/api/rgb/mobo/color",{method:"POST",body:JSON.stringify(
+      {color:hex, persistent:document.getElementById("moboPersist").checked})});
     rememberColor("mobo", hex);
-    say(`Motherboard LED ${index} set.`);
+    say("Motherboard colour applied.");
   }catch(e){ say(e.message,"error"); }
-  drawAdvancedCase();
 }
+
+let moboLedColors = [];
 
 /* Each RAM stick is its own OpenRGB device (confirmed via scan.py's
    earlier 2-stick detection fix) - controlled independently rather than
@@ -1507,7 +1488,6 @@ async function refresh(){
   await refresh();
   try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); renderHubSizes(); }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
-  try{ await loadMoboLeds(); renderMoboLeds(); }catch(e){}
   try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
   loadHubModes();
   pollEffectStatus();
