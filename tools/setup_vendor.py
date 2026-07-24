@@ -104,7 +104,13 @@ def setup_openrgb():
             for asset in release.get("assets", []):
                 name = asset.get("name", "")
                 lowered = name.lower()
-                if "windows" in lowered and lowered.endswith(".zip") and "debug" not in lowered:
+                # Confirmed against a real run this session: OpenRGB ships
+                # both Windows_32 and Windows_64 assets per release, and a
+                # bare "windows" check matched the 32-bit build first. This
+                # project (and any remotely current Windows machine) is
+                # 64-bit only.
+                if ("windows" in lowered and "64" in lowered and "32" not in lowered
+                        and lowered.endswith(".zip") and "debug" not in lowered):
                     asset_url = asset.get("browser_download_url")
                     asset_name = name
                     break
