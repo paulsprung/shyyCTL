@@ -1,186 +1,283 @@
 """Tryx Panorama display - USB control channel + ADB for media.
 
-Protocol reverse-engineered by github.com/fadli0029/reed-tpse (MIT licence),
-read directly from its C++ source this session and ported here. That project
-verified its work against the Panorama SE (2160x1080) and 360 (2240x1080) -
-this project's actual hardware is the 240mm 2-fan variant, which nobody has
-walked yet. The firmware family is presumably shared, but treat every
-command in this file as unverified until it's actually run against this
-specific panel - the same rule as everywhere else in this codebase.
+The real wire protocol, confirmed against a genuine KANALI session this
+project captured (Wireshark + USBPcap, decoded byte-for-byte, correlated
+against a precise documented action timeline - not reverse-engineered by
+guesswork): b"TRYX" + a 4-byte little-endian length + a real Protocol
+Buffers message, on host->device (OUT) frames. Device->host (IN) replies
+skip the "TRYX" prefix entirely and are raw protobuf directly.
 
-IMPORTANT, worked out from real hardware + KANALI's own driver install
-this session (not from reed-tpse, which only documents Linux): on Windows
-this panel (VID 0x391A / PID 0x1011, shows up as "RK PANO" - RK = Rockchip,
-its SoC) is NOT a CDC-ACM serial device - there is no COM port for it, which
-is why Device Manager shows nothing under Ports (COM & LPT). It also is NOT
-meant to be a raw WinUSB device: KANALI's own installer sets it up with
-Windows' built-in USB Printing Support class driver (usbprint.sys) -
-confirmed directly against this hardware's Device Manager entry, correcting
-an earlier assumption in this file that WinUSB was the intended driver
-(that assumption was based on a different USB path seen in KANALI's logs,
-which most likely belongs to a different Tryx USB component entirely, e.g.
-the AIO's pump/fan controller, not this display).
+This supersedes an earlier version of this file that ported
+github.com/fadli0029/reed-tpse's JSON-over-0x5A-frames protocol - that
+project verified its work against the Panorama SE (2160x1080) over Linux
+CDC-ACM, and turned out to not apply to this hardware at all: this panel
+(VID 0x391A / PID 0x1011, shows up as "RK PANO" - RK = Rockchip, its SoC)
+sent and received zero bytes of that protocol in real captures. The actual
+protocol confirmed here is unrelated to reed-tpse's, and this panel talks
+to Windows via usbprint.sys (USB Printing Support), not a COM port -
+PanoramaPrint below, via CreateFile/ReadFile/WriteFile, is the confirmed
+correct transport; this was independently verified as the driver KANALI's
+own installer sets up.
 
-Concretely, on Windows this panel is talked to via CreateFile/ReadFile/
-WriteFile on its USBPRINT device interface (PanoramaPrint below) - not via
-libusb/pyusb at all, which cannot open a usbprint.sys-bound device (see
-usb_probe()'s "not supported"/NotImplementedError case, hit when trying
-exactly that). PanoramaUSB (WinUSB via Zadig) is kept only as a fallback/
-diagnostic path - using it requires replacing usbprint.sys, which breaks
-KANALI's own access, and is not the vendor's intended setup.
-reed-tpse's serial framing (find_device()/Panorama below) is confirmed
-correct only for the Linux CDC-ACM case and never applies on Windows at
-all for this panel - it's simply the wrong transport here.
+Confirmed message types (field numbers are what real captured traffic
+uses - names are inferred from context, not from a schema, since none is
+public):
+    f100/f102/f101 (registration burst, sent once after connecting) ->
+        triggers the device to volunteer three replies unprompted:
+        f500 (device info: OS, kernel, firmware/app versions, serial),
+        f502 (screen resolution), f501 ("ok" ack).
+    f103 ("N/A" placeholder param) -> f503, a full listing of every media
+        file already on the device (both user-uploaded and built-in
+        defaults), each named "<original filename>.h264_<W>x<H>" - the
+        device transcodes everything (including plain images) to H.264
+        video internally after an ADB push completes.
+    f10 ("hello?") -> f10 ("Hey!") - lightweight periodic keepalive,
+        confirmed sent roughly every 2-4s during an active KANALI session.
+    f200 (screen config: poweron media, standby media, active media,
+        brightness) -> f600/f601 "ok" ack, immediately followed by a
+        second short f201 (empty) commit/flush packet. This ONE message
+        carries both "which file is showing" and "what brightness" -
+        every observed KANALI action (brightness change, applying an
+        image or gif) resends the FULL config, not a partial update.
+        Brightness (f200.f5.f2, 0-100) is simply omitted from the message
+        when 0, since protobuf skips default/zero values - confirmed by
+        directly diffing a 0% and a 100% capture, byte for byte.
 
-Two separate channels, confirmed from reed-tpse's own README, not guessed:
-- USB control channel - handshake, brightness, screen config. On Linux
-  this is CDC-ACM (/dev/ttyACM*, 115200 baud 8N1). On Windows it's
-  usbprint.sys (VID 0x391A:0x1011) instead of a COM port - see
-  PanoramaPrint below.
+Two separate channels, confirmed from reed-tpse's own README (still true
+for this hardware, this part isn't protocol-specific):
+- The USB control channel above - handshake, brightness, screen config.
 - ADB (adb.exe on Windows, must be on PATH): file transfer only, media is
-  pushed to /sdcard/pcMedia/ on the panel's own (Android-based) storage.
-  liquidctl/OpenRGB are never involved here - this is a third, independent
-  control surface.
-
-Frame format, byte for byte from reed-tpse's protocol.cpp:
-
-    0x5A <escaped payload> 0x5A
-
-    payload before escaping:
-        length (u16, big-endian) + header + '\r\n\r\n' + json_body + crc (u8)
-    header:
-        f"{request_state} {cmd_type} {version}\r\n"
-        f"ContentType=json\r\nContentLength={len(json_body)}\r\nAckNumber={n}\r\n"
-    length:
-        len(header + '\r\n\r\n' + json_body) + 5   (5 = protocol overhead)
-    crc:
-        sum of every byte from the length prefix through the byte just
-        before the crc itself, & 0xFF
-    escaping (applied to length+header+body+crc, NOT the outer 0x5A markers):
-        0x5A -> 0x5B 0x01
-        0x5B -> 0x5B 0x02
-
-Known commands (request_state is always "POST" for these):
-    conn                 - handshake; response JSON has productId/OS/sn/version
-    brightness            - {"value": 0-100}
-    waterBlockScreenId    - full screen config (media list, mode, ratio, ...)
-    mediaDelete           - {"include": [filenames]}
-
-The device wants a keepalive roughly every 60s or it reverts to its default
-screen (reed-tpse runs a background daemon for this) - not implemented here
-yet; this module is the protocol plus one-shot commands.
+  pushed to /sdcard/pcMedia/ on the panel's own (Android-based) storage,
+  then transcoded internally before it can be referenced in a screen
+  config message - see MEDIA_SUFFIX below. liquidctl/OpenRGB are never
+  involved here - this is a third, independent control surface.
 """
 
-import json
+import ctypes
 import logging
+import struct
 import subprocess
 import time
 
 log = logging.getLogger("panorama")
 
-FRAME_MARKER = 0x5A
-ESCAPE_MARKER = 0x5B
 MEDIA_PATH = "/sdcard/pcMedia/"
-BAUD_RATE = 115200
+TRYX_MAGIC = b"TRYX"
+MEDIA_WIDTH = 2240
+MEDIA_HEIGHT = 1080
+MEDIA_SUFFIX = f".h264_{MEDIA_WIDTH}x{MEDIA_HEIGHT}"
+DEFAULT_POWERON_MEDIA = f"default_poweron.mp4{MEDIA_SUFFIX}"
+DEFAULT_STANDBY_MEDIA = f"default_standby.mp4{MEDIA_SUFFIX}"
 
 
 class PanoramaError(Exception):
     pass
 
 
-# -- wire protocol, ported field-for-field from reed-tpse's protocol.cpp ----
+def media_filename(remote_name: str) -> str:
+    """The name a freshly-pushed file is referenced by in a screen config
+    message, once the device has transcoded it - confirmed against real
+    media listing responses this session (every entry, including plain
+    .png uploads, ends up suffixed exactly this way)."""
+    return remote_name + MEDIA_SUFFIX
 
-def _crc(data: bytes) -> int:
-    return sum(data) & 0xFF
 
+# -- protobuf wire format: minimal encoder + a schema-less decoder ----------
+#
+# No .proto schema is public for this device, so there's no code-generated
+# client here - just enough hand-rolled wire-format plumbing to build the
+# few confirmed message shapes above, and a generic decoder (field number +
+# wire type only, no names) good enough to inspect any response.
 
-def _escape(data: bytes) -> bytes:
+def _pb_varint(value: int) -> bytes:
     out = bytearray()
-    for b in data:
-        if b == FRAME_MARKER:
-            out += bytes((ESCAPE_MARKER, 0x01))
-        elif b == ESCAPE_MARKER:
-            out += bytes((ESCAPE_MARKER, 0x02))
+    while True:
+        b = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(b | 0x80)
         else:
             out.append(b)
+            break
     return bytes(out)
 
 
-def _unescape(data: bytes) -> bytes:
-    out = bytearray()
-    i = 0
-    while i < len(data):
-        if data[i] == ESCAPE_MARKER and i + 1 < len(data) and data[i + 1] in (0x01, 0x02):
-            out.append(FRAME_MARKER if data[i + 1] == 0x01 else ESCAPE_MARKER)
-            i += 2
-        else:
-            out.append(data[i])
-            i += 1
-    return bytes(out)
+def _pb_tag(field_no: int, wire_type: int) -> bytes:
+    return _pb_varint((field_no << 3) | wire_type)
 
 
-def build_frame(request_state: str, cmd_type: str, content: str = "",
-                 version: str = "1", ack_number: int = 0) -> bytes:
-    header = (f"{request_state} {cmd_type} {version}\r\n"
-              f"ContentType=json\r\n"
-              f"ContentLength={len(content)}\r\n"
-              f"AckNumber={ack_number}\r\n\r\n")
-    body = (header + content).encode("utf-8")
-    total_length = len(body) + 5
-    data = total_length.to_bytes(2, "big") + body
-    data += bytes((_crc(data),))
-    return bytes((FRAME_MARKER,)) + _escape(data) + bytes((FRAME_MARKER,))
+def pb_varint_field(field_no: int, value: int) -> bytes:
+    return _pb_tag(field_no, 0) + _pb_varint(value)
 
 
-class Response:
-    def __init__(self, raw: str, version: str, status: str, body: str, json_value):
-        self.raw = raw
-        self.version = version
-        self.status = status
-        self.body = body
-        self.json = json_value
-
-    def __repr__(self):
-        return f"Response(version={self.version!r}, status={self.status!r}, json={self.json!r})"
+def pb_bytes_field(field_no: int, data: bytes) -> bytes:
+    return _pb_tag(field_no, 2) + _pb_varint(len(data)) + data
 
 
-def parse_response(data: bytes) -> Response | None:
-    if len(data) < 4 or data[0] != FRAME_MARKER or data[-1] != FRAME_MARKER:
-        return None
-    payload = _unescape(data[1:-1])
-    if len(payload) < 3:
-        return None
-    message = payload[2:-1].decode("utf-8", errors="replace")  # skip length(2) + trailing crc(1)
-    separator = message.find("\r\n\r\n")
-    if separator == -1:
-        return Response(message, "", "", "", None)
-    header_part = message[:separator]
-    body = message[separator + 4:]
-    json_value = None
-    if body:
+def pb_string_field(field_no: int, text: str) -> bytes:
+    return pb_bytes_field(field_no, text.encode("utf-8"))
+
+
+def pb_message_field(field_no: int, *parts: bytes) -> bytes:
+    return pb_bytes_field(field_no, b"".join(parts))
+
+
+def decode_pb(buf: bytes) -> list:
+    """Schema-less decode: [(field_no, kind, value), ...], kind one of
+    varint/string/bytes/message/fixed32/fixed64. 'string' is a best-effort
+    guess (all-printable-ASCII length-delimited fields render as text,
+    everything else as a nested message or raw bytes) - good enough for
+    inspecting real traffic, not a substitute for a real schema."""
+    out = []
+    pos = 0
+    n = len(buf)
+    while pos < n:
+        start = pos
         try:
-            json_value = json.loads(body)
-        except json.JSONDecodeError:
-            json_value = None
-    first_line = header_part.split("\r\n", 1)[0]
-    parts = first_line.split()
-    version = parts[0] if len(parts) > 0 else ""
-    status = parts[1] if len(parts) > 1 else ""
-    return Response(message, version, status, body, json_value)
+            tag = 0
+            shift = 0
+            while True:
+                b = buf[pos]
+                pos += 1
+                tag |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+        except IndexError:
+            break
+        field_no, wire_type = tag >> 3, tag & 0x7
+        try:
+            if wire_type == 0:
+                val = 0
+                shift = 0
+                while True:
+                    b = buf[pos]
+                    pos += 1
+                    val |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                out.append((field_no, "varint", val))
+            elif wire_type == 2:
+                length = 0
+                shift = 0
+                while True:
+                    b = buf[pos]
+                    pos += 1
+                    length |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
+                chunk = buf[pos:pos + length]
+                pos += length
+                if len(chunk) != length:
+                    break
+                if chunk and all(32 <= b < 127 or b in (9, 10, 13) for b in chunk):
+                    out.append((field_no, "string", chunk.decode("ascii", "replace")))
+                else:
+                    nested = decode_pb(chunk) if chunk else []
+                    out.append((field_no, "message", nested) if nested else (field_no, "bytes", chunk))
+            elif wire_type == 5:
+                out.append((field_no, "fixed32", struct.unpack_from("<I", buf, pos)[0]))
+                pos += 4
+            elif wire_type == 1:
+                out.append((field_no, "fixed64", struct.unpack_from("<Q", buf, pos)[0]))
+                pos += 8
+            else:
+                pos = start
+                break
+        except (IndexError, struct.error):
+            pos = start
+            break
+    return out
 
 
-# -- shared command layer: identical over serial and raw USB ---------------
+def pb_get(entries: list, field_no: int):
+    """First value for a given top-level field number, or None."""
+    for fno, _kind, val in entries:
+        if fno == field_no:
+            return val
+    return None
+
+
+def build_tryx_frame(protobuf_body: bytes) -> bytes:
+    return TRYX_MAGIC + struct.pack("<I", len(protobuf_body)) + protobuf_body
+
+
+# -- confirmed message builders ----------------------------------------------
+
+def _envelope(inner: bytes) -> bytes:
+    """Every observed OUT message starts with an empty/near-empty f1
+    wrapper before the real payload field - reproduced as-is rather than
+    explained, since its purpose isn't clear from traffic alone."""
+    return inner
+
+
+def build_registration_burst() -> list:
+    """Three frames sent once after connecting; triggers the device to
+    volunteer its handshake info unprompted. Field values ("NA"/1) are
+    reproduced exactly as KANALI sends them - placeholders, not addresses
+    or anything device-specific, so hardcoding them is safe."""
+    f1 = pb_message_field(1, pb_varint_field(1, 1))
+    return [
+        build_tryx_frame(f1 + pb_message_field(100, pb_string_field(1, "NA"))),
+        build_tryx_frame(f1 + pb_message_field(102, pb_string_field(1, "NA"))),
+        build_tryx_frame(f1 + pb_message_field(101, pb_varint_field(1, 1))),
+    ]
+
+
+def build_ping_frame() -> bytes:
+    return build_tryx_frame(pb_bytes_field(1, b"") + pb_message_field(10, pb_string_field(1, "hello?")))
+
+
+def build_media_list_frame() -> bytes:
+    return build_tryx_frame(pb_bytes_field(1, b"") + pb_message_field(103, pb_string_field(1, "N/A")))
+
+
+def build_screen_config_frame(active_media: str, brightness: int,
+                              poweron_media: str = DEFAULT_POWERON_MEDIA,
+                              standby_media: str = DEFAULT_STANDBY_MEDIA) -> bytes:
+    """The one confirmed command for both 'which file is showing' and
+    'what brightness' - every real KANALI action resent this whole thing,
+    not a partial update, so this does too. brightness is clamped 0-100;
+    the subfield is omitted entirely at 0, matching real captured traffic
+    (protobuf skips default/zero values) rather than sending an explicit 0.
+    """
+    brightness = max(0, min(100, int(brightness)))
+    slot1 = pb_message_field(1, pb_string_field(1, poweron_media))
+    slot2 = pb_message_field(2, pb_varint_field(1, 1) + pb_string_field(2, standby_media))
+    slot3 = pb_message_field(3, pb_string_field(3, active_media))
+    if brightness > 0:
+        brightness_field = pb_message_field(5, pb_varint_field(1, 1) + pb_varint_field(2, brightness))
+    else:
+        brightness_field = pb_message_field(5, pb_varint_field(1, 1))
+    f200 = pb_message_field(200, slot1 + slot2 + slot3 + brightness_field)
+    return build_tryx_frame(pb_bytes_field(1, b"") + f200)
+
+
+def build_commit_frame() -> bytes:
+    """Empty follow-up sent right after screen config, every time,
+    reproduced as observed - purpose not confirmed (possibly a generic
+    flush/sync, since the same field also appeared after an unrelated
+    request in captured traffic), but harmless and cheap to always send."""
+    return build_tryx_frame(pb_bytes_field(1, b"") + pb_bytes_field(201, b""))
+
+
+# -- shared command layer: identical over every transport -------------------
 #
-# The frame protocol (build_frame/parse_response above) doesn't care how the
-# bytes get to the device - CDC-ACM serial and raw USB bulk endpoints both
-# just move bytes. Only _write()/_read_frame()/connect()/disconnect() differ
-# between transports; every actual command (handshake, brightness, screen
-# config) is transport-agnostic and lives here once.
+# The protocol above doesn't care how the bytes get to the device - only
+# _write()/_read_message()/connect()/disconnect() differ between
+# transports; every actual command (handshake, ping, screen config) is
+# transport-agnostic and lives here once. Responses are read message by
+# message (one _read_message() call = one complete protobuf reply), not
+# accumulated byte-by-byte looking for a framing marker - confirmed against
+# real hardware that each read already returns exactly one complete reply.
 
 class _PanoramaBase:
     def __init__(self, timeout: float = 1.0):
         self.timeout = timeout
-        self._seq = 0
+        self.last_media: str = DEFAULT_STANDBY_MEDIA
+        self.last_brightness: int = 100
 
     @property
     def connected(self) -> bool:
@@ -195,143 +292,116 @@ class _PanoramaBase:
     def _write(self, frame: bytes):
         raise NotImplementedError
 
-    def _read_frame(self, timeout_s: float) -> bytes:
+    def _read_message(self, timeout_s: float) -> bytes:
+        """One read attempt; returns whatever came back (already a
+        complete protobuf message) or b'' on timeout/nothing."""
         raise NotImplementedError
 
-    def send_command(self, request_state: str, cmd_type: str, content: str = "",
-                     wait_response: bool = True) -> Response | None:
-        if not self.connected:
-            raise PanoramaError("not connected")
-        self._seq += 1
-        frame = build_frame(request_state, cmd_type, content, "1", self._seq)
-        self._write(frame)
-        if not wait_response:
-            return None
-        time.sleep(0.5)  # matches reed-tpse's fixed pre-read delay
-        raw = self._read_frame(timeout_s=2.0)
+    def read_message(self, timeout_s: float = 2.0) -> list | None:
+        raw = self._read_message(timeout_s)
         if not raw:
             return None
-        return parse_response(raw)
+        return decode_pb(raw)
 
-    def handshake(self) -> dict | None:
-        response = self.send_command("POST", "conn")
-        if response is None or response.json is None:
+    def read_messages(self, count: int, timeout_s: float = 2.0) -> list:
+        out = []
+        for _ in range(count):
+            entries = self.read_message(timeout_s)
+            if entries is None:
+                break
+            out.append(entries)
+        return out
+
+    def handshake(self, timeout_s: float = 2.0) -> dict | None:
+        if not self.connected:
+            raise PanoramaError("not connected")
+        for frame in build_registration_burst():
+            self._write(frame)
+        replies = self.read_messages(3, timeout_s=timeout_s)
+        info = None
+        resolution = None
+        for entries in replies:
+            device_info = pb_get(entries, 500)
+            if device_info is not None:
+                info = device_info
+            res = pb_get(entries, 502)
+            if res is not None:
+                resolution = res
+        if info is None:
             return None
-        j = response.json
-        return {
-            "product_id": j.get("productId", "unknown"),
-            "os": j.get("OS", "unknown"),
-            "serial": j.get("sn", "unknown"),
-            "app_version": j.get("version", {}).get("app", "unknown"),
-            "firmware": j.get("version", {}).get("firmware", "unknown"),
-            "hardware": j.get("version", {}).get("hardware", "unknown"),
-            "attributes": j.get("attribute", []),
+        result = {
+            "os": pb_get(info, 1),
+            "kernel": pb_get(info, 2),
+            "firmware": pb_get(info, 3),
+            "product": pb_get(info, 4),
+            "app_version": pb_get(info, 5),
+            "model": pb_get(info, 8),
+            "serial": pb_get(info, 10),
         }
+        if resolution is not None:
+            res_field = pb_get(resolution, 10)
+            if res_field is not None:
+                result["width"] = pb_get(res_field, 1)
+                result["height"] = pb_get(res_field, 2)
+        return result
 
-    def set_brightness(self, value: int) -> Response | None:
-        value = max(0, min(100, int(value)))
-        return self.send_command("POST", "brightness", json.dumps({"value": value}))
+    def ping(self, timeout_s: float = 2.0) -> bool:
+        if not self.connected:
+            raise PanoramaError("not connected")
+        self._write(build_ping_frame())
+        entries = self.read_message(timeout_s=timeout_s)
+        return entries is not None
 
-    def set_screen_config(self, media: list[str], screen_mode: str = "Full Screen",
-                          ratio: str = "2:1", play_mode: str = "Single") -> Response | None:
-        config = {
-            "Type": "Custom",
-            "id": "Customization",
-            "screenMode": screen_mode,
-            "ratio": ratio,
-            "playMode": play_mode,
-            "media": media,
-            "settings": {
-                "position": "Top", "color": "#FFFFFF", "align": "Center",
-                "badges": [], "filter": {"value": "", "opacity": 0.0},
-            },
-            "sysinfoDisplay": [],
-        }
-        content = json.dumps(config)
-        # reed-tpse sends this twice - the device otherwise sometimes keeps
-        # showing a cached config from before the first apply.
-        self.send_command("POST", "waterBlockScreenId", content)
-        time.sleep(0.5)
-        return self.send_command("POST", "waterBlockScreenId", content)
+    def list_media(self, timeout_s: float = 2.0) -> list:
+        """Media already on the device, per its own listing response -
+        parsed generically since the exact per-entry field layout beyond
+        f1 (path)/f2 (suffix)/f3 (size bytes) is only loosely confirmed."""
+        if not self.connected:
+            raise PanoramaError("not connected")
+        self._write(build_media_list_frame())
+        entries = self.read_message(timeout_s=timeout_s)
+        if entries is None:
+            return []
+        listing = pb_get(entries, 503)
+        if listing is None:
+            return []
+        items = []
+        for field_no, kind, val in listing:
+            if kind != "message":
+                continue
+            items.append({
+                "path": pb_get(val, 1),
+                "suffix": pb_get(val, 2),
+                "size": pb_get(val, 3),
+            })
+        return items
 
-    def delete_media(self, filenames: list[str]) -> Response | None:
-        return self.send_command("POST", "mediaDelete", json.dumps({"include": filenames}))
+    def set_screen_config(self, active_media: str, brightness: int | None = None,
+                          poweron_media: str = DEFAULT_POWERON_MEDIA,
+                          standby_media: str = DEFAULT_STANDBY_MEDIA,
+                          timeout_s: float = 2.0) -> bool:
+        if not self.connected:
+            raise PanoramaError("not connected")
+        if brightness is None:
+            brightness = self.last_brightness
+        self._write(build_screen_config_frame(active_media, brightness, poweron_media, standby_media))
+        ok = self.read_message(timeout_s=timeout_s) is not None
+        self._write(build_commit_frame())
+        self.last_media = active_media
+        self.last_brightness = max(0, min(100, int(brightness)))
+        return ok
 
+    def set_brightness(self, value: int, timeout_s: float = 2.0) -> bool:
+        """Resends the full screen config with the last-known active media
+        unchanged - there's no confirmed way to set brightness alone; every
+        real KANALI action resent the whole config, this does the same."""
+        return self.set_screen_config(self.last_media, value, timeout_s=timeout_s)
 
-# -- serial (CDC-ACM) transport ---------------------------------------------
-#
-# Correct on Linux (/dev/ttyACM*). Confirmed WRONG for this panel on Windows
-# this session - it has no COM port there at all (see PanoramaUSB below).
-# Kept for Linux and in case some future firmware/driver combo exposes a COM
-# port here after all.
-
-class Panorama(_PanoramaBase):
-    def __init__(self, port: str, timeout: float = 1.0):
-        super().__init__(timeout)
-        self.port_name = port
-        self.ser = None
-
-    def connect(self) -> bool:
-        import serial
-        try:
-            self.ser = serial.Serial(
-                port=self.port_name, baudrate=BAUD_RATE,
-                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE, rtscts=False, dsrdtr=False,
-                xonxoff=False, timeout=self.timeout)
-            return True
-        except Exception as exc:
-            log.warning("could not open %s: %s", self.port_name, exc)
-            self.ser = None
-            return False
-
-    def disconnect(self):
-        if self.ser is not None:
-            self.ser.close()
-            self.ser = None
-
-    @property
-    def connected(self) -> bool:
-        return self.ser is not None and self.ser.is_open
-
-    def _write(self, frame: bytes):
-        self.ser.write(frame)
-        self.ser.flush()
-
-    def _read_frame(self, timeout_s: float) -> bytes:
-        deadline = time.monotonic() + timeout_s
-        buf = bytearray()
-        while time.monotonic() < deadline:
-            chunk = self.ser.read(256)
-            if chunk:
-                buf += chunk
-                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
-                    break
-        return bytes(buf)
-
-
-def find_device(timeout: float = 1.0) -> str | None:
-    """Try every serial port on the system, handshake each, return the first
-    one that answers with a real productId - mirrors reed-tpse's
-    find_device(), which scans /dev/ttyACM* on Linux; ports on Windows have
-    no equivalent fixed naming, so every port has to be tried.
-
-    Confirmed this session to be the wrong transport for this panel on
-    Windows (see usb_probe() below) - kept only because it's still correct
-    on Linux, and in case some future firmware/driver combo does expose a
-    COM port here after all."""
-    import serial.tools.list_ports
-    for info in serial.tools.list_ports.comports():
-        panel = Panorama(info.device, timeout=timeout)
-        if not panel.connect():
-            continue
-        try:
-            info_dict = panel.handshake()
-            if info_dict and info_dict["product_id"] not in ("", "unknown"):
-                return info.device
-        finally:
-            panel.disconnect()
-    return None
+    def set_media(self, remote_name: str, timeout_s: float = 2.0) -> bool:
+        """remote_name is the name the file was pushed to the device as
+        (via Media.push below) - media_filename() applies the confirmed
+        post-transcode suffix automatically."""
+        return self.set_screen_config(media_filename(remote_name), self.last_brightness, timeout_s=timeout_s)
 
 
 # -- raw USB visibility check (WinUSB, no COM port) -------------------------
@@ -346,8 +416,7 @@ def usb_probe() -> dict:
     WinUSB driver, KANALI running or not, COM port or not. This is what
     Device Manager's Ports list can't show, and it's the only way left to
     tell a real hardware/cabling problem apart from "something's just
-    holding the device open" once find_device() (see above) comes back
-    empty, since that function only ever looks at COM ports.
+    holding the device open".
 
     Never raises for the ordinary failure cases (nothing plugged in,
     something else has it open) - those are exactly the cases this exists
@@ -560,23 +629,22 @@ class PanoramaUSB(_PanoramaBase):
     def _write(self, frame: bytes):
         self.ep_out.write(frame, timeout=max(int(self.timeout * 1000), 1000))
 
-    def _read_frame(self, timeout_s: float) -> bytes:
+    def _read_message(self, timeout_s: float) -> bytes:
+        """One bulk-IN read. Confirmed against real captured traffic that a
+        single USB bulk transfer already carries exactly one complete
+        protobuf reply - no framing marker needed to know where it ends."""
         import usb.core
-        deadline = time.monotonic() + timeout_s
-        buf = bytearray()
-        packet_size = self.ep_in.wMaxPacketSize or 512
-        while time.monotonic() < deadline:
-            try:
-                chunk = self.ep_in.read(packet_size, timeout=250)
-            except usb.core.USBError as exc:
-                if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
-                    continue
-                raise
-            if chunk:
-                buf += bytes(chunk)
-                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
-                    break
-        return bytes(buf)
+        # Confirmed real replies as large as ~10.7KB in captured traffic
+        # (media metadata) - the buffer must cover the whole message, not
+        # just one wire-level max-packet-size chunk.
+        read_size = 32768
+        try:
+            chunk = self.ep_in.read(read_size, timeout=max(int(timeout_s * 1000), 1))
+        except usb.core.USBError as exc:
+            if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                return b""
+            raise
+        return bytes(chunk) if chunk else b""
 
 
 def find_usb_panel(timeout: float = 1.0) -> "PanoramaUSB | None":
@@ -881,20 +949,14 @@ class PanoramaPrint(_PanoramaBase):
         if transferred != len(frame):
             raise PanoramaError(f"WriteFile only sent {transferred}/{len(frame)} bytes")
 
-    def _read_frame(self, timeout_s: float) -> bytes:
-        deadline = time.monotonic() + timeout_s
-        buf = bytearray()
-        chunk = ctypes.create_string_buffer(512)
-        while time.monotonic() < deadline:
-            remaining = max(deadline - time.monotonic(), 0.05)
-            transferred = self._overlapped_call(self._kernel32.ReadFile, chunk, 512, remaining)
-            if transferred:
-                buf += chunk.raw[:transferred]
-                if len(buf) >= 2 and buf[0] == FRAME_MARKER and buf[-1] == FRAME_MARKER:
-                    break
-            else:
-                break  # timed out this round - nothing more coming within the deadline
-        return bytes(buf)
+    def _read_message(self, timeout_s: float) -> bytes:
+        """One ReadFile. Confirmed against real captured traffic that a
+        single read already carries exactly one complete protobuf reply -
+        no framing marker needed to know where it ends. Buffer sized well
+        above the largest real reply seen (~10.7KB, media metadata)."""
+        chunk = ctypes.create_string_buffer(32768)
+        transferred = self._overlapped_call(self._kernel32.ReadFile, chunk, 32768, timeout_s)
+        return chunk.raw[:transferred] if transferred else b""
 
 
 def find_print_panel(timeout: float = 1.0) -> "PanoramaPrint | None":

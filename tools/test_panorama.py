@@ -2,29 +2,28 @@
 display equivalent of tools/test_app.py.
 
 Needs:
-    pip install pyserial pyusb libusb-package
+    pip install pyusb libusb-package
     adb.exe on PATH (Android platform-tools - just the zip, no Android
     Studio: https://developer.android.com/tools/releases/platform-tools)
 
-Confirmed against this hardware this session: this panel (VID 0x391A /
-PID 0x1011, "RK PANO") is talked to on Windows via usbprint.sys - Windows'
-built-in USB Printing Support class driver, which is what KANALI's own
-installer actually sets up for it (an earlier assumption in this file that
-WinUSB was the intended driver turned out to be wrong - Device Manager
-directly confirms usbprint.sys is what KANALI expects). panel() below now
-connects that way by default (PanoramaPrint, via CreateFile/ReadFile/
-WriteFile - no Device Manager changes needed), falling back to the WinUSB
-path (PanoramaUSB) only if that fails - which requires having replaced
-usbprint.sys with WinUSB via Zadig (https://zadig.akeo.ie), and breaks
-KANALI's own access while active. Use option 8 ("raw USB visibility") or
-11 (usbprint.sys path check) if neither connects.
+The protocol implemented here (handshake/ping/screen config, all in
+app/panorama.py) is confirmed against a real captured KANALI session this
+project recorded - Wireshark + USBPcap, decoded byte-for-byte, correlated
+against a precise documented action timeline. Every message builder in
+app/panorama.py was verified to reproduce real captured bytes exactly
+before this file was updated to use them - see that module's docstring
+for the full story. This is NOT reed-tpse's JSON protocol; an earlier
+version of this project ported that by mistake and it turned out to not
+apply to this hardware at all (confirmed: zero response, in multiple real
+captures, to every request built that way).
 
-The frame protocol itself (handshake/brightness/screen config, ported from
-reed-tpse's Linux implementation) is still unverified against this specific
-panel/transport combination until a real handshake succeeds - options 1-5
-reach the device but haven't yet confirmed the protocol shape matches.
-Options 6/7/serial support are kept only for the Linux CDC-ACM case and are
-known NOT to work for this panel on Windows at all.
+This panel is talked to on Windows via usbprint.sys (Windows' built-in
+USB Printing Support class driver), which is what KANALI's own installer
+sets up for it - confirmed against Device Manager. panel() below connects
+that way by default (PanoramaPrint, via CreateFile/ReadFile/WriteFile - no
+Device Manager changes needed), falling back to WinUSB (PanoramaUSB) only
+if that fails, which requires having replaced usbprint.sys via Zadig
+(https://zadig.akeo.ie) and breaks KANALI's own access while active.
 
 Usage:
     python tools/test_panorama.py
@@ -41,9 +40,9 @@ import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
 from app.panorama import (
-    Panorama, PanoramaUSB, PanoramaPrint, Media,
-    find_device, find_usb_panel, find_print_panel, find_usbprint_path,
-    usb_probe, build_frame,
+    PanoramaUSB, PanoramaPrint, Media,
+    find_usb_panel, find_print_panel, find_usbprint_path,
+    usb_probe, media_filename, build_ping_frame,
 )
 
 _panel = None  # PanoramaPrint | PanoramaUSB | None
@@ -63,39 +62,12 @@ def panel():
           "(only works if Zadig already replaced the driver)...")
     found = find_usb_panel()
     if found is None:
-        print("No panel found via either transport. Run option 8 (raw USB visibility) "
-              "or 11 (usbprint.sys path check) for details.")
+        print("No panel found via either transport. Run option 6 (raw USB visibility) "
+              "or 7 (usbprint.sys path check) for details.")
         sys.exit(1)
     print("Connected via WinUSB.")
     _panel = found
     return _panel
-
-
-def test_list_ports():
-    import serial.tools.list_ports
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        print("No serial ports detected at all - Windows may not have a driver "
-              "for the panel (check Device Manager > Ports (COM & LPT); if it's "
-              "sitting under 'Other devices' with a warning icon instead, that's "
-              "the problem, not this script).")
-        return
-    for p in ports:
-        print(f"  {p.device}: {p.description}  (hwid={p.hwid})")
-
-
-def test_handshake_on_port():
-    port_name = input("COM port to test directly (e.g. COM5): ").strip()
-    p = Panorama(port_name)
-    if not p.connect():
-        print("Could not open that port.")
-        return
-    try:
-        print("Sending handshake...")
-        info = p.handshake()
-        print("Result:", info if info is not None else "no/invalid response")
-    finally:
-        p.disconnect()
 
 
 def test_find():
@@ -113,16 +85,38 @@ def test_handshake():
         print(f"  {key}: {value}")
 
 
-def test_brightness():
+def test_ping():
     p = panel()
-    for value in (20, 100, 60):
-        print(f"Setting brightness to {value}...")
-        resp = p.set_brightness(value)
-        print("  response:", resp)
+    for _ in range(3):
+        ok = p.ping()
+        print("ping:", "ok" if ok else "no response")
         time.sleep(1)
 
 
-def test_media_list():
+def test_device_media_list():
+    """Lists media the panel itself reports having (via the real protocol's
+    f103 request), as opposed to option 4 which lists via adb's filesystem
+    view - the two should mostly agree, but this one shows the exact names
+    (with the .h264_WxH suffix) to reference in set_screen_config."""
+    p = panel()
+    items = p.list_media()
+    if not items:
+        print("No media reported (or request failed).")
+        return
+    for item in items:
+        print(f"  {item['path']}  ({item['size']} bytes)")
+
+
+def test_brightness():
+    p = panel()
+    for value in (20, 100, 0, 60):
+        print(f"Setting brightness to {value}...")
+        ok = p.set_brightness(value)
+        print("  ok" if ok else "  no response")
+        time.sleep(1)
+
+
+def test_adb_media_list():
     media = Media()
     if not media.is_connected():
         print("adb doesn't see the panel as a device. `adb devices` to check manually - "
@@ -134,49 +128,43 @@ def test_media_list():
 
 
 def test_set_default_image():
-    """Uploads one or more local images/gifs and sets them as the persistent
-    boot/default screen - full screen, looping through all of them if more
-    than one. This is the one CAM/KANALI-free thing this whole project
-    exists to prove out for the display.
+    """Uploads a local image/gif and sets it as the persistent boot/default
+    screen. This is the one CAM/KANALI-free thing this whole project exists
+    to prove out for the display.
 
-    A single file uses playMode "Single"; more than one uses "Sequence" -
-    that second value is an assumption (reed-tpse documents the config
-    shape but not every valid playMode string), so if a multi-file upload
-    only shows the first image, that value is the first thing to check."""
-    raw = input("Path(s) to upload, comma-separated for a slideshow (images/gifs): ").strip()
-    paths = [p.strip().strip('"') for p in raw.split(",") if p.strip()]
-    if not paths:
-        print("Nothing entered.")
+    Only single-file uploads for now - every confirmed real screen-config
+    command carried exactly one 'active media' filename, not a list, so
+    there's no confirmed multi-file slideshow mechanism to reproduce yet."""
+    raw = input("Path to the image/gif to upload (local file): ").strip().strip('"')
+    if not Path(raw).is_file():
+        print("File not found:", raw)
         return
-    missing = [p for p in paths if not Path(p).is_file()]
-    if missing:
-        print("File(s) not found:", missing)
-        return
-    remote_names = [Path(p).name for p in paths]
+    remote_name = Path(raw).name
 
     media = Media()
     if not media.is_connected():
-        print("adb doesn't see the panel - see option 4 for details.")
+        print("adb doesn't see the panel - see option 5 for details.")
         return
-    for local_path, remote_name in zip(paths, remote_names):
-        print(f"Pushing {local_path} -> /sdcard/pcMedia/{remote_name} ...")
-        if not media.push(local_path, remote_name):
-            print("Push failed for", local_path)
-            return
-    print("Pushed. Setting screen config...")
+    print(f"Pushing {raw} -> /sdcard/pcMedia/{remote_name} ...")
+    if not media.push(raw, remote_name):
+        print("Push failed.")
+        return
+    print("Pushed. Waiting a few seconds for the device to transcode it "
+          "(unverified how long this actually takes - the real filename "
+          "only becomes referenceable once transcoding finishes)...")
+    time.sleep(3)
 
     p = panel()
-    play_mode = "Single" if len(remote_names) == 1 else "Sequence"
-    resp = p.set_screen_config(remote_names, screen_mode="Full Screen",
-                               ratio="2:1", play_mode=play_mode)
-    print("response:", resp)
-    print("Should be showing now - and should persist across a reboot, per reed-tpse's README.")
+    active = media_filename(remote_name)
+    print(f"Setting screen config, active media = {active!r} ...")
+    ok = p.set_screen_config(active, brightness=p.last_brightness)
+    print("ok" if ok else "no response")
+    print("Should be showing now on the physical panel.")
 
 
 def test_usb_probe():
     """Checks the raw USB bus for VID 0x391A (Tryx), independent of any
-    driver/COM port/KANALI - start here, since this panel has no COM port
-    on Windows at all (confirmed from real KANALI logs this session)."""
+    driver/COM port/KANALI - useful if 1-4 fail to connect at all."""
     result = usb_probe()
     if not result["ok"]:
         print("NOT FOUND:", result["reason"])
@@ -196,41 +184,6 @@ def test_usb_probe():
             print(f"    -> {dev['likely_cause']}")
 
 
-def test_raw_handshake_dump():
-    """Bypasses build_frame()/parse_response()'s strict 0x5A...0x5A framing -
-    writes the exact same 'conn' request option 2 sends via whichever
-    transport panel() connected with, then dumps whatever comes back
-    regardless of shape. Useful when option 2 says "no/invalid response",
-    which is ambiguous between "device said nothing" and "device replied
-    but not wrapped the way reed-tpse's protocol.cpp does"."""
-    p = panel()
-    frame = build_frame("POST", "conn")
-    print(f"Writing {len(frame)} bytes: {frame.hex()}")
-    p._write(frame)
-    print("Write did not raise. Reading for up to 3s...")
-    raw = p._read_frame(timeout_s=3.0)
-    if raw:
-        print(f"  got {len(raw)} bytes: {raw.hex()}")
-        print(f"    ascii: {raw!r}")
-    else:
-        print("Nothing at all came back in 3s after writing.")
-
-
-def test_passive_listen():
-    """Reads for several seconds without writing anything first - checks
-    whether the device is chatty on its own (some firmware sends periodic
-    status/telemetry unprompted), and rules out one specific explanation
-    for option 9 coming back silent: that writing first is somehow
-    breaking the pipe, rather than the device just never answering."""
-    p = panel()
-    print("Listening for 5s with nothing sent...")
-    raw = p._read_frame(timeout_s=5.0)
-    if raw:
-        print(f"  got {len(raw)} bytes: {raw.hex()}")
-    else:
-        print("Silent - nothing sent by the device on its own either.")
-
-
 def test_check_usbprint_path():
     """Runs just the SetupAPI device-path lookup PanoramaPrint.connect()
     uses internally, without opening a handle - confirms whether Windows
@@ -246,20 +199,33 @@ def test_check_usbprint_path():
         print("Found:", path)
 
 
+def test_raw_ping_dump():
+    """Bypasses handshake()/ping()'s parsing - writes the exact same
+    'hello?' ping frame ping() sends, then dumps the raw reply bytes
+    regardless of shape. Useful if option 3 (ping) reports no response."""
+    p = panel()
+    frame = build_ping_frame()
+    print(f"Writing {len(frame)} bytes: {frame.hex()}")
+    p._write(frame)
+    print("Write did not raise. Reading for up to 3s...")
+    raw = p._read_message(timeout_s=3.0)
+    if raw:
+        print(f"  got {len(raw)} bytes: {raw.hex()}")
+    else:
+        print("Nothing at all came back in 3s after writing.")
+
+
 MENU = {
     "1": ("Find + connect (usbprint.sys, falls back to WinUSB)", test_find),
     "2": ("Full handshake info", test_handshake),
-    "3": ("Brightness sweep (20 -> 100 -> 60)", test_brightness),
-    "4": ("List media on the panel (via adb)", test_media_list),
-    "5": ("Upload image(s)/gif(s) and set them as the default/boot screen", test_set_default_image),
-    "6": ("[Linux/legacy] List every serial port Windows/pyserial can see", test_list_ports),
-    "7": ("[Linux/legacy] Handshake on a specific COM port you name", test_handshake_on_port),
-    "8": ("Check raw USB visibility (pyusb, VID 0x391A) - run this first if "
-          "1-5 fail to connect", test_usb_probe),
-    "9": ("Raw handshake byte dump (diagnostic - use if option 2 says "
-          "'no/invalid response')", test_raw_handshake_dump),
-    "10": ("Passive listen, 5s, nothing sent (diagnostic)", test_passive_listen),
-    "11": ("Check usbprint.sys device path (diagnostic, no handle opened)", test_check_usbprint_path),
+    "3": ("Ping x3 (keepalive)", test_ping),
+    "4": ("List media the panel itself reports (real protocol)", test_device_media_list),
+    "5": ("List media via adb (filesystem view)", test_adb_media_list),
+    "6": ("Check raw USB visibility (pyusb, VID 0x391A)", test_usb_probe),
+    "7": ("Check usbprint.sys device path (diagnostic, no handle opened)", test_check_usbprint_path),
+    "8": ("Brightness sweep (20 -> 100 -> 0 -> 60)", test_brightness),
+    "9": ("Upload an image/gif and set it as the default/boot screen", test_set_default_image),
+    "10": ("Raw ping byte dump (diagnostic - use if option 3 reports no response)", test_raw_ping_dump),
 }
 
 if __name__ == "__main__":
