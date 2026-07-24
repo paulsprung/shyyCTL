@@ -114,6 +114,44 @@ class OpenRgbBridge:
             self.connected = False
             return self.connect()
 
+    def debug_info(self) -> dict:
+        """Raw introspection of the SDK connection itself, not the usual
+        cleaned-up device lists - for pinning down exactly which device
+        index fails to come through and why. Surfaces the negotiated
+        protocol version explicitly: openrgb-python 0.3.6 (the latest
+        release on PyPI as of this session) hard-caps itself at protocol 4
+        (network.py's OPENRGB_PROTOCOL_VERSION = 4 is a literal constant,
+        not just an unset default) even if the OpenRGB server itself
+        offers 5 - a real candidate for why one specific (likely the
+        newest/most complex) device keeps coming back None with no
+        exception ever raised: a v4 client silently misreading a v5-shaped
+        payload wouldn't necessarily hit a clean struct/parsing error, it
+        could just desync which bytes belong to which field."""
+        with self._lock:
+            if not self.connected and not self.connect():
+                return {"connected": False, "error": self.last_error}
+            update_error = None
+            try:
+                self.client.update()
+            except Exception as exc:
+                update_error = f"{type(exc).__name__}: {exc}"
+            comms = self.client.comms
+            return {
+                "connected": True,
+                "update_error": update_error,
+                "negotiated_protocol_version": comms._protocol_version,
+                "client_max_protocol_version": comms.max_protocol_version,
+                "device_count": self.client.device_num,
+                "devices": [
+                    {
+                        "index": i,
+                        "name": d.name if d is not None else None,
+                        "type": d.type.name if d is not None else None,
+                    }
+                    for i, d in enumerate(self.client.devices)
+                ],
+            }
+
     def report(self) -> dict:
         with self._lock:
             if not self.connected:

@@ -266,6 +266,17 @@ async def rgb_devices():
     return await asyncio.to_thread(openrgb.describe_all)
 
 
+@app.get("/api/rgb/debug")
+async def rgb_debug():
+    """Raw SDK connection introspection (negotiated protocol version, a
+    per-index device breakdown) - see OpenRgbBridge.debug_info's
+    docstring. Not for normal use, only for diagnosing a device that
+    won't show up via /api/rgb/devices."""
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    return await asyncio.to_thread(openrgb.debug_info)
+
+
 class ColorRequest(BaseModel):
     color: str  # "#rrggbb"
     persistent: bool = True
