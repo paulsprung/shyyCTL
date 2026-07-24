@@ -24,7 +24,6 @@ needs real settling time and the UI should show what is happening.
 
 import logging
 import threading
-import time
 
 from . import geometry
 
@@ -253,30 +252,33 @@ class Scan:
         manual step for every channel a model was confidently identified
         for. Channels left at "unknown" confidence still need a manual pick
         + POST /api/rgb/hub/{channel}/resize (no auto-detected count exists
-        to apply yet)."""
-        if not self.openrgb.connected and not self.openrgb.connect():
-            log.warning("OpenRGB not reachable, skipping hub zone resize: %s",
-                        self.openrgb.last_error)
-            return
-        devices = self.openrgb.hub_leds()
-        if not devices:
-            log.warning("No OpenRGB hub device found, skipping zone resize")
-            return
-        device = devices[0]
-        first = True
-        for entry in self.results:
-            if entry["confidence"] != "certain" or not entry["led_channel"] or not entry["leds"]:
+        to apply yet).
+
+        Reconnects fresh before every single channel rather than reusing
+        one connection across all of them - confirmed against a real run
+        that reusing one cached connection (even just re-reading it
+        between resizes) corrupted this hub's OpenRGB-side state: its
+        zones list came back literally doubled and its reported total LED
+        count turned to garbage after a few resize calls in the same
+        session. A brand new connection per channel gets a clean snapshot
+        each time instead of piling more requests onto whatever state the
+        previous one already left behind."""
+        to_resize = [
+            entry for entry in self.results
+            if entry["confidence"] == "certain" and entry["led_channel"] and entry["leds"]
+        ]
+        for entry in to_resize:
+            if not self.openrgb.reconnect():
+                log.warning("OpenRGB not reachable, skipping resize for %s: %s",
+                            entry["led_channel"], self.openrgb.last_error)
                 continue
-            if not first:
-                # Confirmed against a real run: firing RESIZEZONE at several
-                # channels on the same hub back-to-back had only the first
-                # one actually stick - the hub needs a beat between USB
-                # commands, not just a longer read-back retry (see
-                # openrgb_bridge.resize_zone's docstring).
-                time.sleep(0.5)
-            first = False
+            devices = self.openrgb.hub_leds()
+            if not devices:
+                log.warning("No OpenRGB hub device found, skipping resize for %s",
+                            entry["led_channel"])
+                continue
             try:
-                ok = self.openrgb.resize_zone(device, entry["led_channel"], entry["leds"])
+                ok = self.openrgb.resize_zone(devices[0], entry["led_channel"], entry["leds"])
                 if not ok:
                     entry["needs"].append(
                         f"could not resize OpenRGB zone for {entry['led_channel']}")

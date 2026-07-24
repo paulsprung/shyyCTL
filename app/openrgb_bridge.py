@@ -79,6 +79,21 @@ class OpenRgbBridge:
             self.connected = False
             return False
 
+    def reconnect(self) -> bool:
+        """Fully drops and re-establishes the SDK connection instead of
+        reusing the cached client - see resize_zone's docstring and
+        scan.py's _resize_hub_zones, which calls this once per channel
+        rather than issuing several resize calls over one long-lived
+        connection. Closes the old socket first so OpenRGB doesn't
+        accumulate stale client entries in its SDK tab across a scan."""
+        if self.client is not None:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+        self.connected = False
+        return self.connect()
+
     def report(self) -> dict:
         if not self.connected:
             return {"connected": False, "sticks": [], "error": self.last_error}
@@ -161,35 +176,31 @@ class OpenRgbBridge:
                 return zone
         return None
 
-    def resize_zone(self, device, channel: str, led_count: int,
-                     retries: int = 6, retry_delay: float = 0.5) -> bool:
+    def resize_zone(self, device, channel: str, led_count: int) -> bool:
         """Never call this with a guessed count - only with a number that
         came from the user picking a real fan model (geometry.expected_leds)
         or from a source that actually verified it against the hardware.
 
-        Confirmed against a real run this session: resizing several zones
-        on the same NZXT hub device back-to-back had only the first call
-        actually stick - the rest read back as still 0 immediately
-        afterwards. zone.resize() re-reads the device right after sending
-        the resize command, but the hub itself has to round-trip the
-        change over USB before OpenRGB's own state catches up, and that
-        clearly outlasted an immediate single re-read under load. Retry
-        with a short settle delay instead of trusting the first read."""
+        REVERTED this session: an earlier version of this retried
+        zone.update() several times against a slow read-back, on the
+        theory that the hub just needed longer to settle over USB. Real
+        evidence disproved that - after adding the retry, repeated re-reads
+        of this specific device ("NZXT RGB & Fan Controller 2024") started
+        coming back with its zones list literally doubled (12 entries for
+        6 real channels) and a garbage, ever-growing total LED count across
+        runs. That's a server-side OpenRGB driver instability triggered by
+        hammering REQUEST_CONTROLLER_DATA at this device repeatedly, not a
+        client-side timing gap - retrying harder was actively corrupting
+        OpenRGB's own in-memory state for it. Back to one resize, one
+        read-back, no polling loop; see _resize_hub_zones in scan.py for
+        the real fix (a fresh reconnect per channel instead of hammering
+        one cached connection)."""
         zone = self.zone_for_channel(device, channel)
         if zone is None:
             return False
         if len(zone.leds) == led_count:
             return True
         zone.resize(led_count)
-        for attempt in range(retries):
-            if len(zone.leds) == led_count:
-                return True
-            time.sleep(retry_delay)
-            try:
-                zone.update()
-            except Exception as exc:
-                log.warning("zone.update() failed while confirming resize of '%s': %s",
-                            channel, exc)
         return len(zone.leds) == led_count
 
     # -- colour -----------------------------------------------------------
