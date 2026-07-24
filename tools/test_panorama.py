@@ -167,6 +167,27 @@ def test_set_default_image():
     print("Should be showing now on the physical panel.")
 
 
+def test_keepalive_loop():
+    """Uploads (if you want) or just applies the last-known media, then
+    pings every 2s indefinitely (Ctrl+C to stop) - matches how often real
+    KANALI traffic pinged in every capture this session. If the image
+    reverting after a few seconds (option 9's known issue right now) stops
+    happening while this runs, that confirms the panel needs an ongoing
+    keepalive to stay on whatever was last set, same as reed-tpse's docs
+    describe for the Linux version - this script just doesn't run one in
+    the background yet, a real client (the eventual web UI) would need
+    to."""
+    p = panel()
+    print("Pinging every 2s. Watch the panel - Ctrl+C to stop.")
+    try:
+        while True:
+            ok = p.ping()
+            print("ping:", "ok" if ok else "no response")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
 def test_usb_probe():
     """Checks the raw USB bus for VID 0x391A (Tryx), independent of any
     driver/COM port/KANALI - useful if 1-4 fail to connect at all."""
@@ -231,6 +252,8 @@ MENU = {
     "8": ("Brightness sweep (20 -> 100 -> 0 -> 60)", test_brightness),
     "9": ("Upload an image/gif (real protocol, needs ffmpeg) and set as active screen", test_set_default_image),
     "10": ("Raw ping byte dump (diagnostic - use if option 3 reports no response)", test_raw_ping_dump),
+    "11": ("Keepalive loop - ping every 2s until Ctrl+C (tests whether this "
+          "stops the image reverting)", test_keepalive_loop),
 }
 
 if __name__ == "__main__":
