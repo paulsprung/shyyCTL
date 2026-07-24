@@ -387,6 +387,14 @@ class _PanoramaBase:
         self._write(build_screen_config_frame(active_media, brightness, poweron_media, standby_media))
         ok = self.read_message(timeout_s=timeout_s) is not None
         self._write(build_commit_frame())
+        # Confirmed against real captured traffic: the device replies to
+        # BOTH the main config frame and this commit follow-up (two "ok"
+        # acks in a row). Not reading this second reply leaves it sitting
+        # unconsumed in the pipe, which desyncs every subsequent command's
+        # read against the wrong reply - exactly the failure mode seen
+        # against real hardware (first command in a sweep worked, every
+        # one after it didn't).
+        self.read_message(timeout_s=timeout_s)
         self.last_media = active_media
         self.last_brightness = max(0, min(100, int(brightness)))
         return ok
