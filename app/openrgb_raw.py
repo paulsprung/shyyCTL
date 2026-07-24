@@ -192,6 +192,13 @@ class OpenRgbRaw:
         self.timeout = timeout
         self.sock: socket.socket | None = None
 
+    def __enter__(self) -> "OpenRgbRaw":
+        self.connect()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
@@ -429,6 +436,28 @@ class OpenRgbRaw:
             body += struct.pack("BBBx", red, green, blue)
         payload = struct.pack("I", len(body) + 4) + body
         self._send(device_index, PKT_RGBCONTROLLER_UPDATELEDS, payload)
+
+    def set_zone_color(self, device_index: int, zone: ZoneInfo, color: tuple[int, int, int]):
+        """Convenience over set_zone_colors: same colour for every LED
+        currently in the zone (leds_count, which is only correct once
+        the zone has actually been resized - see resize_zone)."""
+        self.set_zone_colors(device_index, zone.index, [color] * zone.leds_count)
+
+    def set_device_color(self, device_index: int, num_leds: int, color: tuple[int, int, int]):
+        self.set_device_colors(device_index, [color] * num_leds)
+
+    def select_mode(self, controller: ControllerInfo, mode_name: str) -> bool:
+        """Finds a mode by name on an already-fetched ControllerInfo and
+        selects it - mirrors openrgb_bridge.OpenRgbBridge._select_mode's
+        'static' (persists after shyyctl closes) vs 'direct' (host-driven,
+        needs shyyctl running) distinction."""
+        mode = self.find_mode(controller, mode_name)
+        if mode is None:
+            log.warning("%s has no '%s' mode - leaving whatever mode is currently active",
+                        controller.name, mode_name)
+            return False
+        self.set_mode(controller.index, mode)
+        return True
 
     def set_mode(self, device_index: int, mode: ModeInfo):
         """Re-sends a mode (as returned by controller_data) to select it as

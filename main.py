@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from app.hub import Hub, HubError
 from app.openrgb_bridge import OpenRgbBridge
+from app.openrgb_raw import OpenRgbRaw
 from app.panorama import find_print_panel, find_usb_panel
 from app.scan import Scan
 
@@ -310,41 +311,85 @@ class ResizeRequest(BaseModel):
     leds: int
 
 
+def _open_hub_raw() -> OpenRgbRaw:
+    return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
+
+
 @app.post("/api/rgb/hub/{channel}/resize")
 async def resize_hub_channel(channel: str, body: ResizeRequest):
-    """Needed once per channel before hub color control does anything -
-    OpenRGB's zones default to 0 LEDs and silently no-op until sized to
-    match the real fan (see app/openrgb_bridge.py's docstring). A scan
-    applies this automatically for every channel it identifies with
-    certainty (app/scan.py's _resize_hub_zones); call this directly for a
-    channel scan left at 'unknown' confidence after picking its model by
-    hand, or to redo one channel without a full rescan."""
-    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
-        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
-    devices = await asyncio.to_thread(openrgb.hub_leds)
-    if not devices:
+    """Needed once per channel before hub color control does anything.
+    This hub's zones are flagged effects-only/manually-configurable-size -
+    OpenRGB's server deliberately reports them as 0/1 LEDs to any client
+    below SDK protocol 5, as an intentional backward-compat shim (see
+    app/openrgb_raw.py's docstring, sourced from OpenRGB's own
+    RGBController.cpp). openrgb-python (app/openrgb_bridge.py, used for
+    mobo/RAM below) hard-caps at protocol 4 and can never see or resize
+    these zones - this hub goes through our own protocol-5 client
+    instead. A scan applies this automatically for every channel it
+    identifies with certainty (app/scan.py's _resize_hub_zones); call
+    this directly for a channel scan left at 'unknown' confidence after
+    picking its model by hand, or to redo one channel without a full
+    rescan."""
+    def _do():
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                return "no_device"
+            zone = raw.zone_for_channel(ctrl, channel)
+            if zone is None:
+                return f"no zone on {ctrl.name} matches channel '{channel}'"
+            raw.resize_zone(ctrl.index, zone.index, body.leds)
+            ctrl = raw.controller_data(ctrl.index)
+            zone = raw.zone_for_channel(ctrl, channel)
+            if zone is None or zone.leds_count != body.leds:
+                got = zone.leds_count if zone else "no zone"
+                return f"could not resize '{channel}' to {body.leds} LEDs (got {got})"
+            return None
+
+    try:
+        error = await asyncio.to_thread(_do)
+    except Exception as exc:
+        raise HTTPException(503, f"OpenRGB not connected: {exc}")
+    if error == "no_device":
         raise HTTPException(404, "no hub RGB device found")
-    ok = await asyncio.to_thread(openrgb.resize_zone, devices[0], channel, body.leds)
-    if not ok:
-        raise HTTPException(400, f"could not resize zone for '{channel}' to {body.leds} LEDs")
+    if error:
+        raise HTTPException(400, error)
     return {"ok": True}
 
 
 @app.post("/api/rgb/hub/{channel}/color")
 async def set_hub_channel_color(channel: str, body: ColorRequest):
     """liquidctl LED control is confirmed broken for the 360mm units - hub
-    RGB goes through OpenRGB exclusively, same as motherboard/RAM (see
-    app/openrgb_bridge.py's docstring)."""
-    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
-        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    RGB goes through OpenRGB's protocol-5 client (app/openrgb_raw.py),
+    same reasoning as the resize endpoint above. The channel must already
+    be sized (via a scan or the resize endpoint) - a 0-LED zone means
+    nothing is known to be attached there, and is refused rather than
+    silently falling back to a device-wide write."""
     rgb = _hex_to_rgb(body.color)
-    devices = await asyncio.to_thread(openrgb.hub_leds)
-    if not devices:
-        raise HTTPException(404, "no hub RGB device found")
+
+    def _do():
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                return "no_device"
+            zone = raw.zone_for_channel(ctrl, channel)
+            if zone is None:
+                return f"no zone on {ctrl.name} matches channel '{channel}'"
+            if zone.leds_count == 0:
+                return (f"channel '{channel}' has no LEDs sized yet - "
+                        f"resize it first (POST /api/rgb/hub/{channel}/resize)")
+            raw.select_mode(ctrl, "static" if body.persistent else "direct")
+            raw.set_zone_color(ctrl.index, zone, rgb)
+            return None
+
     try:
-        await asyncio.to_thread(openrgb.set_zone_color, devices[0], channel, rgb, body.persistent)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        error = await asyncio.to_thread(_do)
+    except Exception as exc:
+        raise HTTPException(503, f"OpenRGB not connected: {exc}")
+    if error == "no_device":
+        raise HTTPException(404, "no hub RGB device found")
+    if error:
+        raise HTTPException(400, error)
     return {"ok": True}
 
 

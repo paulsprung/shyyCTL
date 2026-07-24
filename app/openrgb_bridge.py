@@ -1,14 +1,16 @@
-"""RAM, motherboard and hub RGB via OpenRGB's SDK.
+"""RAM and motherboard RGB via OpenRGB's SDK (openrgb-python).
+
+Hub RGB is NOT handled here anymore - see app/openrgb_raw.py. This bridge
+is hard-capped at SDK protocol 4 (a limit in the openrgb-python library
+itself, not something a setting here can lift), and the hub's zones need
+protocol 5 to report/accept their real LED counts at all. Mobo/RAM don't
+use that effects-only zone flag, so protocol 4 sees their real sizes fine
+and they stay on this simpler client.
 
 shyyctl never touches SMBus itself - OpenRGB carries that privilege, same
 separation as LibreHardwareMonitor for CPU temperature (see PROMPT.md).
 
 Facts confirmed against real hardware this session, not assumptions:
-- The NZXT hub's own LED zones report 0 LEDs by default and do nothing when
-  written to until explicitly resized with the real LED count - this turned
-  out to be the actual root cause of what first looked like a liquidctl
-  channel-specific bug. Once sized correctly, every populated channel works
-  through OpenRGB.
 - A zone with 0 LEDs must never be targeted directly - writing to one falls
   back to a device-wide write instead of doing nothing (confirmed: doing so
   visibly changed every other channel at once).
@@ -196,6 +198,13 @@ class OpenRgbBridge:
             return clean
 
     def hub_leds(self) -> list:
+        """Not used by the real app anymore - main.py and scan.py talk to
+        the hub through app/openrgb_raw.py's protocol-5 client instead
+        (see its docstring for why: this hub's zones are flagged
+        effects-only/manually-configurable-size, and OpenRGB's server
+        deliberately reports those as 0/1 LEDs to any protocol-4 client
+        like this one, as an intentional backward-compat shim). Kept for
+        tools/test_app.py's side-by-side comparison test only."""
         with self._lock:
             return [d for d in self._devices() if "NZXT" in d.name]
 

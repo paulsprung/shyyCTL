@@ -7,16 +7,22 @@ none of that is guessable from software and is left for the human via the
 webUI's setup screen.
 
 Confirmed against real hardware, not assumed: this hub's LED channel count
-can't be read via liquidctl's CLI or OpenRGB - the CLI's 'initialize' only
-ever prints "Unknown" for accessory type, and OpenRGB's zones start at 0
-LEDs with no auto-detected size either. The CLI's "Unknown" turned out to
-be a labelling gap, not a missing measurement though: the hub does report a
-real numeric accessory ID per channel (hub.accessory_ids(), via liquidctl's
-Python API), and this session found the actual IDs used by the X-series
-fans (see geometry.ACCESSORY-related lookups). Where that ID is recognised,
-the model and LED count are certain, straight from hardware - no picking
-required. An unrecognised ID still falls back to confidence "unknown" and
-asks the setup screen for a manual pick, same as before.
+can't be read via liquidctl's CLI or OpenRGB's protocol-4 view - the CLI's
+'initialize' only ever prints "Unknown" for accessory type, and OpenRGB
+(when spoken over openrgb-python, which hard-caps at protocol 4) reports
+these zones as 0/1 LEDs unconditionally, regardless of what's actually
+plugged in - see app/openrgb_raw.py's docstring: this hub's zones are
+flagged effects-only/manually-configurable-size, which OpenRGB's own
+server deliberately zeroes out for any client below protocol 5, as an
+intentional backward-compat shim, not a bug on either side. The CLI's
+"Unknown" turned out to be a labelling gap, not a missing measurement
+though: the hub does report a real numeric accessory ID per channel
+(hub.accessory_ids(), via liquidctl's Python API), and this session found
+the actual IDs used by the X-series fans (see geometry.ACCESSORY-related
+lookups). Where that ID is recognised, the model and LED count are
+certain, straight from hardware - no picking required. An unrecognised ID
+still falls back to confidence "unknown" and asks the setup screen for a
+manual pick, same as before.
 
 Runs in a background thread and reports progress, because the fan probing
 needs real settling time and the UI should show what is happening.
@@ -26,6 +32,7 @@ import logging
 import threading
 
 from . import geometry
+from .openrgb_raw import OpenRgbRaw
 
 log = logging.getLogger("scan")
 
@@ -244,46 +251,70 @@ class Scan:
         return None
 
     def _resize_hub_zones(self):
-        """OpenRGB's hub LED zones default to 0 LEDs and silently do nothing
-        when written to until resized to the real count (see
-        app/openrgb_bridge.py's docstring) - this is the one place that
-        actually applies the counts this scan just identified, so hub RGB
-        control works right after a scan instead of needing a separate
-        manual step for every channel a model was confidently identified
-        for. Channels left at "unknown" confidence still need a manual pick
-        + POST /api/rgb/hub/{channel}/resize (no auto-detected count exists
-        to apply yet).
-
-        Reconnects fresh before every single channel rather than reusing
-        one connection across all of them - confirmed against a real run
-        that reusing one cached connection (even just re-reading it
-        between resizes) corrupted this hub's OpenRGB-side state: its
-        zones list came back literally doubled and its reported total LED
-        count turned to garbage after a few resize calls in the same
-        session. A brand new connection per channel gets a clean snapshot
-        each time instead of piling more requests onto whatever state the
-        previous one already left behind."""
+        """OpenRGB's hub LED zones report as 0/1 LEDs and silently do
+        nothing when written to until resized to the real count - not a
+        client-side bug, an intentional server-side backward-compat shim
+        for this hub's effects-only zones that only lifts at SDK protocol
+        5 (see app/openrgb_raw.py's docstring, sourced from OpenRGB's own
+        RGBController.cpp). openrgb-python (app/openrgb_bridge.py) is
+        hard-capped at protocol 4 and can never see or fix this - it's the
+        wrong tool for this specific device, which is why every previous
+        attempt at this from that side (timing retries, connection
+        churn, a threading lock) treated real symptoms of the version
+        mismatch as if they were the actual disease. openrgb_raw.py talks
+        protocol 5 directly and sees/sets the real sizes. This is the one
+        place that actually applies the counts this scan just identified,
+        so hub RGB control works right after a scan instead of needing a
+        separate manual step for every channel a model was confidently
+        identified for. Channels left at "unknown" confidence still need a
+        manual pick + POST /api/rgb/hub/{channel}/resize (no auto-detected
+        count exists to apply yet)."""
         to_resize = [
             entry for entry in self.results
             if entry["confidence"] == "certain" and entry["led_channel"] and entry["leds"]
         ]
-        for entry in to_resize:
-            if not self.openrgb.reconnect():
-                log.warning("OpenRGB not reachable, skipping resize for %s: %s",
-                            entry["led_channel"], self.openrgb.last_error)
-                continue
-            devices = self.openrgb.hub_leds()
-            if not devices:
-                log.warning("No OpenRGB hub device found, skipping resize for %s",
-                            entry["led_channel"])
-                continue
-            try:
-                ok = self.openrgb.resize_zone(devices[0], entry["led_channel"], entry["leds"])
-                if not ok:
+        if not to_resize:
+            return
+        try:
+            raw = OpenRgbRaw(host=self.openrgb.host, port=self.openrgb.port)
+            raw.connect()
+        except Exception as exc:
+            log.warning("Could not connect the raw OpenRGB v5 client for hub zone resize: %s", exc)
+            for entry in to_resize:
+                entry["needs"].append(f"could not resize OpenRGB zone: {exc}")
+            return
+        try:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                log.warning("No OpenRGB hub device found (raw v5 client), skipping zone resize")
+                for entry in to_resize:
+                    entry["needs"].append("no OpenRGB hub device found")
+                return
+            for entry in to_resize:
+                zone = raw.zone_for_channel(ctrl, entry["led_channel"])
+                if zone is None:
                     entry["needs"].append(
-                        f"could not resize OpenRGB zone for {entry['led_channel']}")
-            except Exception as exc:
-                entry["needs"].append(f"resize failed: {exc}")
+                        f"no OpenRGB zone matches {entry['led_channel']}")
+                    continue
+                if zone.leds_count == entry["leds"]:
+                    continue
+                try:
+                    raw.resize_zone(ctrl.index, zone.index, entry["leds"])
+                except Exception as exc:
+                    entry["needs"].append(f"resize failed: {exc}")
+            # Resizing invalidates the ControllerInfo snapshot's zone data -
+            # re-fetch once to confirm every resize actually landed before
+            # reporting success.
+            ctrl = raw.controller_data(ctrl.index)
+            for entry in to_resize:
+                zone = raw.zone_for_channel(ctrl, entry["led_channel"])
+                if zone is None or zone.leds_count != entry["leds"]:
+                    got = zone.leds_count if zone else "no zone"
+                    entry["needs"].append(
+                        f"could not resize OpenRGB zone for {entry['led_channel']} "
+                        f"(wanted {entry['leds']}, got {got})")
+        finally:
+            raw.close()
 
     def _scan_openrgb(self):
         if not self.openrgb.connected and not self.openrgb.connect():
