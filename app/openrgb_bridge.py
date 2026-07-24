@@ -308,26 +308,54 @@ class OpenRgbBridge:
             self._select_mode(device, mode_name)
             zone.set_color(RGBColor(*color))
 
-    def set_zone_color_by_index(self, device, zone_index: int, color: tuple[int, int, int],
-                                 persistent: bool = True):
-        """For devices like the X870-F's motherboard controller, which
-        exposes 4 zones under one device: 'Aura Mainboard' (3 real onboard
-        LEDs) plus 3x 'Aura Addressable N' (8 LEDs each - unconnected combo
-        headers on this board). set_color() above writes the whole device
-        at once, which includes those empty/unconnected zones; this targets
-        exactly one zone by its position in device.zones (as returned by
-        describe_all) so the UI can address the real onboard zone alone."""
+    @staticmethod
+    def real_zone_index(device) -> int | None:
+        """The one zone on a device that actually has LEDs attached - for
+        the X870-F's motherboard controller, that's 'Aura Mainboard' (3
+        onboard LEDs); its other 3 zones ('Aura Addressable N') are
+        unconnected combo headers with 0 LEDs each and are never worth
+        addressing. First match only: a board with more than one populated
+        zone would need picking a specific one, not just the first, but
+        this board only has one, and guessing further isn't warranted."""
+        for i, zone in enumerate(device.zones):
+            if len(zone.leds) > 0:
+                return i
+        return None
+
+    def set_led_color_by_index(self, device, zone_index: int, led_index: int,
+                                color: tuple[int, int, int], persistent: bool = True):
+        """Addresses exactly one physical LED within a zone - confirmed via
+        openrgb-python's own source (orgb.py's LED.set_color) that this
+        sends RGBCONTROLLER_UPDATESINGLELED with that LED's real
+        device-wide id, not a zone-wide write. Only meaningful for a
+        protocol-4-visible device like the motherboard; the hub's
+        effects-only zones need the protocol-5 raw client instead (see
+        openrgb_raw.py), same reasoning as everywhere else in this file."""
         with self._lock:
             if zone_index < 0 or zone_index >= len(device.zones):
                 raise ValueError(f"{device.name} has no zone at index {zone_index}")
             zone = device.zones[zone_index]
-            if len(zone.leds) == 0:
-                raise ValueError(f"zone '{zone.name}' has no LEDs - it's an unconnected header, "
-                                  "do not address it")
+            if led_index < 0 or led_index >= len(zone.leds):
+                raise ValueError(f"zone '{zone.name}' has no LED at index {led_index}")
             from openrgb.utils import RGBColor
             mode_name = "static" if persistent else "direct"
             self._select_mode(device, mode_name)
-            zone.set_color(RGBColor(*color))
+            zone.leds[led_index].set_color(RGBColor(*color))
+
+    def set_device_led_color(self, device, led_index: int, color: tuple[int, int, int],
+                              persistent: bool = True):
+        """Same real per-LED write as set_led_color_by_index above, but
+        straight through the device's own top-level LED list rather than
+        a zone - each RAM stick is its own single-zone OpenRGB device, so
+        there's no need to know a zone index first, unlike the
+        multi-zone motherboard controller."""
+        with self._lock:
+            if led_index < 0 or led_index >= len(device.leds):
+                raise ValueError(f"{device.name} has no LED at index {led_index}")
+            from openrgb.utils import RGBColor
+            mode_name = "static" if persistent else "direct"
+            self._select_mode(device, mode_name)
+            device.leds[led_index].set_color(RGBColor(*color))
 
     @staticmethod
     def _select_mode(device, mode_name: str):

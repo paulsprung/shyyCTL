@@ -445,36 +445,42 @@ async def set_mobo_color(body: ColorRequest):
     return {"ok": True}
 
 
-@app.get("/api/rgb/mobo/zones")
-async def mobo_zones():
+@app.get("/api/rgb/mobo/leds")
+async def mobo_leds():
     """The X870-F's motherboard controller is one OpenRGB device with 4
     zones: 'Aura Mainboard' (3 real onboard LEDs) and 3x 'Aura Addressable
     N' (8 LEDs each - unconnected combo headers on this board, confirmed
-    against real hardware). /api/rgb/mobo/color writes the whole device at
-    once, hitting the unconnected zones too; this lists the zones so the
-    UI can target just the real one instead."""
+    against real hardware). Only the real zone is ever worth exposing -
+    this returns its LED count directly (not a zone list) so the UI can
+    address the 3 real LEDs individually without ever seeing the
+    unconnected placeholders."""
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     devices = await asyncio.to_thread(openrgb.motherboard)
     if not devices:
         raise HTTPException(404, "no motherboard RGB device found")
     device = devices[0]
-    return {"name": device.name,
-            "zones": [{"index": i, "name": z.name, "leds": len(z.leds)}
-                      for i, z in enumerate(device.zones)]}
+    zone_index = openrgb.real_zone_index(device)
+    if zone_index is None:
+        return {"name": device.name, "zone_index": None, "leds": 0}
+    return {"name": device.name, "zone_index": zone_index, "leds": len(device.zones[zone_index].leds)}
 
 
-@app.post("/api/rgb/mobo/zone/{index}/color")
-async def set_mobo_zone_color(index: int, body: ColorRequest):
+@app.post("/api/rgb/mobo/led/{index}/color")
+async def set_mobo_led_color(index: int, body: ColorRequest):
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
     devices = await asyncio.to_thread(openrgb.motherboard)
     if not devices:
         raise HTTPException(404, "no motherboard RGB device found")
+    device = devices[0]
+    zone_index = openrgb.real_zone_index(device)
+    if zone_index is None:
+        raise HTTPException(404, "motherboard has no populated RGB zone")
     try:
         await asyncio.to_thread(
-            openrgb.set_zone_color_by_index, devices[0], index, rgb, body.persistent)
+            openrgb.set_led_color_by_index, device, zone_index, index, rgb, body.persistent)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True}
@@ -489,6 +495,50 @@ async def set_ram_color(body: ColorRequest):
     if not devices:
         raise HTTPException(404, "no RAM RGB device found")
     await asyncio.to_thread(openrgb.set_color, devices, rgb, body.persistent)
+    return {"ok": True}
+
+
+@app.get("/api/rgb/ram/sticks")
+async def ram_sticks():
+    """Each stick is its own separate OpenRGB DRAM device (confirmed this
+    project's earlier RAM-detection fix in scan.py) - this lists them so
+    the UI can address stick 1 and stick 2 independently instead of
+    /api/rgb/ram/color's whole-set write."""
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    devices = await asyncio.to_thread(openrgb.ram)
+    return [{"index": i, "name": d.name, "leds": len(d.leds)} for i, d in enumerate(devices)]
+
+
+@app.post("/api/rgb/ram/stick/{index}/color")
+async def set_ram_stick_color(index: int, body: ColorRequest):
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    rgb = _hex_to_rgb(body.color)
+    devices = await asyncio.to_thread(openrgb.ram)
+    if index < 0 or index >= len(devices):
+        raise HTTPException(404, f"no RAM stick at index {index}")
+    await asyncio.to_thread(openrgb.set_color, [devices[index]], rgb, body.persistent)
+    return {"ok": True}
+
+
+@app.post("/api/rgb/ram/stick/{index}/led/{led_index}/color")
+async def set_ram_stick_led_color(index: int, led_index: int, body: ColorRequest):
+    """Individual LED on one stick - each stick is its own single-zone
+    device, so this goes straight through the device's LED list (see
+    OpenRgbBridge.set_device_led_color) rather than needing a zone index
+    first, unlike the motherboard's multi-zone controller."""
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    rgb = _hex_to_rgb(body.color)
+    devices = await asyncio.to_thread(openrgb.ram)
+    if index < 0 or index >= len(devices):
+        raise HTTPException(404, f"no RAM stick at index {index}")
+    try:
+        await asyncio.to_thread(
+            openrgb.set_device_led_color, devices[index], led_index, rgb, body.persistent)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"ok": True}
 
 

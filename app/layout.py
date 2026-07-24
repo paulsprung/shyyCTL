@@ -96,6 +96,7 @@ class Layout:
             "rotation": 0,
             "facing": "front",
             "reversed_leds": False,
+            "led_offset": 0,
         }
         merged = dict(fresh)
         for key, default in placement_defaults.items():
@@ -131,7 +132,19 @@ class Layout:
         rotation and reversed_leds apply regardless of kind - a RAM stick
         or motherboard header is just as physically rotatable as a fan, it
         only lacks the fan-specific capsule shape and front/edge facing
-        concept (facing only means anything for an actual fan)."""
+        concept (facing only means anything for an actual fan).
+
+        led_offset is the escape hatch for a wrong *wiring order*
+        assumption rather than a wrong shape or facing - F360X's cap/side
+        split (see geometry.py's module docstring) is an inferred
+        placeholder, never walked on real hardware, and a mismatch there
+        looks like "the LED that lights up isn't the one highlighted here"
+        even though the shape itself is otherwise correct. Rather than
+        guess a new formula blind, a cyclic shift of the point order lets
+        a human correct it empirically: click each LED in Advanced (which
+        doubles as an identify tool - it lights up exactly that one LED
+        and nothing else) and nudge this until the highlighted position
+        matches the one that's actually lit."""
         model = None
         if unit.get("kind") == "fan" and unit.get("model"):
             model = next((m for m in geometry.MODELS if m.name == unit["model"]), None)
@@ -145,4 +158,8 @@ class Layout:
             pts = geometry.rotate(pts, unit["rotation"])
         if unit.get("reversed_leds"):
             pts = list(reversed(pts))
+        offset = unit.get("led_offset") or 0
+        if offset and pts:
+            offset %= len(pts)
+            pts = pts[offset:] + pts[:offset]
         return pts

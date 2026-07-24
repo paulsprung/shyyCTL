@@ -210,18 +210,17 @@
         <div class="card">
           <div class="card-title">Motherboard</div>
           <div class="note" style="line-height:1.6;margin:0 0 10px">
-            One zone per real header - the X870-F's other addressable
-            headers are unconnected on this build and shown disabled.
+            Only the real onboard zone - the X870-F's other addressable
+            headers are unconnected on this build and are never shown.
           </div>
-          <div id="moboZonesList"><div class="note">Loading zones&hellip;</div></div>
+          <div id="moboLedsList"><div class="note">Loading&hellip;</div></div>
         </div>
         <div class="card">
           <div class="card-title">RAM</div>
-          <div class="row">
-            <input type="color" id="ramColor" value="#4c79ff">
-            <label class="inline"><input type="checkbox" id="ramPersist" checked> persistent</label>
-            <button class="btn sm" onclick="setRamColor()">Apply</button>
+          <div class="note" style="line-height:1.6;margin:0 0 10px">
+            Each stick is its own device - set independently.
           </div>
+          <div id="ramSticksList"><div class="note">Loading&hellip;</div></div>
         </div>
       </div>
     </section>
@@ -233,8 +232,31 @@
     </section>
 
     <section>
-      <div class="section-head"><h2>Advanced</h2><div class="rule"></div>
-        <span class="note">click an LED below to select it</span></div>
+      <div class="section-head"><h2>Advanced</h2><div class="rule"></div></div>
+      <div class="card">
+        <p class="note" style="line-height:1.6;margin:0 0 10px">
+          Every controllable LED - fans, motherboard, RAM - at its real
+          physical position, plus layout-aware and standalone animations.
+          Its own view, not a redirect to Setup.
+        </p>
+        <button class="btn" onclick="showPage('advanced')">Open Advanced &rarr;</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ================= RGB ADVANCED ================= -->
+  <div class="page" id="page-advanced">
+    <section>
+      <div class="section-head">
+        <button class="btn sec sm" onclick="showPage('rgb')">&larr; RGB</button>
+        <h2 style="margin-left:12px">Advanced</h2><div class="rule"></div>
+        <span class="note">click an LED to select it</span>
+      </div>
+      <p class="intro">
+        Every controllable LED shown at its real physical position from
+        Setup - not a flat list, the actual shape. Click one to set its
+        colour directly.
+      </p>
       <div class="setup-grid">
         <div>
           <div class="canvas"><svg id="advancedCase" viewBox="0 0 900 600"
@@ -251,14 +273,16 @@
         <p class="note" style="line-height:1.6;margin:0 0 10px">
           A wave that runs across every placed fan channel using each LED's
           real position from Setup, top to bottom - not a flat per-channel
-          colour cycle.
+          colour cycle. Preview plays right here in the layout above without
+          touching the hardware; Apply starts the real thing.
         </p>
         <div class="row">
           <input type="color" id="waveColorA" value="#4c79ff">
           <input type="color" id="waveColorB" value="#ff7a30">
           <label class="inline">period <input type="number" id="wavePeriod" value="4" min="0.5"
             step="0.5" style="width:64px"> s</label>
-          <button class="btn sm" onclick="startWaveEffect()">Start</button>
+          <button class="btn sec sm" onclick="previewWaveEffect()">Preview</button>
+          <button class="btn sm" onclick="startWaveEffect()">Apply to PC</button>
           <button class="btn sec sm" onclick="stopEffect()">Stop</button>
         </div>
       </div>
@@ -438,7 +462,7 @@
 <div id="log"></div>
 
 <script>
-const PAGES = ["status","fans","rgb","display","scan","setup","settings"];
+const PAGES = ["status","fans","rgb","display","scan","setup","settings","advanced"];
 let status_ = null, fans = null, scanState = null, panoStatus = null, panoMedia = null;
 let layoutData = null, selectedUnit = null, dragState = null;
 let dutyOverride = {}, dutySliderActive = false;
@@ -466,7 +490,10 @@ function showPage(name){
   if(!PAGES.includes(name)) name = "status";
   PAGES.forEach(p=>{
     document.getElementById("page-"+p).classList.toggle("active", p===name);
+    // "advanced" is reached only via the button on the RGB page, not a
+    // top-nav tab, so it has no matching tab-advanced element.
     const tab = document.getElementById("tab-"+p);
+    if(!tab) return;
     if(p===name) tab.setAttribute("aria-current","page"); else tab.removeAttribute("aria-current");
   });
   if(location.hash !== "#/"+name) location.hash = "#/"+name;
@@ -651,47 +678,78 @@ async function setDuty(channel, value){
 
 /* ---------- rgb ---------- */
 
-let moboZones = null;
+/* Only the motherboard's one real onboard zone is ever shown - the
+   X870-F's 3 other zones are unconnected combo headers, always 0 LEDs,
+   not worth surfacing (see openrgb_bridge.py's real_zone_index). Tracked
+   client-side per LED index, same "last sent, not read back" reasoning
+   as everywhere else - shared with the Advanced page below. */
+let moboLeds = null; // {name, zone_index, leds}
+let moboLedColors = [];
 
-async function loadMoboZones(){
-  try{ moboZones = await api("/api/rgb/mobo/zones"); }
-  catch(e){ moboZones = null; }
+async function loadMoboLeds(){
+  try{
+    moboLeds = await api("/api/rgb/mobo/leds");
+    moboLedColors = new Array(moboLeds.leds || 0).fill("#4c79ff");
+  }catch(e){ moboLeds = null; }
 }
 
-function renderMoboZones(){
-  const box = document.getElementById("moboZonesList");
-  if(!moboZones || !moboZones.zones.length){
+function renderMoboLeds(){
+  const box = document.getElementById("moboLedsList");
+  if(!moboLeds || !moboLeds.leds){
     box.innerHTML = `<div class="note">No motherboard RGB device found.</div>`;
     return;
   }
-  box.innerHTML = `<div class="stack">` + moboZones.zones.map(z=>{
-    const empty = z.leds === 0;
-    return `<div class="row" style="justify-content:space-between${empty?';opacity:.5':''}">
-      <span>${z.name} <span class="note">${z.leds} LED</span></span>
-      <span class="row">
-        <input type="color" id="moboZoneColor-${z.index}" value="#4c79ff" ${empty?"disabled":""}>
-        <button class="btn sm" ${empty?"disabled":""} onclick="setMoboZoneColor(${z.index})">Apply</button>
-      </span>
-    </div>`;
-  }).join("") + `</div>`;
+  box.innerHTML = Array.from({length: moboLeds.leds}, (_, i) => `
+    <div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <span>LED ${i}</span>
+      <input type="color" value="${moboLedColors[i]}" onchange="setMoboLedColor(${i}, this.value)">
+    </div>`).join("");
 }
 
-async function setMoboZoneColor(index){
-  const hex = document.getElementById(`moboZoneColor-${index}`).value;
+async function setMoboLedColor(index, hex){
+  moboLedColors[index] = hex;
   try{
-    await api(`/api/rgb/mobo/zone/${index}/color`,{method:"POST",body:JSON.stringify(
+    await api(`/api/rgb/mobo/led/${index}/color`,{method:"POST",body:JSON.stringify(
       {color:hex, persistent:true})});
     rememberColor("mobo", hex);
-    say("Motherboard zone colour applied.");
+    say(`Motherboard LED ${index} set.`);
   }catch(e){ say(e.message,"error"); }
+  drawAdvancedCase();
 }
-async function setRamColor(){
-  const hex = document.getElementById("ramColor").value;
+
+/* Each RAM stick is its own OpenRGB device (confirmed via scan.py's
+   earlier 2-stick detection fix) - controlled independently rather than
+   as one combined colour. */
+let ramSticks = [];
+
+async function loadRamSticks(){
+  try{ ramSticks = await api("/api/rgb/ram/sticks"); }
+  catch(e){ ramSticks = []; }
+}
+
+function renderRamSticks(){
+  const box = document.getElementById("ramSticksList");
+  if(!ramSticks.length){
+    box.innerHTML = `<div class="note">No RAM RGB device found.</div>`;
+    return;
+  }
+  box.innerHTML = ramSticks.map(s=>`
+    <div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <span>${s.name} <span class="note">${s.leds} LED</span></span>
+      <span class="row">
+        <input type="color" id="ramStickColor-${s.index}" value="#4c79ff">
+        <button class="btn sm" onclick="setRamStickColor(${s.index})">Apply</button>
+      </span>
+    </div>`).join("");
+}
+
+async function setRamStickColor(index){
+  const hex = document.getElementById(`ramStickColor-${index}`).value;
   try{
-    await api("/api/rgb/ram/color",{method:"POST",body:JSON.stringify(
-      {color:hex, persistent:document.getElementById("ramPersist").checked})});
+    await api(`/api/rgb/ram/stick/${index}/color`,{method:"POST",body:JSON.stringify(
+      {color:hex, persistent:true})});
     rememberColor("ram", hex);
-    say("RAM colour applied.");
+    say(`RAM stick ${index} set.`);
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -734,22 +792,58 @@ async function setHubColor(channel){
 /* ---------- rgb advanced: per-LED editing + effects ----------
    Reuses layoutData/shapeX/shapeY/svgX from the Setup section below - the
    whole point is showing the real physical shape, not a flat list, so
-   there's no separate coordinate system here. Only fan channels (which
-   have a led_channel and go through /api/rgb/hub/{channel}/leds) are
-   individually clickable - mobo/RAM only ever get a whole-zone colour
-   from the backend, so their dots show for context but aren't editable
-   here. There's no hardware readback for a single LED's current colour
-   (same reasoning as Panorama's last_applied) - advancedLedColors tracks
-   what this UI itself last sent, per channel, defaulting unset LEDs to off. */
+   there's no separate coordinate system here.
 
-let selectedLed = null; // {unit, channel, index}
+   Every unit kind is individually clickable now: fan channels go through
+   /api/rgb/hub/{channel}/leds (a full per-channel array - the hub's raw
+   v5 client has no single-LED packet), motherboard through
+   /api/rgb/mobo/led/{index}/color and RAM sticks through
+   /api/rgb/ram/stick/{index}/led/{index}/color (both real per-LED writes
+   confirmed via openrgb-python's own source - see openrgb_bridge.py).
+   ledEndpointInfo() is the one place that knows which of the three a
+   given unit maps to.
+
+   There's no hardware readback for a single LED's current colour (same
+   reasoning as Panorama's last_applied) - colours are tracked
+   client-side, per channel for fans (advancedLedColors, shared with
+   nothing else) and per stick for RAM (ramLedColorsByStick); mobo shares
+   moboLedColors with the Detail section above so the two views agree. */
+
+let selectedLed = null; // {unit, index}
 let advancedLedColors = {};
+let ramLedColorsByStick = {};
 
 function channelLedColors(channel, count){
   if(!advancedLedColors[channel] || advancedLedColors[channel].length !== count){
     advancedLedColors[channel] = new Array(count).fill("#000000");
   }
   return advancedLedColors[channel];
+}
+
+function ramStickLedColors(stick, count){
+  if(!ramLedColorsByStick[stick] || ramLedColorsByStick[stick].length !== count){
+    ramLedColorsByStick[stick] = new Array(count).fill("#000000");
+  }
+  return ramLedColorsByStick[stick];
+}
+
+function ledEndpointInfo(u){
+  if(u.kind === "fan" && u.led_channel) return {kind:"fan", channel:u.led_channel};
+  if(u.kind === "mobo") return {kind:"mobo"};
+  if(u.kind === "ram"){
+    const m = /-(\d+)$/.exec(u.id);
+    return m ? {kind:"ram", stick:parseInt(m[1],10)} : null;
+  }
+  return null;
+}
+
+function ledColorArray(u, info){
+  const leds = layoutData.leds.filter(l=>l.unit===u.id);
+  if(info.kind === "fan") return channelLedColors(info.channel, leds.length);
+  if(info.kind === "mobo") return moboLedColors.length === leds.length ? moboLedColors
+    : (moboLedColors = new Array(leds.length).fill("#4c79ff"));
+  if(info.kind === "ram") return ramStickLedColors(info.stick, leds.length);
+  return null;
 }
 
 function drawAdvancedCase(){
@@ -767,7 +861,8 @@ function drawAdvancedCase(){
     if(u.kind === "display") continue;
     const leds = layoutData.leds.filter(l=>l.unit===u.id).sort((a,b)=>a.index-b.index);
     if(!leds.length) continue;
-    const colors = u.led_channel ? channelLedColors(u.led_channel, leds.length) : null;
+    const info = ledEndpointInfo(u);
+    const colors = info ? ledColorArray(u, info) : null;
     const topY = Math.min(...leds.map(l=>shapeY(u,l)));
     out += `<text x="${shapeX(u,leds[0])-10}" y="${topY-14}"
       font-family="monospace" font-size="10" fill="var(--ink-soft)">${u.name}</text>`;
@@ -775,17 +870,17 @@ function drawAdvancedCase(){
       const x = shapeX(u,l), y = shapeY(u,l);
       const sel = selectedLed && selectedLed.unit===u.id && selectedLed.index===l.index;
       const fill = colors ? colors[l.index] : "var(--rule)";
-      out += `<circle cx="${x}" cy="${y}" r="${sel?7:5}" fill="${fill}"
+      out += `<circle id="advLed-${u.id}-${l.index}" cx="${x}" cy="${y}" r="${sel?7:5}" fill="${fill}"
         stroke="${sel?'var(--signal)':'var(--panel)'}" stroke-width="${sel?2:1}"
-        style="cursor:${u.led_channel?'pointer':'default'}"
-        ${u.led_channel?`onclick="selectLed('${u.id}','${u.led_channel}',${l.index})"`:''}/>`;
+        style="cursor:${info?'pointer':'default'}"
+        ${info?`onclick="selectLed('${u.id}',${l.index})"`:''}/>`;
     });
   }
   svg.innerHTML = out;
 }
 
-function selectLed(unit, channel, index){
-  selectedLed = {unit, channel, index};
+function selectLed(unit, index){
+  selectedLed = {unit, index};
   renderAdvancedLedProps();
   drawAdvancedCase();
 }
@@ -795,10 +890,11 @@ function renderAdvancedLedProps(){
   if(!box) return;
   if(!selectedLed){ box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
   const u = layoutData.units.find(x=>x.id===selectedLed.unit);
-  const leds = layoutData.leds.filter(l=>l.unit===selectedLed.unit);
-  const colors = channelLedColors(selectedLed.channel, leds.length);
+  const info = u ? ledEndpointInfo(u) : null;
+  if(!u || !info){ box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
+  const colors = ledColorArray(u, info);
   box.innerHTML = `
-    <div class="card-title">${u ? u.name : selectedLed.unit} &middot; LED ${selectedLed.index}</div>
+    <div class="card-title">${u.name} &middot; LED ${selectedLed.index}</div>
     <div class="prop"><label>Colour</label>
       <input type="color" id="ledColorInput" value="${colors[selectedLed.index]}"></div>
     <button class="btn sm" style="margin-top:10px" onclick="applyLedColor()">Apply</button>
@@ -807,31 +903,89 @@ function renderAdvancedLedProps(){
 
 async function applyLedColor(){
   if(!selectedLed) return;
+  const u = layoutData.units.find(x=>x.id===selectedLed.unit);
+  const info = u ? ledEndpointInfo(u) : null;
+  if(!u || !info) return;
   const hex = document.getElementById("ledColorInput").value;
-  const leds = layoutData.leds.filter(l=>l.unit===selectedLed.unit);
-  const colors = channelLedColors(selectedLed.channel, leds.length);
+  const colors = ledColorArray(u, info);
   colors[selectedLed.index] = hex;
   try{
-    await api(`/api/rgb/hub/${selectedLed.channel}/leds`,{method:"POST",
-      body:JSON.stringify({colors})});
-    rememberColor(selectedLed.channel, hex);
-    say(`LED ${selectedLed.index} on ${selectedLed.channel} set.`);
+    if(info.kind === "fan"){
+      await api(`/api/rgb/hub/${info.channel}/leds`,{method:"POST", body:JSON.stringify({colors})});
+      rememberColor(info.channel, hex);
+    } else if(info.kind === "mobo"){
+      await api(`/api/rgb/mobo/led/${selectedLed.index}/color`,{method:"POST",
+        body:JSON.stringify({color:hex, persistent:true})});
+      rememberColor("mobo", hex);
+    } else if(info.kind === "ram"){
+      await api(`/api/rgb/ram/stick/${info.stick}/led/${selectedLed.index}/color`,{method:"POST",
+        body:JSON.stringify({color:hex, persistent:true})});
+      rememberColor("ram", hex);
+    }
+    say(`LED ${selectedLed.index} on ${u.name} set.`);
     drawAdvancedCase();
   }catch(e){ say(e.message,"error"); }
 }
 
+/* Preview plays entirely in the browser (no API calls) so an animation
+   can be tuned before it ever touches real hardware - the same cosine
+   blend main.py's _run_wave_effect uses, so what's previewed matches
+   what Apply actually runs. Only updates each circle's fill attribute
+   directly (not a full re-render) so it can run at animation-frame rate. */
+let previewRaf = null;
+
+function blendRgb(a, b, t){
+  const w = (1 - Math.cos(t * 2 * Math.PI)) / 2;
+  return [0,1,2].map(i => Math.round(a[i] + (b[i]-a[i]) * w));
+}
+
+function previewWaveEffect(){
+  stopPreview();
+  if(!layoutData) return;
+  const colorA = hexToRgb(document.getElementById("waveColorA").value);
+  const colorB = hexToRgb(document.getElementById("waveColorB").value);
+  const period = parseFloat(document.getElementById("wavePeriod").value) || 4;
+  const fanLeds = layoutData.leds.filter(l=>{
+    const u = layoutData.units.find(x=>x.id===l.unit);
+    return u && u.kind === "fan" && u.led_channel;
+  });
+  if(!fanLeds.length){ say("No fan LED channels placed in Setup yet.","error"); return; }
+  const ys = fanLeds.map(l=>l.y);
+  const yMin = Math.min(...ys), ySpan = (Math.max(...ys) - yMin) || 1;
+  const start = performance.now();
+  function frame(now){
+    const phase = ((now - start) / 1000 / period) % 1;
+    for(const l of fanLeds){
+      const t = (((l.y - yMin) / ySpan) - phase + 1) % 1;
+      const [r,g,b] = blendRgb(colorA, colorB, t);
+      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
+      if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
+    }
+    previewRaf = requestAnimationFrame(frame);
+  }
+  previewRaf = requestAnimationFrame(frame);
+  const note = document.getElementById("waveStatusNote");
+  if(note) note.textContent = "previewing - not applied to hardware yet";
+}
+
+function stopPreview(){
+  if(previewRaf !== null){ cancelAnimationFrame(previewRaf); previewRaf = null; }
+}
+
 async function startWaveEffect(){
+  stopPreview();
   try{
     await api("/api/rgb/effects/wave/start",{method:"POST",body:JSON.stringify({
       color_a: document.getElementById("waveColorA").value,
       color_b: document.getElementById("waveColorB").value,
       period_s: parseFloat(document.getElementById("wavePeriod").value) || 4,
     })});
-    say("Wave effect started.");
+    say("Wave effect applied to the PC.");
     pollEffectStatus();
   }catch(e){ say(e.message,"error"); }
 }
 async function stopEffect(){
+  stopPreview();
   try{ await api("/api/rgb/effects/stop",{method:"POST"}); say("Effect stopped."); }
   catch(e){ say(e.message,"error"); }
   pollEffectStatus();
@@ -840,7 +994,9 @@ async function pollEffectStatus(){
   try{
     const s = await api("/api/rgb/effects/status");
     const note = document.getElementById("waveStatusNote");
-    if(note) note.textContent = s.running ? "running" : (s.error ? "stopped - " + s.error : "");
+    if(note && previewRaf === null){
+      note.textContent = s.running ? "running on the PC" : (s.error ? "stopped - " + s.error : "");
+    }
     if(s.running) setTimeout(pollEffectStatus, 2000);
   }catch(e){}
 }
@@ -1133,6 +1289,16 @@ function renderUnitProps(){
         <button aria-pressed="${!u.reversed_leds}" onclick="editUnit('reversed_leds',false)">Forward</button>
         <button aria-pressed="${u.reversed_leds}" onclick="editUnit('reversed_leds',true)">Reversed</button>
       </div></div>
+    <div class="prop"><label>LED offset</label>
+      <input type="number" step="1" value="${u.led_offset||0}"
+        onchange="editUnit('led_offset', parseInt(this.value)||0)">
+      <div class="note" style="line-height:1.6;margin-top:6px">
+        Shifts which physical LED index 0 maps to, without changing the
+        shape - use this if Advanced's colour highlights the wrong LED
+        (e.g. a "right side" LED that lights up in the middle of a long
+        side on the 360mm unit). Click through each LED in Advanced to
+        see exactly which one lights, then nudge this until they line up.
+      </div></div>
     <div class="prop"><label>Info</label>
       <div class="note" style="line-height:1.7">
         ${u.model || u.kind}<br>
@@ -1152,7 +1318,7 @@ async function editUnit(field, value){
   const u = layoutData.units.find(x=>x.id===selectedUnit);
   if(!u) return;
   u[field] = value;
-  if(["rotation","facing","reversed_leds"].includes(field)){
+  if(["rotation","facing","reversed_leds","led_offset"].includes(field)){
     // These change the unit's actual LED geometry (app/geometry.py's
     // capsule maths) - only the server can recompute that, so persist and
     // refetch immediately instead of rendering a now-stale cached shape.
@@ -1259,7 +1425,8 @@ async function refresh(){
   await refresh();
   try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); renderHubSizes(); }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
-  try{ await loadMoboZones(); renderMoboZones(); }catch(e){}
+  try{ await loadMoboLeds(); renderMoboLeds(); }catch(e){}
+  try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
   loadHubModes();
   pollEffectStatus();
   loadRgbDump();
