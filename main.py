@@ -107,8 +107,13 @@ def _launch_vendor_openrgb() -> bool:
     elevates only the OpenRGB subprocess, not shyyctl itself - nothing
     else this project does (liquidctl/WinUSB access) needs admin rights,
     so the backend keeps running as a normal user."""
-    exe = ROOT / "vendor" / "OpenRGB" / "OpenRGB.exe"
-    if not exe.is_file():
+    vendor_dir = ROOT / "vendor" / "OpenRGB"
+    # Confirmed against a real run: the downloaded zip's own internal
+    # folder structure is preserved (e.g. "OpenRGB Windows 64-bit/
+    # OpenRGB.exe"), not a flat vendor/OpenRGB/OpenRGB.exe - search for it
+    # rather than assuming a fixed depth.
+    exe = next(vendor_dir.rglob("OpenRGB.exe"), None)
+    if exe is None:
         return False
 
     elevated = CONFIG.get("openrgb", {}).get("launch_elevated", True)
