@@ -122,6 +122,22 @@
   .fan-row{padding:14px 0;border-top:1px solid var(--rule)}
   .fan-row:first-child{border-top:none}
 
+  .seg{display:flex;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  .seg button{flex:1;padding:6px;background:var(--panel);border:none;color:var(--ink-soft);
+    font-family:var(--mono);font-size:11px;cursor:pointer}
+  .seg button[aria-pressed="true"]{background:var(--signal);color:#fff}
+
+  .canvas{background:var(--recess);border:1px solid var(--rule)}
+  .setup-grid{display:grid;grid-template-columns:1fr 260px;gap:1px;
+    background:var(--rule);border:1px solid var(--rule)}
+  .setup-grid > div{background:var(--panel);padding:16px}
+
+  .unit-row{display:flex;align-items:center;gap:10px;padding:9px 0;
+    border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:12px;cursor:pointer}
+  .unit-row:first-child{border-top:none}
+  .unit-row[aria-selected="true"]{color:var(--signal)}
+  .unit-row .grow{flex:1}
+
   #log{position:fixed;left:22px;right:22px;bottom:22px;max-width:640px;margin:0 auto;
     font-family:var(--mono);font-size:12px;background:var(--ink);color:var(--chassis);
     padding:12px 14px;display:none;z-index:20}
@@ -150,6 +166,7 @@
     <button id="tab-rgb"     onclick="showPage('rgb')">RGB</button>
     <button id="tab-display" onclick="showPage('display')">Display</button>
     <button id="tab-scan"    onclick="showPage('scan')">Scan</button>
+    <button id="tab-setup"   onclick="showPage('setup')">Setup</button>
     <button id="tab-settings" onclick="showPage('settings')">Settings</button>
   </nav>
 
@@ -298,6 +315,38 @@
     </section>
   </div>
 
+  <!-- ================= SETUP ================= -->
+  <div class="page" id="page-setup">
+    <section>
+      <div class="section-head"><h2>Placement</h2><div class="rule"></div>
+        <span class="note">drag a unit to place it</span></div>
+      <p class="intro">
+        Where each unit physically sits, so effects that care about position
+        (a wave running top to bottom, for example) know which LED is where.
+        Purely cosmetic on its own - only Identify below actually touches the
+        hardware.
+      </p>
+      <div class="card">
+        <div class="row">
+          <button class="btn" onclick="adoptLayout()">Adopt from last scan</button>
+          <button class="btn sec sm" onclick="saveLayoutData()">Save layout</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="setup-grid">
+        <div>
+          <div class="seg" id="surfaceSeg" style="margin-bottom:14px"></div>
+          <div class="canvas"><svg id="setupCase" viewBox="0 0 520 430"
+            style="width:100%;display:block;touch-action:none"></svg></div>
+          <div id="unitList" style="margin-top:14px"></div>
+        </div>
+        <div id="unitProps"><div class="note">Select a unit.</div></div>
+      </div>
+    </section>
+  </div>
+
   <!-- ================= SETTINGS ================= -->
   <div class="page" id="page-settings">
     <section>
@@ -326,8 +375,9 @@
 <div id="log"></div>
 
 <script>
-const PAGES = ["status","fans","rgb","display","scan","settings"];
+const PAGES = ["status","fans","rgb","display","scan","setup","settings"];
 let status_ = null, fans = null, scanState = null, panoStatus = null, panoMedia = null;
+let layoutData = null, selectedUnit = null, currentSurface = "front", dragState = null;
 
 /* ---------- plumbing ---------- */
 
@@ -643,6 +693,207 @@ function renderScan(){
     </div>` : `<div class="note">Run a scan.</div>`;
 }
 
+/* ---------- setup (placement) ----------
+   Coordinates the server sends are normalised 0..1 per surface; these two
+   pairs map that space onto the fixed 520x430 viewBox with a small margin,
+   and back again for turning a drag's pointer position into normalised
+   x/y. Every LED's absolute position is already unit position + geometry
+   offset (see app/layout.py's with_leds) - the same one linear map applies
+   to a unit's placement dot and to each of its individual LEDs. */
+
+function svgX(nx){ return 20 + nx * (520-40); }
+function svgY(ny){ return 20 + ny * (430-40); }
+function invX(sx){ return (sx-20) / (520-40); }
+function invY(sy){ return (sy-20) / (430-40); }
+
+async function loadLayout(){
+  try{ layoutData = await api("/api/layout"); }
+  catch(e){ layoutData = {surfaces:[], units:[], leds:[]}; }
+  cacheLedOffsets();
+}
+
+function cacheLedOffsets(){
+  // Each LED's position from the server is unit.x/y + a geometry offset
+  // (app/layout.py's with_leds). Caching the offset separately lets
+  // dragging (which only ever mutates a unit's own x/y, client-side)
+  // recompute every LED's on-screen position live, without needing the
+  // server to resend the whole shape on every pointermove.
+  (layoutData.leds || []).forEach(l=>{
+    const u = layoutData.units.find(x=>x.id===l.unit);
+    l._ox = u ? l.x - u.x : 0;
+    l._oy = u ? l.y - u.y : 0;
+  });
+}
+
+function renderSetup(){
+  if(!layoutData) return;
+  document.getElementById("surfaceSeg").innerHTML = layoutData.surfaces.map(s=>`
+    <button aria-pressed="${s===currentSurface}" onclick="currentSurface='${s}';renderSetup()">${s}</button>`).join("");
+
+  drawSetupCase();
+
+  document.getElementById("unitList").innerHTML = layoutData.units.length ? layoutData.units.map(u=>`
+    <div class="unit-row" aria-selected="${selectedUnit===u.id}" onclick="selectUnit('${u.id}')">
+      <span class="grow">${u.name}</span>
+      <span class="note">${u.kind}${u.model?" · "+u.model:""}${u.leds!=null?" · "+u.leds+" LED":""} · ${u.surface}</span>
+    </div>`).join("") : `<div class="note">No units yet - adopt from the last scan.</div>`;
+
+  renderUnitProps();
+}
+
+function drawSetupCase(){
+  const svg = document.getElementById("setupCase");
+  if(!layoutData || !layoutData.units.length){
+    svg.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
+      fill="var(--ink-soft)">No units yet. Adopt from the last scan.</text>`;
+    return;
+  }
+  const onSurface = layoutData.units.filter(u=>u.surface===currentSurface);
+  if(!onSurface.length){
+    svg.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
+      fill="var(--ink-soft)">Nothing on this surface.</text>`;
+    return;
+  }
+  let out = `<rect x="8" y="8" width="504" height="414" fill="none"
+    stroke="var(--ink-soft)" stroke-width="1.2" opacity=".4" rx="3"/>`;
+  for(const u of onSurface){
+    const sel = selectedUnit === u.id;
+    const pts = layoutData.leds.filter(l=>l.unit===u.id)
+      .map(l=>[svgX(u.x + l._ox), svgY(u.y + l._oy)]);
+    if(!pts.length) continue;
+    const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
+    const x0 = Math.min(...xs)-10, y0 = Math.min(...ys)-10;
+    const x1 = Math.max(...xs)+10, y1 = Math.max(...ys)+10;
+    out += `<g style="cursor:grab" onpointerdown="startDrag(event,'${u.id}')">
+      <rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" rx="6"
+        fill="${sel?'rgba(76,121,255,.10)':'transparent'}"
+        stroke="${sel?'var(--signal)':'var(--ink-soft)'}" stroke-width="${sel?2:1}" opacity="${sel?.95:.5}"/>
+      <text x="${x0}" y="${y0-6}" font-family="monospace" font-size="10"
+        fill="${sel?'var(--signal)':'var(--ink-soft)'}">${u.name}</text>
+      ${pts.map(([x,y])=>`<circle cx="${x}" cy="${y}" r="3.4"
+        fill="${sel?'var(--signal)':'var(--rule)'}"/>`).join("")}
+    </g>`;
+  }
+  svg.innerHTML = out;
+}
+
+function startDrag(evt, id){
+  selectUnit(id);
+  const svg = document.getElementById("setupCase");
+  dragState = {id, svg, pt: svg.createSVGPoint()};
+  window.addEventListener("pointermove", onDrag);
+  window.addEventListener("pointerup", stopDrag, {once:true});
+  evt.preventDefault();
+}
+function onDrag(evt){
+  if(!dragState) return;
+  const {svg, pt, id} = dragState;
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const u = layoutData.units.find(x=>x.id===id);
+  if(!u) return;
+  u.x = Math.min(1, Math.max(0, invX(loc.x)));
+  u.y = Math.min(1, Math.max(0, invY(loc.y)));
+  drawSetupCase();
+  const px = document.getElementById("prop-x"), py = document.getElementById("prop-y");
+  if(px) px.value = u.x.toFixed(3);
+  if(py) py.value = u.y.toFixed(3);
+}
+function stopDrag(){
+  window.removeEventListener("pointermove", onDrag);
+  dragState = null;
+}
+
+function selectUnit(id){ selectedUnit = id; renderSetup(); }
+
+function renderUnitProps(){
+  const box = document.getElementById("unitProps");
+  const u = layoutData.units.find(x=>x.id===selectedUnit);
+  if(!u){ box.innerHTML = `<div class="note">Select a unit.</div>`; return; }
+  box.innerHTML = `
+    <div class="card-title">Selected unit</div>
+    <div class="prop"><label>Name</label>
+      <input type="text" value="${u.name}" onchange="editUnit('name', this.value)"></div>
+    <div class="prop"><label>Surface</label>
+      <select onchange="editUnit('surface', this.value)">
+        ${layoutData.surfaces.map(s=>`<option ${u.surface===s?"selected":""}>${s}</option>`).join("")}
+      </select></div>
+    <div class="prop"><label>Across / down</label>
+      <div class="row">
+        <input type="number" id="prop-x" step="0.01" min="0" max="1" value="${u.x.toFixed(3)}" style="width:48%"
+          onchange="editUnit('x', parseFloat(this.value))">
+        <input type="number" id="prop-y" step="0.01" min="0" max="1" value="${u.y.toFixed(3)}" style="width:48%"
+          onchange="editUnit('y', parseFloat(this.value))">
+      </div></div>
+    ${u.kind === "fan" ? `
+    <div class="prop"><label>Rotation</label>
+      <div class="seg">${[0,90,180,270].map(d=>`
+        <button aria-pressed="${u.rotation===d}" onclick="editUnit('rotation',${d})">${d}&deg;</button>`).join("")}</div></div>
+    <div class="prop"><label>Facing</label>
+      <div class="seg">
+        <button aria-pressed="${u.facing==='front'}" onclick="editUnit('facing','front')">Front on</button>
+        <button aria-pressed="${u.facing==='edge'}" onclick="editUnit('facing','edge')">Edge on</button>
+      </div></div>
+    <div class="prop"><label>LED order</label>
+      <div class="seg">
+        <button aria-pressed="${!u.reversed_leds}" onclick="editUnit('reversed_leds',false)">Forward</button>
+        <button aria-pressed="${u.reversed_leds}" onclick="editUnit('reversed_leds',true)">Reversed</button>
+      </div></div>` : ""}
+    <div class="prop"><label>Info</label>
+      <div class="note" style="line-height:1.7">
+        ${u.model || u.kind}<br>
+        ${u.leds!=null ? u.leds+" LED" : "LED count unknown"}
+      </div></div>
+    ${u.kind !== "display" ? `
+    <div class="card-title" style="margin-top:16px">Which one is this?</div>
+    <p class="note" style="line-height:1.6;margin:0 0 10px">
+      ${u.kind==="fan"
+        ? "Turns this channel red and blacks out every other known fan channel."
+        : "Flashes this device red."}
+    </p>
+    <button class="btn hot sm" style="width:100%" onclick="identifyUnit('${u.id}')">Identify</button>` : ""}`;
+}
+
+async function editUnit(field, value){
+  const u = layoutData.units.find(x=>x.id===selectedUnit);
+  if(!u) return;
+  u[field] = value;
+  if(["rotation","facing","reversed_leds"].includes(field)){
+    // These change the unit's actual LED geometry (app/geometry.py's
+    // capsule maths) - only the server can recompute that, so persist and
+    // refetch immediately instead of rendering a now-stale cached shape.
+    try{ await saveLayoutData(); }catch(e){ say(e.message,"error"); }
+    return;
+  }
+  renderSetup();
+}
+
+async function adoptLayout(){
+  try{
+    layoutData = await api("/api/layout/adopt",{method:"POST"});
+    cacheLedOffsets();
+    selectedUnit = null;
+    say("Layout adopted from the last scan.");
+    renderSetup();
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function saveLayoutData(){
+  try{
+    layoutData = await api("/api/layout",{method:"POST",body:JSON.stringify(layoutData.units)});
+    cacheLedOffsets();
+    say("Layout saved.");
+    renderSetup();
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function identifyUnit(id){
+  try{
+    await api(`/api/layout/identify/${id}`,{method:"POST"});
+    say("Identify sent - check the hardware.");
+  }catch(e){ say(e.message,"error"); }
+}
+
 /* ---------- settings ---------- */
 
 function renderSettings(){
@@ -685,6 +936,7 @@ async function refresh(){
 (async ()=>{
   await refresh();
   try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); }catch(e){}
+  try{ await loadLayout(); renderSetup(); }catch(e){}
   loadRgbDump();
 })();
 

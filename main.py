@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.hub import Hub, HubError
+from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
 from app.panorama import find_print_panel, find_usb_panel
@@ -38,6 +39,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 WEB_DIR = ROOT / "web"
 CURVE_FILE = ROOT / "curve.json"
+LAYOUT_FILE = ROOT / "layout.json"
 
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
 log = logging.getLogger("shyyctl")
@@ -45,6 +47,7 @@ log = logging.getLogger("shyyctl")
 hub = Hub(match=CONFIG["hub"]["match"])
 openrgb = OpenRgbBridge(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
 scan = Scan(hub, openrgb)
+layout = Layout(LAYOUT_FILE)
 
 _panorama = None
 _panorama_lock = asyncio.Lock()
@@ -482,6 +485,78 @@ async def scan_status():
 @app.post("/api/scan/cancel")
 async def scan_cancel():
     scan.cancel()
+    return {"ok": True}
+
+
+# -- layout: where every unit physically is -------------------------------
+
+@app.get("/api/layout")
+async def get_layout():
+    return layout.with_leds()
+
+
+@app.post("/api/layout")
+async def save_layout(units: list[dict]):
+    return layout.with_leds(layout.save(units))
+
+
+@app.post("/api/layout/adopt")
+async def adopt_layout():
+    """Builds/refreshes the unit list from the latest scan (fans,
+    motherboard, RAM) plus a standing Panorama unit - safe to call again
+    after a rescan, since Layout.adopt() never overwrites a unit's
+    existing placement (see its docstring), only its measured fields."""
+    return layout.with_leds(layout.adopt(scan.state()))
+
+
+@app.post("/api/layout/identify/{unit_id}")
+async def identify_unit(unit_id: str):
+    """Flashes the given unit's real hardware red so it's visible while
+    placing it on the Setup canvas - not a general colour setter. Fan
+    channels go through the raw v5 hub client and blank every other known
+    fan channel at the same time, since they're all zones on one shared
+    controller and would otherwise just stay whatever colour they already
+    were; motherboard/RAM are separate physical devices, so only the
+    target one needs to change."""
+    units = layout.load()["units"]
+    unit = next((u for u in units if u["id"] == unit_id), None)
+    if unit is None:
+        raise HTTPException(404, f"no unit '{unit_id}' in the layout")
+    RED, BLACK = (255, 0, 0), (0, 0, 0)
+
+    if unit["kind"] == "fan":
+        def _do():
+            with _open_hub_raw() as raw:
+                ctrl = raw.find_controller("NZXT")
+                if ctrl is None:
+                    return "no_device"
+                raw.select_mode(ctrl, "static")
+                for u in units:
+                    if u["kind"] != "fan" or not u.get("led_channel"):
+                        continue
+                    zone = raw.zone_for_channel(ctrl, u["led_channel"])
+                    if zone is None or zone.leds_count == 0:
+                        continue
+                    raw.set_zone_color(ctrl.index, zone, RED if u["id"] == unit_id else BLACK)
+                return None
+        try:
+            error = await asyncio.to_thread(_do)
+        except Exception as exc:
+            raise HTTPException(503, f"OpenRGB not connected: {exc}")
+        if error == "no_device":
+            raise HTTPException(404, "no hub RGB device found")
+    elif unit["kind"] in ("mobo", "ram"):
+        if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+            raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+        devices = await asyncio.to_thread(openrgb.motherboard if unit["kind"] == "mobo" else openrgb.ram)
+        if unit["kind"] == "ram":
+            idx = int(unit_id.split("-")[1]) if "-" in unit_id else 0
+            devices = devices[idx:idx + 1]
+        if not devices:
+            raise HTTPException(404, f"no {unit['kind']} RGB device found")
+        await asyncio.to_thread(openrgb.set_color, devices, RED, False)
+    else:
+        raise HTTPException(400, f"nothing to identify for a '{unit['kind']}' unit")
     return {"ok": True}
 
 
