@@ -197,7 +197,23 @@
   <!-- ================= RGB ================= -->
   <div class="page" id="page-rgb">
     <section>
-      <div class="section-head"><h2>Motherboard &amp; RAM</h2><div class="rule"></div>
+      <div class="section-head"><h2>Quick</h2><div class="rule"></div>
+        <span class="note">everything at once</span></div>
+      <div class="card">
+        <div class="row">
+          <input type="color" id="allColor" value="#4c79ff">
+          <label class="inline"><input type="checkbox" id="allPersist" checked> persistent</label>
+          <button class="btn" onclick="setAllColor()">Apply to everything</button>
+        </div>
+        <p class="note" style="line-height:1.6;margin:10px 0 0">
+          Motherboard, RAM, and every hub channel the last scan sized - each
+          at its own real LED count, mixed fan models included.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Detail</h2><div class="rule"></div>
         <span class="note" id="rgbNote"></span></div>
       <div class="split">
         <div class="card">
@@ -221,8 +237,22 @@
 
     <section>
       <div class="section-head"><h2>Hub channels</h2><div class="rule"></div>
-        <span class="note">from the last scan</span></div>
+        <span class="note">from the last scan &middot; sizes are in Settings</span></div>
       <div id="hubRgbList"></div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Advanced</h2><div class="rule"></div>
+        <span class="note">per-LED, one channel at a time</span></div>
+      <div class="card">
+        <div class="row">
+          <select id="advancedChannel" onchange="renderAdvancedRgb()"></select>
+          <button class="btn sec sm" onclick="fillAdvanced()">Fill all with one colour</button>
+          <input type="color" id="advancedFillColor" value="#4c79ff">
+          <button class="btn sm" onclick="applyAdvancedRgb()">Apply</button>
+        </div>
+        <div id="advancedLeds" style="margin-top:14px;display:flex;flex-wrap:wrap;gap:6px"></div>
+      </div>
     </section>
   </div>
 
@@ -357,6 +387,17 @@
       </div>
     </section>
     <section>
+      <div class="section-head"><h2>Hub channel sizes</h2><div class="rule"></div>
+        <span class="note">from the last scan</span></div>
+      <p class="intro">
+        OpenRGB's hub zones default to 0 LEDs and do nothing until sized to
+        the real count - a scan does this automatically for every channel it
+        identifies with certainty. Only change this by hand for a channel a
+        scan left unsized, or to redo one without a full rescan.
+      </p>
+      <div id="hubSizesList"></div>
+    </section>
+    <section>
       <div class="section-head"><h2>Raw OpenRGB devices</h2><div class="rule"></div>
         <span class="note">for troubleshooting</span></div>
       <div class="card"><pre class="dump" id="rgbDump">not loaded</pre></div>
@@ -378,6 +419,7 @@
 const PAGES = ["status","fans","rgb","display","scan","setup","settings"];
 let status_ = null, fans = null, scanState = null, panoStatus = null, panoMedia = null;
 let layoutData = null, selectedUnit = null, currentSurface = "front", dragState = null;
+let dutyOverride = {}, dutySliderActive = false;
 
 /* ---------- plumbing ---------- */
 
@@ -493,6 +535,10 @@ function renderFans(){
     list.innerHTML = `<div class="note">No fan channels reported.</div>`;
     return;
   }
+  // Don't rebuild the slider DOM out from under an active drag - a poll
+  // landing mid-gesture was replacing the element the user's pointer was
+  // still down on.
+  if(dutySliderActive) return;
   document.getElementById("fansNote").textContent = `${fans.channels.length} channel(s)`;
   list.innerHTML = fans.channels.map(ch=>{
     const n = ch.replace("fan","");
@@ -500,7 +546,15 @@ function renderFans(){
       String(r.key).toLowerCase() === `fan ${n} speed`);
     const duty = (fans.readings||[]).find(r =>
       String(r.key).toLowerCase() === `fan ${n} duty`);
-    const dutyVal = duty ? Math.round(duty.value) : 0;
+    // The hub takes a moment to physically settle after a duty change, so
+    // its own status read-back can still report the old value for a poll
+    // or two right after we set a new one - trust what we just sent for a
+    // short grace window instead of visibly snapping back to the stale
+    // reading and then correcting itself once the hub catches up.
+    const override = dutyOverride[ch];
+    const useOverride = override && Date.now() < override.until;
+    const dutyVal = useOverride ? override.value : (duty ? Math.round(duty.value) : 0);
+    const dutyKnown = useOverride || !!duty;
     return `<div class="fan-row">
       <div class="row" style="justify-content:space-between">
         <strong>${ch}</strong>
@@ -508,15 +562,17 @@ function renderFans(){
       </div>
       <div class="row" style="margin-top:10px;align-items:center">
         <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}" style="flex:1"
+          onpointerdown="dutySliderActive=true" onpointerup="dutySliderActive=false"
           oninput="document.getElementById('dutyval-${ch}').textContent=this.value+' %'"
           onchange="setDuty('${ch}', this.value)">
-        <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">${duty ? dutyVal+" %" : "-- %"}</span>
+        <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">${dutyKnown ? dutyVal+" %" : "-- %"}</span>
       </div>
     </div>`;
   }).join("");
 }
 
 async function setDuty(channel, value){
+  dutyOverride[channel] = {value: parseInt(value), until: Date.now() + 4000};
   try{
     await api(`/api/fans/${channel}/duty`,{method:"POST",body:JSON.stringify({duty:parseInt(value)})});
     say(`${channel} set to ${value}%.`);
@@ -541,40 +597,45 @@ async function setRamColor(){
   }catch(e){ say(e.message,"error"); }
 }
 
+async function setAllColor(){
+  try{
+    const r = await api("/api/rgb/all/color",{method:"POST",body:JSON.stringify({
+      color: document.getElementById("allColor").value,
+      persistent: document.getElementById("allPersist").checked,
+    })});
+    const parts = [];
+    if(r.mobo) parts.push("motherboard");
+    if(r.ram) parts.push("RAM");
+    if(r.hub && r.hub.length) parts.push(r.hub.length+" hub channel(s)");
+    say(parts.length ? "Applied to "+parts.join(", ")+"." : "Nothing to apply to yet.");
+  }catch(e){ say(e.message,"error"); }
+}
+
 function renderHubRgb(){
   const box = document.getElementById("hubRgbList");
   const results = (scanState && scanState.results || []).filter(r=>r.led_channel);
   if(!results.length){
     box.innerHTML = `<div class="card note">No LED channels known yet — run a scan first.</div>`;
-    return;
+  } else {
+    box.innerHTML = `<div class="stack">` + results.map(r=>{
+      const ch = r.led_channel;
+      const sized = r.leds != null;
+      return `<div class="card">
+        <div class="row" style="justify-content:space-between">
+          <strong>${ch}</strong>
+          <span class="note">${r.model ? r.model+" · "+r.leds+" LED" : (sized ? r.leds+" LED" : "not sized - see Settings")}</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="color" id="color-${ch}" value="#4c79ff">
+          <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
+          <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
+        </div>
+      </div>`;
+    }).join("") + `</div>`;
   }
-  box.innerHTML = `<div class="stack">` + results.map(r=>{
-    const ch = r.led_channel;
-    const known = r.leds != null;
-    return `<div class="card">
-      <div class="row" style="justify-content:space-between">
-        <strong>${ch}</strong>
-        <span class="note">${r.model ? r.model+" · "+r.leds+" LED" : (known ? r.leds+" LED" : "model unknown")}</span>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <input type="number" id="resize-${ch}" style="width:80px" value="${r.leds||""}" placeholder="LEDs">
-        <button class="btn sec sm" onclick="resizeHubChannel('${ch}')">Resize zone</button>
-        <input type="color" id="color-${ch}" value="#4c79ff">
-        <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
-        <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
-      </div>
-    </div>`;
-  }).join("") + `</div>`;
+  renderAdvancedChannelOptions();
 }
 
-async function resizeHubChannel(channel){
-  const leds = parseInt(document.getElementById(`resize-${channel}`).value);
-  if(!leds){ say("Enter a LED count first.","error"); return; }
-  try{
-    await api(`/api/rgb/hub/${channel}/resize`,{method:"POST",body:JSON.stringify({leds})});
-    say(`${channel} resized to ${leds} LEDs.`);
-  }catch(e){ say(e.message,"error"); }
-}
 async function setHubColor(channel){
   try{
     await api(`/api/rgb/hub/${channel}/color`,{method:"POST",body:JSON.stringify({
@@ -582,6 +643,52 @@ async function setHubColor(channel){
       persistent: document.getElementById(`persist-${channel}`).checked,
     })});
     say(`${channel} colour applied.`);
+  }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- rgb: advanced (per-LED) ---------- */
+
+function advancedChannels(){
+  return (scanState && scanState.results || []).filter(r=>r.led_channel && r.leds);
+}
+
+function renderAdvancedChannelOptions(){
+  const sel = document.getElementById("advancedChannel");
+  const channels = advancedChannels();
+  const prior = sel.value;
+  sel.innerHTML = channels.length
+    ? channels.map(r=>`<option value="${r.led_channel}">${r.led_channel} (${r.leds} LED)</option>`).join("")
+    : `<option value="">no sized channel</option>`;
+  if(channels.some(r=>r.led_channel===prior)) sel.value = prior;
+  renderAdvancedRgb();
+}
+
+function renderAdvancedRgb(){
+  const box = document.getElementById("advancedLeds");
+  const ch = document.getElementById("advancedChannel").value;
+  const entry = advancedChannels().find(r=>r.led_channel===ch);
+  if(!entry){
+    box.innerHTML = `<div class="note">Run a scan and size a channel first (Settings).</div>`;
+    return;
+  }
+  box.innerHTML = Array.from({length: entry.leds}, (_,i)=>`
+    <input type="color" class="led-swatch" data-index="${i}" value="#000000" title="LED ${i}">`).join("");
+}
+
+function fillAdvanced(){
+  const color = document.getElementById("advancedFillColor").value;
+  document.querySelectorAll("#advancedLeds .led-swatch").forEach(el=>el.value=color);
+}
+
+async function applyAdvancedRgb(){
+  const ch = document.getElementById("advancedChannel").value;
+  if(!ch){ say("No channel selected.","error"); return; }
+  const swatches = [...document.querySelectorAll("#advancedLeds .led-swatch")]
+    .sort((a,b)=>parseInt(a.dataset.index)-parseInt(b.dataset.index));
+  const colors = swatches.map(el=>el.value);
+  try{
+    await api(`/api/rgb/hub/${ch}/leds`,{method:"POST",body:JSON.stringify({colors})});
+    say(`${ch}: ${colors.length} LEDs set individually.`);
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -657,6 +764,7 @@ async function pollScan(){
   else if(scanState.results.length){
     say("Scan finished.");
     renderHubRgb();
+    renderHubSizes();
   }
 }
 
@@ -907,6 +1015,34 @@ function renderSettings(){
       <strong style="color:var(--ink)">OpenRGB</strong> — ${openrgb.connected?"connected":openrgb.error}<br><br>
       <strong style="color:var(--ink)">Panorama</strong> — ${panorama.connected?"connected":"not connected"}
     </div>`;
+  renderHubSizes();
+}
+
+function renderHubSizes(){
+  const box = document.getElementById("hubSizesList");
+  const results = (scanState && scanState.results || []).filter(r=>r.led_channel);
+  box.innerHTML = results.length ? `<div class="stack">` + results.map(r=>{
+    const ch = r.led_channel;
+    return `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <strong>${ch}</strong>
+        <span class="note">${r.model ? r.model+" · "+r.leds+" LED" : "model unknown"}</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input type="number" id="resize-${ch}" style="width:80px" value="${r.leds||""}" placeholder="LEDs">
+        <button class="btn sec sm" onclick="resizeHubChannel('${ch}')">Resize zone</button>
+      </div>
+    </div>`;
+  }).join("") + `</div>` : `<div class="card note">No LED channels known yet — run a scan first.</div>`;
+}
+
+async function resizeHubChannel(channel){
+  const leds = parseInt(document.getElementById(`resize-${channel}`).value);
+  if(!leds){ say("Enter a LED count first.","error"); return; }
+  try{
+    await api(`/api/rgb/hub/${channel}/resize`,{method:"POST",body:JSON.stringify({leds})});
+    say(`${channel} resized to ${leds} LEDs.`);
+  }catch(e){ say(e.message,"error"); }
 }
 
 async function loadRgbDump(){
@@ -935,7 +1071,7 @@ async function refresh(){
 
 (async ()=>{
   await refresh();
-  try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); }catch(e){}
+  try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); renderHubSizes(); }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
   loadRgbDump();
 })();

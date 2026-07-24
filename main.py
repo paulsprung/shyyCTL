@@ -50,6 +50,7 @@ scan = Scan(hub, openrgb)
 layout = Layout(LAYOUT_FILE)
 
 _panorama = None
+_panorama_info: dict | None = None
 _panorama_lock = asyncio.Lock()
 _keepalive_task: asyncio.Task | None = None
 
@@ -70,12 +71,30 @@ def _find_panorama():
 async def get_panorama():
     """Lazily (re)connects to the panel on every call rather than trusting
     a connection made at server startup - it may not be plugged in yet, or
-    KANALI may currently hold usbprint.sys open (see app/panorama.py)."""
-    global _panorama
+    KANALI may currently hold usbprint.sys open (see app/panorama.py).
+
+    Also handshakes exactly once per fresh connection, right here, and
+    caches the result in _panorama_info - build_registration_burst()'s own
+    docstring says its three frames are "sent once after connecting" to
+    make the device volunteer its info unprompted. /api/panorama/status
+    used to call handshake() itself on every single request, resending
+    that same burst against an already-registered, long-lived connection
+    every time - if the device only replies with real info the first time
+    after connecting (which is exactly what that docstring says), every
+    repeat call after the first was always going to come back empty. Not a
+    concurrency bug (already fixed separately with _panorama_lock around
+    every panel call) - this was a protocol misuse bug underneath it."""
+    global _panorama, _panorama_info
     async with _panorama_lock:
         if _panorama is not None and _panorama.connected:
             return _panorama
         _panorama = await asyncio.to_thread(_find_panorama)
+        _panorama_info = None
+        if _panorama is not None:
+            try:
+                _panorama_info = await asyncio.to_thread(_panorama.handshake)
+            except Exception as exc:
+                log.warning("panorama handshake failed: %s", exc)
         return _panorama
 
 
@@ -461,6 +480,93 @@ async def set_hub_channel_color(channel: str, body: ColorRequest):
     return {"ok": True}
 
 
+class LedColorsRequest(BaseModel):
+    colors: list[str]  # ["#rrggbb", ...], one per LED, in strip order
+
+
+@app.post("/api/rgb/hub/{channel}/leds")
+async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
+    """Per-LED control for a single hub channel - the "advanced" tier
+    above the whole-channel colour endpoint. The channel must already be
+    sized (a scan does this, or POST .../resize) and the number of
+    colours sent must match that size exactly - no padding or truncating
+    guesses, same reasoning as resize_zone's docstring about not guessing
+    LED counts."""
+    rgb_list = [_hex_to_rgb(c) for c in body.colors]
+
+    def _do():
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                return "no_device"
+            zone = raw.zone_for_channel(ctrl, channel)
+            if zone is None:
+                return f"no zone on {ctrl.name} matches channel '{channel}'"
+            if zone.leds_count != len(rgb_list):
+                return (f"channel '{channel}' has {zone.leds_count} LEDs, "
+                        f"but {len(rgb_list)} colours were sent")
+            raw.select_mode(ctrl, "static")
+            raw.set_zone_colors(ctrl.index, zone.index, rgb_list)
+            return None
+
+    try:
+        error = await asyncio.to_thread(_do)
+    except Exception as exc:
+        raise HTTPException(503, f"OpenRGB not connected: {exc}")
+    if error == "no_device":
+        raise HTTPException(404, "no hub RGB device found")
+    if error:
+        raise HTTPException(400, error)
+    return {"ok": True}
+
+
+@app.post("/api/rgb/all/color")
+async def set_all_color(body: ColorRequest):
+    """The "quick" tier: one colour for everything shyyctl knows how to
+    address - motherboard, RAM, and every hub channel the last scan
+    identified with a known LED count, each written at its own real
+    size (mixed fan models included, nothing assumed uniform). Channels
+    without a known size are skipped rather than guessed at."""
+    rgb = _hex_to_rgb(body.color)
+    result: dict = {"mobo": False, "ram": False, "hub": []}
+
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        result["openrgb_error"] = f"OpenRGB not connected: {openrgb.last_error}"
+    else:
+        mobo_devices = await asyncio.to_thread(openrgb.motherboard)
+        if mobo_devices:
+            await asyncio.to_thread(openrgb.set_color, mobo_devices, rgb, body.persistent)
+            result["mobo"] = True
+        ram_devices = await asyncio.to_thread(openrgb.ram)
+        if ram_devices:
+            await asyncio.to_thread(openrgb.set_color, ram_devices, rgb, body.persistent)
+            result["ram"] = True
+
+    channels = [r["led_channel"] for r in scan.state().get("results", [])
+                if r.get("led_channel") and r.get("leds")]
+    if channels:
+        def _do():
+            applied = []
+            with _open_hub_raw() as raw:
+                ctrl = raw.find_controller("NZXT")
+                if ctrl is None:
+                    return applied
+                raw.select_mode(ctrl, "static" if body.persistent else "direct")
+                for ch in channels:
+                    zone = raw.zone_for_channel(ctrl, ch)
+                    if zone is None or zone.leds_count == 0:
+                        continue
+                    raw.set_zone_color(ctrl.index, zone, rgb)
+                    applied.append(ch)
+            return applied
+        try:
+            result["hub"] = await asyncio.to_thread(_do)
+        except Exception as exc:
+            result["hub_error"] = str(exc)
+
+    return result
+
+
 # -- hardware discovery scan -------------------------------------------
 
 class ScanRequest(BaseModel):
@@ -564,12 +670,14 @@ async def identify_unit(unit_id: str):
 
 @app.get("/api/panorama/status")
 async def panorama_status():
+    """Returns the info handshaked once when this connection was
+    established (see get_panorama's docstring) - does NOT re-handshake on
+    every call, since the device only replies with real info the first
+    time after connecting."""
     panel = await get_panorama()
     if panel is None or not panel.connected:
         return {"connected": False}
-    async with _panorama_lock:
-        info = await asyncio.to_thread(panel.handshake)
-    return {"connected": True, "info": info}
+    return {"connected": True, "info": _panorama_info}
 
 
 @app.get("/api/panorama/media")
