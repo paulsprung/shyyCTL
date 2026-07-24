@@ -3,19 +3,24 @@ display equivalent of tools/test_app.py.
 
 Needs:
     pip install pyusb libusb-package
-    adb.exe on PATH (Android platform-tools - just the zip, no Android
-    Studio: https://developer.android.com/tools/releases/platform-tools)
+    ffmpeg on PATH (for option 9, media upload - encodes to the device's
+    expected H.264 container; see app/panorama.py's encode_to_h264())
+    adb.exe on PATH, optional (option 5 only - confirmed NOT needed for
+    actual media upload, see below)
 
-The protocol implemented here (handshake/ping/screen config, all in
-app/panorama.py) is confirmed against a real captured KANALI session this
-project recorded - Wireshark + USBPcap, decoded byte-for-byte, correlated
-against a precise documented action timeline. Every message builder in
-app/panorama.py was verified to reproduce real captured bytes exactly
-before this file was updated to use them - see that module's docstring
-for the full story. This is NOT reed-tpse's JSON protocol; an earlier
-version of this project ported that by mistake and it turned out to not
-apply to this hardware at all (confirmed: zero response, in multiple real
-captures, to every request built that way).
+The protocol implemented here (handshake/ping/screen config/media upload,
+all in app/panorama.py) is confirmed against real captured KANALI traffic
+this project recorded - Wireshark + USBPcap, decoded byte-for-byte,
+correlated against precise documented action timelines across several
+captures. Every message builder in app/panorama.py was verified to
+reproduce real captured bytes exactly before this file was updated to use
+them - see that module's docstring for the full story. This is NOT
+reed-tpse's JSON protocol; an earlier version of this project ported that
+by mistake and it turned out to not apply to this hardware at all
+(confirmed: zero response, in multiple real captures, to every request
+built that way). It's also NOT ADB for media - `adb devices` sees nothing
+for this panel at all; real uploads go over this same usbprint.sys
+connection via a confirmed announce/data/finalize exchange.
 
 This panel is talked to on Windows via usbprint.sys (Windows' built-in
 USB Printing Support class driver), which is what KANALI's own installer
@@ -42,7 +47,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(messa
 from app.panorama import (
     PanoramaUSB, PanoramaPrint, Media,
     find_usb_panel, find_print_panel, find_usbprint_path,
-    usb_probe, media_filename, build_ping_frame,
+    usb_probe, build_ping_frame,
 )
 
 _panel = None  # PanoramaPrint | PanoramaUSB | None
@@ -117,47 +122,47 @@ def test_brightness():
 
 
 def test_adb_media_list():
+    """[Legacy/diagnostic] adb-based media listing - kept only for
+    reference. Confirmed this session that adb isn't actually involved in
+    real media upload at all (`adb devices` sees nothing for this panel);
+    expect this to find nothing too. Use option 4 instead for a real
+    listing, and option 9 to actually upload something."""
     media = Media()
     if not media.is_connected():
-        print("adb doesn't see the panel as a device. `adb devices` to check manually - "
-              "may need to accept a USB debugging prompt on first connect, if the "
-              "panel's Android side shows one, or a Windows ADB driver.")
+        print("adb doesn't see the panel as a device (expected - confirmed this session "
+              "that adb isn't actually used for media on this hardware; option 4 is the "
+              "real listing, option 9 the real upload).")
         return
     for name in media.list_media():
         print(" ", name)
 
 
 def test_set_default_image():
-    """Uploads a local image/gif and sets it as the persistent boot/default
-    screen. This is the one CAM/KANALI-free thing this whole project exists
-    to prove out for the display.
+    """Encodes a local image/gif and uploads it directly to the panel over
+    the real connection (announce/data/finalize, confirmed against two
+    independent real captures - NOT adb), then sets it as the active
+    screen. This is the one CAM/KANALI-free thing this whole project
+    exists to prove out for the display.
 
-    Only single-file uploads for now - every confirmed real screen-config
-    command carried exactly one 'active media' filename, not a list, so
-    there's no confirmed multi-file slideshow mechanism to reproduce yet."""
+    Needs ffmpeg on PATH - the device wants a specific H.264 container,
+    not the original image/gif file, and encode_to_h264() shells out to
+    ffmpeg to produce it. If ffmpeg isn't installed, this will fail at the
+    encode step with a clear log message rather than silently doing
+    nothing."""
     raw = input("Path to the image/gif to upload (local file): ").strip().strip('"')
     if not Path(raw).is_file():
         print("File not found:", raw)
         return
-    remote_name = Path(raw).name
-
-    media = Media()
-    if not media.is_connected():
-        print("adb doesn't see the panel - see option 5 for details.")
-        return
-    print(f"Pushing {raw} -> /sdcard/pcMedia/{remote_name} ...")
-    if not media.push(raw, remote_name):
-        print("Push failed.")
-        return
-    print("Pushed. Waiting a few seconds for the device to transcode it "
-          "(unverified how long this actually takes - the real filename "
-          "only becomes referenceable once transcoding finishes)...")
-    time.sleep(3)
 
     p = panel()
-    active = media_filename(remote_name)
-    print(f"Setting screen config, active media = {active!r} ...")
-    ok = p.set_screen_config(active, brightness=p.last_brightness)
+    print("Encoding + uploading (this shells out to ffmpeg, may take a few seconds)...")
+    remote_name = p.upload_media(raw)
+    if remote_name is None:
+        print("Upload failed - see the log line above for which step (encode/announce/"
+              "data/finalize) it failed at.")
+        return
+    print(f"Uploaded as {remote_name!r}. Setting it as the active screen...")
+    ok = p.set_media(remote_name)
     print("ok" if ok else "no response")
     print("Should be showing now on the physical panel.")
 
@@ -220,11 +225,11 @@ MENU = {
     "2": ("Full handshake info", test_handshake),
     "3": ("Ping x3 (keepalive)", test_ping),
     "4": ("List media the panel itself reports (real protocol)", test_device_media_list),
-    "5": ("List media via adb (filesystem view)", test_adb_media_list),
+    "5": ("[Legacy] List media via adb (expect nothing - not actually used)", test_adb_media_list),
     "6": ("Check raw USB visibility (pyusb, VID 0x391A)", test_usb_probe),
     "7": ("Check usbprint.sys device path (diagnostic, no handle opened)", test_check_usbprint_path),
     "8": ("Brightness sweep (20 -> 100 -> 0 -> 60)", test_brightness),
-    "9": ("Upload an image/gif and set it as the default/boot screen", test_set_default_image),
+    "9": ("Upload an image/gif (real protocol, needs ffmpeg) and set as active screen", test_set_default_image),
     "10": ("Raw ping byte dump (diagnostic - use if option 3 reports no response)", test_raw_ping_dump),
 }
 
