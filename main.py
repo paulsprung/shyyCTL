@@ -17,8 +17,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import subprocess
 import tempfile
+import threading
+import time
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -54,6 +57,16 @@ _panorama = None
 _panorama_info: dict | None = None
 _panorama_lock = asyncio.Lock()
 _keepalive_task: asyncio.Task | None = None
+
+# Host-driven, position-aware hub effects (Advanced RGB view) - see
+# _run_wave_effect below. A plain threading.Event rather than an asyncio
+# primitive because the effect body is a tight blocking-socket loop run
+# via asyncio.to_thread on a worker thread, not a coroutine; setting the
+# event from a request handler's own thread is safe without a lock, it's
+# just a one-way "stop now" flag.
+_effect_stop = threading.Event()
+_effect_task: asyncio.Task | None = None
+_effect_status: dict = {"running": False, "kind": None, "error": None}
 
 
 def _find_panorama():
@@ -259,6 +272,7 @@ async def lifespan(app: FastAPI):
     _keepalive_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await _keepalive_task
+    await _stop_effect()
     hub.disconnect()
     if _panorama is not None:
         _panorama.disconnect()
@@ -431,6 +445,41 @@ async def set_mobo_color(body: ColorRequest):
     return {"ok": True}
 
 
+@app.get("/api/rgb/mobo/zones")
+async def mobo_zones():
+    """The X870-F's motherboard controller is one OpenRGB device with 4
+    zones: 'Aura Mainboard' (3 real onboard LEDs) and 3x 'Aura Addressable
+    N' (8 LEDs each - unconnected combo headers on this board, confirmed
+    against real hardware). /api/rgb/mobo/color writes the whole device at
+    once, hitting the unconnected zones too; this lists the zones so the
+    UI can target just the real one instead."""
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    devices = await asyncio.to_thread(openrgb.motherboard)
+    if not devices:
+        raise HTTPException(404, "no motherboard RGB device found")
+    device = devices[0]
+    return {"name": device.name,
+            "zones": [{"index": i, "name": z.name, "leds": len(z.leds)}
+                      for i, z in enumerate(device.zones)]}
+
+
+@app.post("/api/rgb/mobo/zone/{index}/color")
+async def set_mobo_zone_color(index: int, body: ColorRequest):
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    rgb = _hex_to_rgb(body.color)
+    devices = await asyncio.to_thread(openrgb.motherboard)
+    if not devices:
+        raise HTTPException(404, "no motherboard RGB device found")
+    try:
+        await asyncio.to_thread(
+            openrgb.set_zone_color_by_index, devices[0], index, rgb, body.persistent)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
 @app.post("/api/rgb/ram/color")
 async def set_ram_color(body: ColorRequest):
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
@@ -563,6 +612,146 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
     if error:
         raise HTTPException(400, error)
     return {"ok": True}
+
+
+class HubModeRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/rgb/hub/mode")
+async def set_hub_mode(body: HubModeRequest):
+    """Selects one of the hub's own native firmware modes (Static, Direct,
+    Fading, Spectrum Cycle, Rainbow Wave, etc - whatever ctrl.modes lists,
+    read straight off the hub itself and surfaced via /api/rgb/devices'
+    merged hub entry) - the 'standalone animation' tier of the Advanced RGB
+    view: rainbow-style effects the hub's own IC drives on its own,
+    distinct from the position-aware wave effect below, which is
+    host-driven and needs shyyctl running continuously. Stops that wave
+    effect first if one is active, so the two don't fight over the zone's
+    active mode."""
+    await _stop_effect()
+
+    def _do():
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                return "no_device"
+            if not raw.select_mode(ctrl, body.name):
+                return f"no mode named '{body.name}' on {ctrl.name}"
+            return None
+
+    try:
+        error = await asyncio.to_thread(_do)
+    except Exception as exc:
+        raise HTTPException(503, f"OpenRGB not connected: {exc}")
+    if error == "no_device":
+        raise HTTPException(404, "no hub RGB device found")
+    if error:
+        raise HTTPException(400, error)
+    return {"ok": True}
+
+
+def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
+    """Runs until _effect_stop is set, on its own worker thread (via
+    asyncio.to_thread) - one raw connection held for the whole effect
+    rather than reopened per frame (see openrgb_raw.py's docstring on this
+    hub's server-side instability under repeated REQUEST_CONTROLLER_DATA
+    hammering). Drives every fan channel that's actually been placed in
+    Setup from its real per-LED y-coordinate (app/layout.py), blended
+    against a moving phase - a wave that visibly runs top-to-bottom across
+    the case, not just a flat per-channel colour cycle blind to position."""
+    global _effect_status
+    data = layout.with_leds()
+    leds_by_unit: dict[str, list[dict]] = {}
+    for led in data["leds"]:
+        leds_by_unit.setdefault(led["unit"], []).append(led)
+    fan_units = [u for u in data["units"] if u.get("kind") == "fan" and u.get("led_channel")]
+    all_ys = [led["y"] for u in fan_units for led in leds_by_unit.get(u["id"], [])]
+    if not fan_units or not all_ys:
+        _effect_status = {"running": False, "kind": None,
+                           "error": "no fan LED channels placed in Setup yet"}
+        return
+    y_min, y_max = min(all_ys), max(all_ys)
+    y_span = (y_max - y_min) or 1.0
+
+    def blend(a, b, t):
+        # Cosine ease instead of a linear lerp - a linear wave has a
+        # visible seam where it wraps from b back to a; cosine keeps the
+        # loop smooth all the way around.
+        w = (1 - math.cos(t * 2 * math.pi)) / 2
+        return tuple(round(a[i] + (b[i] - a[i]) * w) for i in range(3))
+
+    try:
+        with _open_hub_raw() as raw:
+            ctrl = raw.find_controller("NZXT")
+            if ctrl is None:
+                _effect_status = {"running": False, "kind": None,
+                                   "error": "no hub RGB device found"}
+                return
+            raw.select_mode(ctrl, "direct")
+            start = time.monotonic()
+            while not _effect_stop.is_set():
+                phase = ((time.monotonic() - start) / period_s) % 1.0
+                for u in fan_units:
+                    zone = raw.zone_for_channel(ctrl, u["led_channel"])
+                    if zone is None or zone.leds_count == 0:
+                        continue
+                    unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
+                    if len(unit_leds) != zone.leds_count:
+                        continue
+                    colors = [
+                        blend(color_a, color_b, ((led["y"] - y_min) / y_span - phase) % 1.0)
+                        for led in unit_leds
+                    ]
+                    raw.set_zone_colors(ctrl.index, zone.index, colors)
+                _effect_stop.wait(0.08)
+    except Exception as exc:
+        log.warning("wave effect stopped: %s", exc)
+        _effect_status = {"running": False, "kind": None, "error": str(exc)}
+        return
+    _effect_status = {"running": False, "kind": None, "error": None}
+
+
+async def _stop_effect():
+    global _effect_task
+    _effect_stop.set()
+    if _effect_task is not None:
+        try:
+            await asyncio.wait_for(_effect_task, timeout=3.0)
+        except Exception:
+            pass
+        _effect_task = None
+
+
+class WaveEffectRequest(BaseModel):
+    color_a: str = "#4c79ff"
+    color_b: str = "#ff7a30"
+    period_s: float = 4.0
+
+
+@app.post("/api/rgb/effects/wave/start")
+async def start_wave_effect(body: WaveEffectRequest):
+    global _effect_task, _effect_status
+    if _effect_status.get("running"):
+        raise HTTPException(409, "an effect is already running - stop it first")
+    _effect_stop.clear()
+    _effect_status = {"running": True, "kind": "wave", "error": None}
+    color_a = _hex_to_rgb(body.color_a)
+    color_b = _hex_to_rgb(body.color_b)
+    _effect_task = asyncio.create_task(
+        asyncio.to_thread(_run_wave_effect, color_a, color_b, max(body.period_s, 0.5)))
+    return {"ok": True}
+
+
+@app.post("/api/rgb/effects/stop")
+async def stop_effect_endpoint():
+    await _stop_effect()
+    return {"ok": True}
+
+
+@app.get("/api/rgb/effects/status")
+async def effect_status():
+    return _effect_status
 
 
 # -- hardware discovery scan -------------------------------------------

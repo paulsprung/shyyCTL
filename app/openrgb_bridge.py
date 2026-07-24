@@ -229,7 +229,8 @@ class OpenRgbBridge:
                     "type": d.type.name,
                     "leds": len(d.leds),
                     "modes": [m.name for m in d.modes],
-                    "zones": [{"name": z.name, "leds": len(z.leds)} for z in d.zones],
+                    "zones": [{"index": i, "name": z.name, "leds": len(z.leds)}
+                              for i, z in enumerate(d.zones)],
                 }
                 for d in self._devices()
             ]
@@ -301,6 +302,27 @@ class OpenRgbBridge:
                 raise ValueError(f"no zone on {device.name} matches channel '{channel}'")
             if len(zone.leds) == 0:
                 raise ValueError(f"channel '{channel}' has no LEDs - it's an empty combo header, "
+                                  "do not address it")
+            from openrgb.utils import RGBColor
+            mode_name = "static" if persistent else "direct"
+            self._select_mode(device, mode_name)
+            zone.set_color(RGBColor(*color))
+
+    def set_zone_color_by_index(self, device, zone_index: int, color: tuple[int, int, int],
+                                 persistent: bool = True):
+        """For devices like the X870-F's motherboard controller, which
+        exposes 4 zones under one device: 'Aura Mainboard' (3 real onboard
+        LEDs) plus 3x 'Aura Addressable N' (8 LEDs each - unconnected combo
+        headers on this board). set_color() above writes the whole device
+        at once, which includes those empty/unconnected zones; this targets
+        exactly one zone by its position in device.zones (as returned by
+        describe_all) so the UI can address the real onboard zone alone."""
+        with self._lock:
+            if zone_index < 0 or zone_index >= len(device.zones):
+                raise ValueError(f"{device.name} has no zone at index {zone_index}")
+            zone = device.zones[zone_index]
+            if len(zone.leds) == 0:
+                raise ValueError(f"zone '{zone.name}' has no LEDs - it's an unconnected header, "
                                   "do not address it")
             from openrgb.utils import RGBColor
             mode_name = "static" if persistent else "direct"
