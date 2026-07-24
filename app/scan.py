@@ -129,6 +129,10 @@ class Scan:
             entry = self._probe_channel(channel, measure_curves, base, 0.62 / total, accessory_ids)
             self.results.append(entry)
 
+        self.step = "Sizing OpenRGB LED zones"
+        self.progress = 0.72
+        self._resize_hub_zones()
+
         self.step = "Checking motherboard and RAM lighting"
         self.progress = 0.75
         self._scan_openrgb()
@@ -239,6 +243,36 @@ class Scan:
             if self.hub.rpm(channel):
                 return duty
         return None
+
+    def _resize_hub_zones(self):
+        """OpenRGB's hub LED zones default to 0 LEDs and silently do nothing
+        when written to until resized to the real count (see
+        app/openrgb_bridge.py's docstring) - this is the one place that
+        actually applies the counts this scan just identified, so hub RGB
+        control works right after a scan instead of needing a separate
+        manual step for every channel a model was confidently identified
+        for. Channels left at "unknown" confidence still need a manual pick
+        + POST /api/rgb/hub/{channel}/resize (no auto-detected count exists
+        to apply yet)."""
+        if not self.openrgb.connected and not self.openrgb.connect():
+            log.warning("OpenRGB not reachable, skipping hub zone resize: %s",
+                        self.openrgb.last_error)
+            return
+        devices = self.openrgb.hub_leds()
+        if not devices:
+            log.warning("No OpenRGB hub device found, skipping zone resize")
+            return
+        device = devices[0]
+        for entry in self.results:
+            if entry["confidence"] != "certain" or not entry["led_channel"] or not entry["leds"]:
+                continue
+            try:
+                ok = self.openrgb.resize_zone(device, entry["led_channel"], entry["leds"])
+                if not ok:
+                    entry["needs"].append(
+                        f"could not resize OpenRGB zone for {entry['led_channel']}")
+            except Exception as exc:
+                entry["needs"].append(f"resize failed: {exc}")
 
     def _scan_openrgb(self):
         if not self.openrgb.connected and not self.openrgb.connect():

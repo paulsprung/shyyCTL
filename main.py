@@ -295,6 +295,30 @@ async def set_ram_color(body: ColorRequest):
     return {"ok": True}
 
 
+class ResizeRequest(BaseModel):
+    leds: int
+
+
+@app.post("/api/rgb/hub/{channel}/resize")
+async def resize_hub_channel(channel: str, body: ResizeRequest):
+    """Needed once per channel before hub color control does anything -
+    OpenRGB's zones default to 0 LEDs and silently no-op until sized to
+    match the real fan (see app/openrgb_bridge.py's docstring). A scan
+    applies this automatically for every channel it identifies with
+    certainty (app/scan.py's _resize_hub_zones); call this directly for a
+    channel scan left at 'unknown' confidence after picking its model by
+    hand, or to redo one channel without a full rescan."""
+    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+        raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
+    devices = await asyncio.to_thread(openrgb.hub_leds)
+    if not devices:
+        raise HTTPException(404, "no hub RGB device found")
+    ok = await asyncio.to_thread(openrgb.resize_zone, devices[0], channel, body.leds)
+    if not ok:
+        raise HTTPException(400, f"could not resize zone for '{channel}' to {body.leds} LEDs")
+    return {"ok": True}
+
+
 @app.post("/api/rgb/hub/{channel}/color")
 async def set_hub_channel_color(channel: str, body: ColorRequest):
     """liquidctl LED control is confirmed broken for the 360mm units - hub
