@@ -30,6 +30,7 @@ needs real settling time and the UI should show what is happening.
 
 import logging
 import threading
+import time
 
 from . import geometry
 from .openrgb_raw import OpenRgbRaw
@@ -392,14 +393,37 @@ class Scan:
             log.warning("OpenRGB not reachable during scan: %s", self.openrgb.last_error)
             return
         try:
-            mobo = self.openrgb.motherboard()
+            mobo = self._settled(self.openrgb.motherboard, "motherboard")
             self.mobo = {"name": mobo[0].name, "leds": len(mobo[0].leds)} if mobo else None
         except Exception as exc:
             log.warning("Could not read motherboard from OpenRGB: %s", exc)
         try:
-            self.ram = [{"name": d.name, "leds": len(d.leds)} for d in self.openrgb.ram()]
+            ram = self._settled(self.openrgb.ram, "RAM")
+            self.ram = [{"name": d.name, "leds": len(d.leds)} for d in ram]
         except Exception as exc:
             log.warning("Could not read RAM from OpenRGB: %s", exc)
+
+    @staticmethod
+    def _settled(fetch, label: str, retries: int = 4, delay: float = 1.5) -> list:
+        """OpenRGB's own SMBus detection can find sticks/devices one at a
+        time - a device count with no None entries (which
+        OpenRgbBridge._devices() already treats as "settled") can still be
+        genuinely short of the real hardware if OpenRGB just hasn't found
+        every one yet, confirmed against a real run: a second RAM stick
+        went missing from a scan's results despite both showing up fine
+        through OpenRGB moments later. Polls a few times and keeps the
+        largest result seen, stopping early once a read no longer grows
+        past the previous one."""
+        best: list = []
+        for attempt in range(retries):
+            current = fetch()
+            if len(current) <= len(best) and best:
+                break
+            best = current
+            if attempt < retries - 1:
+                log.debug("%s: %d device(s) so far, checking again for more", label, len(best))
+                time.sleep(delay)
+        return best
 
     def _restore(self):
         """Leave every fan somewhere safe rather than at whatever the scan left."""

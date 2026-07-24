@@ -40,6 +40,7 @@ CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
 WEB_DIR = ROOT / "web"
 CURVE_FILE = ROOT / "curve.json"
 LAYOUT_FILE = ROOT / "layout.json"
+PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
 
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
 log = logging.getLogger("shyyctl")
@@ -66,6 +67,29 @@ def _find_panorama():
         # take down startup or a request handler.
         log.warning("panorama connect attempt failed: %s", exc)
         return None
+
+
+def _load_panorama_state() -> dict:
+    if PANORAMA_STATE_FILE.is_file():
+        try:
+            return json.loads(PANORAMA_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_panorama_state(media: str | None, brightness: int | None):
+    """Persists what shyyctl itself last applied - not a read of the
+    device's real current state, which the reverse-engineered protocol has
+    no command for (checked: neither the handshake's device-info reply nor
+    the media listing carries a "currently active" field - confirmed
+    against real captures, every field of both was dumped and inspected).
+    KANALI itself almost certainly does the same thing (remembers its own
+    last action rather than querying it back). This at least survives a
+    shyyctl restart or panel reconnect, instead of resetting to a guessed
+    default every time a fresh connection object is created."""
+    PANORAMA_STATE_FILE.write_text(
+        json.dumps({"media": media, "brightness": brightness}), encoding="utf-8")
 
 
 async def get_panorama():
@@ -95,6 +119,15 @@ async def get_panorama():
                 _panorama_info = await asyncio.to_thread(_panorama.handshake)
             except Exception as exc:
                 log.warning("panorama handshake failed: %s", exc)
+            # A fresh connection object's last_media/last_brightness start
+            # at hardcoded defaults (see app/panorama.py) - reload whatever
+            # shyyctl itself last actually applied instead of forgetting it
+            # on every reconnect.
+            saved = _load_panorama_state()
+            if saved.get("media"):
+                _panorama.last_media = saved["media"]
+            if saved.get("brightness") is not None:
+                _panorama.last_brightness = saved["brightness"]
         return _panorama
 
 
@@ -520,53 +553,6 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
     return {"ok": True}
 
 
-@app.post("/api/rgb/all/color")
-async def set_all_color(body: ColorRequest):
-    """The "quick" tier: one colour for everything shyyctl knows how to
-    address - motherboard, RAM, and every hub channel the last scan
-    identified with a known LED count, each written at its own real
-    size (mixed fan models included, nothing assumed uniform). Channels
-    without a known size are skipped rather than guessed at."""
-    rgb = _hex_to_rgb(body.color)
-    result: dict = {"mobo": False, "ram": False, "hub": []}
-
-    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
-        result["openrgb_error"] = f"OpenRGB not connected: {openrgb.last_error}"
-    else:
-        mobo_devices = await asyncio.to_thread(openrgb.motherboard)
-        if mobo_devices:
-            await asyncio.to_thread(openrgb.set_color, mobo_devices, rgb, body.persistent)
-            result["mobo"] = True
-        ram_devices = await asyncio.to_thread(openrgb.ram)
-        if ram_devices:
-            await asyncio.to_thread(openrgb.set_color, ram_devices, rgb, body.persistent)
-            result["ram"] = True
-
-    channels = [r["led_channel"] for r in scan.state().get("results", [])
-                if r.get("led_channel") and r.get("leds")]
-    if channels:
-        def _do():
-            applied = []
-            with _open_hub_raw() as raw:
-                ctrl = raw.find_controller("NZXT")
-                if ctrl is None:
-                    return applied
-                raw.select_mode(ctrl, "static" if body.persistent else "direct")
-                for ch in channels:
-                    zone = raw.zone_for_channel(ctrl, ch)
-                    if zone is None or zone.leds_count == 0:
-                        continue
-                    raw.set_zone_color(ctrl.index, zone, rgb)
-                    applied.append(ch)
-            return applied
-        try:
-            result["hub"] = await asyncio.to_thread(_do)
-        except Exception as exc:
-            result["hub_error"] = str(exc)
-
-    return result
-
-
 # -- hardware discovery scan -------------------------------------------
 
 class ScanRequest(BaseModel):
@@ -673,11 +659,23 @@ async def panorama_status():
     """Returns the info handshaked once when this connection was
     established (see get_panorama's docstring) - does NOT re-handshake on
     every call, since the device only replies with real info the first
-    time after connecting."""
+    time after connecting.
+
+    last_applied is what shyyctl itself last set (persisted across
+    reconnects/restarts - see _save_panorama_state), NOT a live read of
+    what's actually showing on the panel right now - the reverse-
+    engineered protocol has no command for that (checked; see
+    _save_panorama_state's docstring). If something else changed the
+    screen after shyyctl last touched it (KANALI, for instance), this can
+    be stale."""
     panel = await get_panorama()
     if panel is None or not panel.connected:
         return {"connected": False}
-    return {"connected": True, "info": _panorama_info}
+    return {
+        "connected": True,
+        "info": _panorama_info,
+        "last_applied": {"media": panel.last_media, "brightness": panel.last_brightness},
+    }
 
 
 @app.get("/api/panorama/media")
@@ -700,6 +698,8 @@ async def panorama_brightness(body: BrightnessRequest):
         raise HTTPException(503, "panel not connected")
     async with _panorama_lock:
         ok = await asyncio.to_thread(panel.set_brightness, body.value)
+    if ok:
+        _save_panorama_state(panel.last_media, panel.last_brightness)
     return {"ok": ok}
 
 
@@ -720,6 +720,8 @@ async def _handle_media_upload(file: UploadFile, apply_as_boot: bool) -> dict:
                 ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
             else:
                 ok = await asyncio.to_thread(panel.set_media, remote_name)
+                if ok:
+                    _save_panorama_state(panel.last_media, panel.last_brightness)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
     return {"filename": remote_name, "applied": ok}

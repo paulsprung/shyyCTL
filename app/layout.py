@@ -24,7 +24,9 @@ SURFACES = ("front", "top", "side", "rear")
 # Fraction of a surface canvas's span that one radius-1 fan's LED ring
 # occupies - not a physical measurement, just enough spread that a unit's
 # individual LEDs are visible as a cluster rather than a single point.
-UNIT_SCALE = 0.12
+# Kept small deliberately (smaller than an early value of 0.12) so units
+# placed close together don't visually overlap.
+UNIT_SCALE = 0.085
 
 
 class Layout:
@@ -124,18 +126,23 @@ class Layout:
         fan model (app/geometry.py, unit-tested); a simple evenly-spaced
         line for anything else - an unidentified fan, RAM, motherboard, or
         the display - which is not physically accurate but keeps the LED
-        count and cluster-of-dots look consistent everywhere."""
+        count and cluster-of-dots look consistent everywhere.
+
+        rotation and reversed_leds apply regardless of kind - a RAM stick
+        or motherboard header is just as physically rotatable as a fan, it
+        only lacks the fan-specific capsule shape and front/edge facing
+        concept (facing only means anything for an actual fan)."""
+        model = None
         if unit.get("kind") == "fan" and unit.get("model"):
             model = next((m for m in geometry.MODELS if m.name == unit["model"]), None)
-            if model is not None:
-                pts = geometry.led_positions(
-                    model, radius=1.0, vertical=unit.get("facing", "front") == "front")
-                if unit.get("rotation"):
-                    pts = geometry.rotate(pts, unit["rotation"])
-                if unit.get("reversed_leds"):
-                    pts = list(reversed(pts))
-                return pts
-        n = unit.get("leds") or 1
-        if n <= 1:
-            return [(0.0, 0.0)]
-        return [(-1.0 + 2.0 * i / (n - 1), 0.0) for i in range(n)]
+        if model is not None:
+            pts = geometry.led_positions(
+                model, radius=1.0, vertical=unit.get("facing", "front") == "front")
+        else:
+            n = unit.get("leds") or 1
+            pts = [(0.0, 0.0)] if n <= 1 else [(-1.0 + 2.0 * i / (n - 1), 0.0) for i in range(n)]
+        if unit.get("rotation"):
+            pts = geometry.rotate(pts, unit["rotation"])
+        if unit.get("reversed_leds"):
+            pts = list(reversed(pts))
+        return pts

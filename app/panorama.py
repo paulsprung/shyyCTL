@@ -456,7 +456,16 @@ class _PanoramaBase:
             out.append(entries)
         return out
 
-    def handshake(self, timeout_s: float = 2.0) -> dict | None:
+    def handshake(self, timeout_s: float = 4.0) -> dict | None:
+        """timeout_s bumped from 2.0: confirmed against a real run that
+        product/model/firmware/serial (from f500) came back fine while
+        resolution (f502) stayed empty - f502 is one of three replies
+        read_messages() tries to collect, and it breaks off the read
+        attempt entirely the moment any single one times out. That fits a
+        real device that's simply slower to send this specific reply than
+        the 2s window budgeted per message - this is now called once per
+        connection (see main.py's get_panorama), not once per request, so
+        there's no UX cost to being more patient here."""
         if not self.connected:
             raise PanoramaError("not connected")
         for frame in build_registration_burst():
