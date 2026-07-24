@@ -214,6 +214,25 @@ async def status():
     }
 
 
+@app.post("/api/reconnect")
+async def reconnect_all():
+    """Manual retry for all three hardware surfaces - e.g. after plugging
+    something in, restarting OpenRGB, or the panel dropping off USB -
+    without restarting shyyctl itself. /api/status only ever reports
+    cached state; this is what actually re-probes."""
+    hub_ok = await asyncio.to_thread(hub.connect)
+    openrgb_ok = await asyncio.to_thread(openrgb.connect)
+    global _panorama
+    async with _panorama_lock:
+        _panorama = None
+    panel = await get_panorama()
+    return {
+        "hub": {"connected": hub_ok, "error": hub.last_error},
+        "openrgb": {"connected": openrgb_ok, "error": openrgb.last_error},
+        "panorama": {"connected": panel is not None and panel.connected},
+    }
+
+
 # -- fans -----------------------------------------------------------------
 
 @app.get("/api/fans")

@@ -1,26 +1,735 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<title>shyyctl</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shyyctl</title>
 <style>
-  :root { color-scheme: dark; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #0b0b0d; color: #eee; font-family: system-ui, sans-serif;
+  :root {
+    --chassis:#CFD2CA; --panel:#E9EAE4; --recess:#BFC3BA; --ink:#16181A;
+    --ink-soft:#6B7069; --rule:#A9AEA4; --signal:#1F44E8; --warn:#D9430F;
+    --ok:#1E7A4B; --brush:rgba(255,255,255,.20); --field:#FFFFFF;
+    --display:"Bahnschrift","DIN Alternate","Segoe UI",sans-serif;
+    --body:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+    --mono:"Cascadia Mono","Consolas",ui-monospace,monospace;
   }
-  main { text-align: center; padding: 2rem; }
-  h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.02em; margin-bottom: 0.5rem; }
-  p { color: #999; margin: 0.25rem 0; }
-  code { background: #1a1a1e; padding: 0.15rem 0.4rem; border-radius: 4px; }
+  [data-theme="dark"] {
+    --chassis:#191C1A; --panel:#232724; --recess:#101312; --ink:#E7EAE4;
+    --ink-soft:#8B928A; --rule:#363C38; --signal:#4C79FF; --warn:#FF6B3D;
+    --ok:#43C486; --brush:rgba(255,255,255,.03); --field:#141715;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--chassis);
+    background-image:repeating-linear-gradient(90deg,var(--brush) 0 1px,transparent 1px 3px);
+    color:var(--ink);font-family:var(--body);font-size:14px;padding:22px}
+  .rack{max-width:1180px;margin:0 auto;padding-bottom:70px}
+
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:16px;
+    border-bottom:2px solid var(--ink);padding-bottom:10px}
+  h1{font-family:var(--display);font-weight:700;font-size:30px;letter-spacing:.14em;
+    text-transform:uppercase;margin:0}
+  .subtitle{font-family:var(--mono);font-size:11px;color:var(--ink-soft);flex:1}
+  .theme-toggle{font-family:var(--display);font-size:10px;letter-spacing:.12em;
+    text-transform:uppercase;background:none;border:none;color:var(--ink-soft);
+    padding:6px 8px;cursor:pointer}
+  .theme-toggle:hover{color:var(--signal)}
+
+  .devicebar{display:flex;flex-wrap:wrap;gap:1px;background:var(--rule);
+    border:1px solid var(--rule);border-top:none}
+  .device{flex:1 1 200px;background:var(--panel);padding:10px 13px;
+    display:flex;align-items:center;gap:10px}
+  .lamp{width:9px;height:9px;border-radius:50%;background:var(--rule);flex:none;
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
+  .lamp[data-on="true"]{background:var(--ok)} .lamp[data-on="false"]{background:var(--warn)}
+  .device-name{font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:11px}
+  .device-detail{font-family:var(--mono);font-size:11px;color:var(--ink-soft);
+    margin-top:2px;word-break:break-word}
+
+  nav{display:flex;flex-wrap:wrap;gap:1px;background:var(--rule);
+    border:1px solid var(--rule);border-top:none}
+  nav button{flex:1 1 auto;font-family:var(--display);font-size:11px;letter-spacing:.14em;
+    text-transform:uppercase;padding:11px 14px;border:none;background:var(--panel);
+    color:var(--ink-soft);cursor:pointer;display:flex;align-items:center;
+    justify-content:center;gap:8px}
+  nav button:hover{color:var(--ink)}
+  nav button[aria-current="page"]{background:var(--signal);color:#fff}
+  nav .pip{width:6px;height:6px;border-radius:50%;background:var(--warn);flex:none}
+  nav button[aria-current="page"] .pip{background:#fff}
+
+  main{padding-top:26px}
+  .page{display:none} .page.active{display:block}
+  section{margin-bottom:28px}
+  .section-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
+  h2{font-family:var(--display);font-size:13px;font-weight:600;letter-spacing:.18em;
+    text-transform:uppercase;margin:0}
+  .rule{flex:1;height:1px;background:var(--rule)}
+  .note{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .intro{font-family:var(--mono);font-size:12px;color:var(--ink-soft);
+    line-height:1.65;max-width:64ch;margin:0 0 18px}
+
+  .card{background:var(--panel);padding:18px;border:1px solid var(--rule)}
+  .card-title{font-family:var(--display);text-transform:uppercase;letter-spacing:.12em;
+    font-size:11px;margin-bottom:10px}
+  .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  .split > .card{border:none}
+  .stack{display:flex;flex-direction:column;gap:1px;background:var(--rule);
+    border:1px solid var(--rule)}
+  .stack > .card{border:none}
+
+  .btn{font-family:var(--display);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+    padding:10px 16px;border:none;background:var(--ink);color:var(--chassis);cursor:pointer}
+  .btn.sec{background:none;color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+  .btn.hot{background:var(--warn);color:#fff}
+  .btn.sm{padding:6px 10px;font-size:10px}
+  .btn:hover{background:var(--signal);color:#fff}
+  .btn.sec:hover{background:none;color:var(--signal);box-shadow:inset 0 0 0 1px var(--signal)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+  select,input[type=text],input[type=number],input[type=file]{font-family:var(--mono);font-size:12px;
+    padding:7px;border:1px solid var(--rule);background:var(--field);color:var(--ink)}
+  input[type=color]{width:46px;height:32px;padding:0;border:1px solid var(--rule);
+    background:none;cursor:pointer}
+  input[type=range]{accent-color:var(--signal);width:100%}
+  input[type=checkbox]{accent-color:var(--signal);width:15px;height:15px}
+  label.inline{display:flex;align-items:center;gap:7px;font-family:var(--mono);
+    font-size:12px;cursor:pointer}
+  .prop{margin-bottom:12px}
+  .prop label{display:block;font-family:var(--display);font-size:10px;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--ink-soft);margin-bottom:5px}
+  .prop input,.prop select{width:100%}
+
+  table.res{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+  table.res th{text-align:left;font-family:var(--display);font-size:10px;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--ink-soft);padding:0 10px 8px 0;font-weight:600}
+  table.res td{padding:8px 10px 8px 0;border-top:1px solid var(--rule);vertical-align:top}
+  .tag{font-size:10px;padding:2px 6px;box-shadow:inset 0 0 0 1px var(--rule);color:var(--ink-soft)}
+  .tag.ok{box-shadow:inset 0 0 0 1px var(--ok);color:var(--ok)}
+  .tag.warn{box-shadow:inset 0 0 0 1px var(--warn);color:var(--warn)}
+
+  .bar{height:5px;background:var(--recess);border:1px solid var(--rule);margin:12px 0 6px}
+  .bar i{display:block;height:100%;background:var(--signal);transition:width .3s}
+
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+    gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  .stat{background:var(--panel);padding:13px}
+  .stat-label{font-family:var(--display);font-size:10px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--ink-soft)}
+  .stat-value{font-family:var(--mono);font-size:22px;font-variant-numeric:tabular-nums;margin-top:5px}
+  .stat-value .u{font-size:11px;color:var(--ink-soft)}
+
+  .fan-row{padding:14px 0;border-top:1px solid var(--rule)}
+  .fan-row:first-child{border-top:none}
+
+  #log{position:fixed;left:22px;right:22px;bottom:22px;max-width:640px;margin:0 auto;
+    font-family:var(--mono);font-size:12px;background:var(--ink);color:var(--chassis);
+    padding:12px 14px;display:none;z-index:20}
+  #log[data-kind="error"]{background:var(--warn);color:#fff}
+
+  pre.dump{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;
+    margin:0;max-height:320px;overflow:auto}
+
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
-<main>
-  <h1>shyyctl backend is running</h1>
-  <p>The web UI hasn't been built yet - this is a placeholder.</p>
-  <p>Try <code>/api/status</code> to confirm the API is wired up.</p>
-</main>
+<div class="rack">
+
+  <header>
+    <h1>shyyctl</h1>
+    <span class="subtitle">127.0.0.1:8777 &middot; local only</span>
+    <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">Light</button>
+  </header>
+
+  <div class="devicebar" id="devicebar"></div>
+
+  <nav aria-label="Sections">
+    <button id="tab-status"  onclick="showPage('status')">Status</button>
+    <button id="tab-fans"    onclick="showPage('fans')">Fans</button>
+    <button id="tab-rgb"     onclick="showPage('rgb')">RGB</button>
+    <button id="tab-display" onclick="showPage('display')">Display</button>
+    <button id="tab-scan"    onclick="showPage('scan')">Scan</button>
+    <button id="tab-settings" onclick="showPage('settings')">Settings</button>
+  </nav>
+
+  <main>
+
+  <!-- ================= STATUS ================= -->
+  <div class="page" id="page-status">
+    <section>
+      <div class="section-head"><h2>Overview</h2><div class="rule"></div></div>
+      <div class="stat-grid" id="statusStats"></div>
+      <div class="note" id="statusEmpty" style="margin-top:14px"></div>
+    </section>
+  </div>
+
+  <!-- ================= FANS ================= -->
+  <div class="page" id="page-fans">
+    <section>
+      <div class="section-head"><h2>Fan speed</h2><div class="rule"></div>
+        <span class="note" id="fansNote"></span></div>
+      <p class="intro">
+        Duty applies immediately and stays in the hub after this app closes. On a
+        single-frame unit one PWM line drives every fan in the frame.
+      </p>
+      <div class="card" id="fansList"></div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Curve</h2><div class="rule"></div>
+        <span class="note">saved only &mdash; not applied automatically yet</span></div>
+      <p class="intro">
+        Temperature/duty points, stored for when the automatic control loop lands.
+        For now, use the duty sliders above to actually change fan speed.
+      </p>
+      <div class="card">
+        <div id="curvePoints"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn sec sm" onclick="addCurvePoint()">+ point</button>
+          <button class="btn sm" onclick="saveCurve()">Save</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ================= RGB ================= -->
+  <div class="page" id="page-rgb">
+    <section>
+      <div class="section-head"><h2>Motherboard &amp; RAM</h2><div class="rule"></div>
+        <span class="note" id="rgbNote"></span></div>
+      <div class="split">
+        <div class="card">
+          <div class="card-title">Motherboard</div>
+          <div class="row">
+            <input type="color" id="moboColor" value="#4c79ff">
+            <label class="inline"><input type="checkbox" id="moboPersist" checked> persistent</label>
+            <button class="btn sm" onclick="setMoboColor()">Apply</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">RAM</div>
+          <div class="row">
+            <input type="color" id="ramColor" value="#4c79ff">
+            <label class="inline"><input type="checkbox" id="ramPersist" checked> persistent</label>
+            <button class="btn sm" onclick="setRamColor()">Apply</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Hub channels</h2><div class="rule"></div>
+        <span class="note">from the last scan</span></div>
+      <div id="hubRgbList"></div>
+    </section>
+  </div>
+
+  <!-- ================= DISPLAY ================= -->
+  <div class="page" id="page-display">
+    <section>
+      <div class="section-head"><h2>Panorama</h2><div class="rule"></div>
+        <span class="note" id="panoNote"></span></div>
+      <div class="split">
+        <div class="card">
+          <div class="card-title">Device</div>
+          <div class="note" id="panoInfo" style="line-height:1.8"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Brightness</div>
+          <input type="range" min="0" max="100" id="panoBrightness" value="80">
+          <div class="row" style="margin-top:10px;justify-content:space-between">
+            <span class="note" id="panoBrightnessVal">80%</span>
+            <button class="btn sm" onclick="setPanoBrightness()">Set</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Media on device</h2><div class="rule"></div></div>
+      <div class="card">
+        <table class="res" id="panoMediaTable"></table>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Upload</h2><div class="rule"></div></div>
+      <div class="split">
+        <div class="card">
+          <div class="card-title">Apply now</div>
+          <p class="note" style="line-height:1.6;margin:0 0 10px">
+            Image, GIF, or video &mdash; encoded to H.264 and shown immediately.
+          </p>
+          <input type="file" id="panoApplyFile" accept="image/*,video/*">
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm" onclick="uploadPanoMedia(false)">Upload &amp; apply</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Set as boot image</div>
+          <p class="note" style="line-height:1.6;margin:0 0 10px">
+            Shown from the moment the PSU powers on, independent of whatever else
+            is currently applied.
+          </p>
+          <input type="file" id="panoBootFile" accept="image/*,video/*">
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm" onclick="uploadPanoMedia(true)">Upload &amp; set as boot</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ================= SCAN ================= -->
+  <div class="page" id="page-scan">
+    <section>
+      <div class="section-head"><h2>Scan</h2><div class="rule"></div>
+        <span class="note" id="scanNote"></span></div>
+      <p class="intro">
+        Spins each fan channel up, reads its tachometer, and reads the hub's
+        per-channel accessory ID to identify the fan model (and with it, the real
+        LED count) where possible. Also resizes the matching OpenRGB hub zones so
+        RGB control on the RGB page works right after.
+      </p>
+      <div class="card">
+        <div class="row">
+          <button class="btn" id="scanBtn" onclick="startScan(true)">Run full scan</button>
+          <button class="btn sec sm" onclick="startScan(false)">Quick scan, no curves</button>
+          <button class="btn sec sm" onclick="cancelScan()">Cancel</button>
+        </div>
+        <div class="bar"><i id="scanBar" style="width:0%"></i></div>
+        <div class="note" id="scanStep">Not run yet.</div>
+        <div id="scanResults" style="margin-top:16px"></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>Motherboard &amp; RAM</h2><div class="rule"></div></div>
+      <div class="card" id="scanRgbSummary"><div class="note">Run a scan.</div></div>
+    </section>
+  </div>
+
+  <!-- ================= SETTINGS ================= -->
+  <div class="page" id="page-settings">
+    <section>
+      <div class="section-head"><h2>Connections</h2><div class="rule"></div></div>
+      <div class="card" id="connections"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn sec sm" onclick="reconnectAll()">Reconnect all</button>
+      </div>
+    </section>
+    <section>
+      <div class="section-head"><h2>Raw OpenRGB devices</h2><div class="rule"></div>
+        <span class="note">for troubleshooting</span></div>
+      <div class="card"><pre class="dump" id="rgbDump">not loaded</pre></div>
+    </section>
+    <section>
+      <div class="section-head"><h2>Appearance</h2><div class="rule"></div></div>
+      <div class="card">
+        <button class="btn sec" onclick="toggleTheme()">Switch theme</button>
+      </div>
+    </section>
+  </div>
+
+  </main>
+</div>
+
+<div id="log"></div>
+
+<script>
+const PAGES = ["status","fans","rgb","display","scan","settings"];
+let status_ = null, fans = null, curve = null, scanState = null, panoStatus = null, panoMedia = null;
+
+/* ---------- plumbing ---------- */
+
+function say(message, kind="info"){
+  const el = document.getElementById("log");
+  el.textContent = message; el.dataset.kind = kind; el.style.display = "block";
+  clearTimeout(say._t); say._t = setTimeout(()=>el.style.display="none", 6000);
+}
+
+async function api(path, options={}){
+  const opts = {...options};
+  if(!(opts.body instanceof FormData)){
+    opts.headers = {"Content-Type":"application/json", ...(opts.headers||{})};
+  }
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function showPage(name){
+  if(!PAGES.includes(name)) name = "status";
+  PAGES.forEach(p=>{
+    document.getElementById("page-"+p).classList.toggle("active", p===name);
+    const tab = document.getElementById("tab-"+p);
+    if(p===name) tab.setAttribute("aria-current","page"); else tab.removeAttribute("aria-current");
+  });
+  if(location.hash !== "#/"+name) location.hash = "#/"+name;
+  if(showPage._last && showPage._last !== name) window.scrollTo({top:0});
+  showPage._last = name;
+}
+addEventListener("hashchange", ()=>showPage((location.hash||"").replace("#/","")||"status"));
+
+function applyTheme(theme){
+  document.documentElement.dataset.theme = theme;
+  document.getElementById("themeToggle").textContent = theme==="dark" ? "Light" : "Dark";
+  localStorage.setItem("shyyctl-theme", theme);
+}
+function toggleTheme(){
+  applyTheme(document.documentElement.dataset.theme==="dark" ? "light" : "dark");
+}
+applyTheme(localStorage.getItem("shyyctl-theme") || "dark");
+
+function hexToRgb(h){ h=h.replace("#",""); return [0,2,4].map(i=>parseInt(h.slice(i,i+2),16)); }
+
+/* ---------- device rail ---------- */
+
+function renderDevices(){
+  if(!status_) return;
+  const {hub, openrgb, panorama} = status_;
+  const cells = [
+    ["Hub", hub.connected, hub.connected ? (hub.description || "connected") : (hub.error || "not connected")],
+    ["OpenRGB", openrgb.connected, openrgb.connected ? "connected" : (openrgb.error || "not connected")],
+    ["Panorama", panorama.connected, panorama.connected ? "connected" : "not connected"],
+  ];
+  document.getElementById("devicebar").innerHTML = cells.map(([n,on,d])=>`
+    <div class="device"><div class="lamp" data-on="${!!on}"></div>
+      <div><div class="device-name">${n}</div><div class="device-detail">${d}</div></div>
+    </div>`).join("");
+
+  const pips = {
+    fans: !hub.connected, rgb: !openrgb.connected, display: !panorama.connected,
+  };
+  Object.entries(pips).forEach(([page,on])=>{
+    const tab = document.getElementById("tab-"+page); if(!tab) return;
+    const has = tab.querySelector(".pip");
+    if(on && !has){ const s=document.createElement("span"); s.className="pip"; tab.prepend(s); }
+    else if(!on && has) has.remove();
+  });
+}
+
+async function reconnectAll(){
+  try{
+    status_ = await api("/api/reconnect",{method:"POST"});
+    say("Reconnect attempted.");
+    renderDevices(); renderSettings();
+  }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- status ---------- */
+
+function renderStatus(){
+  if(!status_){ document.getElementById("statusStats").innerHTML=""; return; }
+  const stats = [];
+  if(fans && fans.readings){
+    fans.readings.filter(r=>String(r.key).toLowerCase().includes("speed"))
+      .forEach(r=>stats.push([r.key, r.value, r.unit||""]));
+  }
+  if(!stats.length) stats.push(["Fans", "--", ""]);
+  document.getElementById("statusStats").innerHTML = stats.map(([l,v,u])=>`
+    <div class="stat"><div class="stat-label">${l}</div>
+      <div class="stat-value" style="${String(v).length>5?'font-size:15px':''}">${v}<span class="u">${u}</span></div></div>`).join("");
+  document.getElementById("statusEmpty").textContent =
+    status_.hub.connected ? "" : "Hub not connected — check Settings.";
+}
+
+/* ---------- fans ---------- */
+
+async function loadFans(){
+  if(!status_ || !status_.hub.connected){ fans = null; return; }
+  try{ fans = await api("/api/fans"); }
+  catch(e){ fans = null; }
+}
+
+function renderFans(){
+  const list = document.getElementById("fansList");
+  if(!status_ || !status_.hub.connected){
+    list.innerHTML = `<div class="note">Hub not connected.</div>`;
+    document.getElementById("fansNote").textContent = "";
+    return;
+  }
+  if(!fans || !fans.channels.length){
+    list.innerHTML = `<div class="note">No fan channels reported.</div>`;
+    return;
+  }
+  document.getElementById("fansNote").textContent = `${fans.channels.length} channel(s)`;
+  list.innerHTML = fans.channels.map(ch=>{
+    const n = ch.replace("fan","");
+    const rpm = (fans.readings||[]).find(r =>
+      String(r.key).toLowerCase() === `fan ${n} speed`);
+    return `<div class="fan-row">
+      <div class="row" style="justify-content:space-between">
+        <strong>${ch}</strong>
+        <span class="note">${rpm ? rpm.value + " rpm" : "-- rpm"}</span>
+      </div>
+      <div class="row" style="margin-top:10px;align-items:center">
+        <input type="range" min="0" max="100" value="0" id="duty-${ch}" style="flex:1"
+          oninput="document.getElementById('dutyval-${ch}').textContent=this.value+' %'"
+          onchange="setDuty('${ch}', this.value)">
+        <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">-- %</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function setDuty(channel, value){
+  try{
+    await api(`/api/fans/${channel}/duty`,{method:"POST",body:JSON.stringify({duty:parseInt(value)})});
+    say(`${channel} set to ${value}%.`);
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function loadCurve(){
+  try{ curve = await api("/api/curve"); }catch(e){ curve = {points:[]}; }
+}
+function renderCurve(){
+  const box = document.getElementById("curvePoints");
+  box.innerHTML = (curve.points||[]).map((p,i)=>`
+    <div class="row" style="margin-bottom:6px">
+      <input type="number" value="${p[0]}" style="width:90px" placeholder="°C"
+        onchange="curve.points[${i}][0]=parseInt(this.value)">
+      <span class="note">°C →</span>
+      <input type="number" value="${p[1]}" style="width:90px" placeholder="%"
+        onchange="curve.points[${i}][1]=parseInt(this.value)">
+      <span class="note">%</span>
+      <button class="btn sec sm" onclick="curve.points.splice(${i},1);renderCurve()">remove</button>
+    </div>`).join("");
+}
+function addCurvePoint(){
+  curve.points = curve.points || [];
+  curve.points.push([50,50]);
+  renderCurve();
+}
+async function saveCurve(){
+  try{
+    await api("/api/curve",{method:"POST",body:JSON.stringify({points:curve.points})});
+    say("Curve saved.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- rgb ---------- */
+
+async function setMoboColor(){
+  try{
+    const rgb = hexToRgb(document.getElementById("moboColor").value);
+    await api("/api/rgb/mobo/color",{method:"POST",body:JSON.stringify(
+      {color:document.getElementById("moboColor").value, persistent:document.getElementById("moboPersist").checked})});
+    say("Motherboard colour applied.");
+  }catch(e){ say(e.message,"error"); }
+}
+async function setRamColor(){
+  try{
+    await api("/api/rgb/ram/color",{method:"POST",body:JSON.stringify(
+      {color:document.getElementById("ramColor").value, persistent:document.getElementById("ramPersist").checked})});
+    say("RAM colour applied.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+function renderHubRgb(){
+  const box = document.getElementById("hubRgbList");
+  const results = (scanState && scanState.results || []).filter(r=>r.led_channel);
+  if(!results.length){
+    box.innerHTML = `<div class="card note">No LED channels known yet — run a scan first.</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="stack">` + results.map(r=>{
+    const ch = r.led_channel;
+    const known = r.leds != null;
+    return `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <strong>${ch}</strong>
+        <span class="note">${r.model ? r.model+" · "+r.leds+" LED" : (known ? r.leds+" LED" : "model unknown")}</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input type="number" id="resize-${ch}" style="width:80px" value="${r.leds||""}" placeholder="LEDs">
+        <button class="btn sec sm" onclick="resizeHubChannel('${ch}')">Resize zone</button>
+        <input type="color" id="color-${ch}" value="#4c79ff">
+        <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
+        <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
+      </div>
+    </div>`;
+  }).join("") + `</div>`;
+}
+
+async function resizeHubChannel(channel){
+  const leds = parseInt(document.getElementById(`resize-${channel}`).value);
+  if(!leds){ say("Enter a LED count first.","error"); return; }
+  try{
+    await api(`/api/rgb/hub/${channel}/resize`,{method:"POST",body:JSON.stringify({leds})});
+    say(`${channel} resized to ${leds} LEDs.`);
+  }catch(e){ say(e.message,"error"); }
+}
+async function setHubColor(channel){
+  try{
+    await api(`/api/rgb/hub/${channel}/color`,{method:"POST",body:JSON.stringify({
+      color: document.getElementById(`color-${channel}`).value,
+      persistent: document.getElementById(`persist-${channel}`).checked,
+    })});
+    say(`${channel} colour applied.`);
+  }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- display (panorama) ---------- */
+
+async function loadPanorama(){
+  try{ panoStatus = await api("/api/panorama/status"); }catch(e){ panoStatus = {connected:false}; }
+  if(panoStatus.connected){
+    try{ panoMedia = await api("/api/panorama/media"); }catch(e){ panoMedia = []; }
+  } else panoMedia = [];
+}
+
+function renderPanorama(){
+  document.getElementById("panoNote").textContent = panoStatus.connected ? "connected" : "not connected";
+  const info = panoStatus.info || {};
+  document.getElementById("panoInfo").innerHTML = panoStatus.connected ? `
+    Product: ${info.product||"?"}<br>
+    Model: ${info.model||"?"}<br>
+    Firmware: ${info.firmware||"?"}<br>
+    Serial: ${info.serial||"?"}<br>
+    Resolution: ${info.width||"?"} &times; ${info.height||"?"}
+  ` : `<span class="note">Panel not connected.</span>`;
+
+  document.getElementById("panoMediaTable").innerHTML = panoMedia.length ? `
+    <thead><tr><th>Path</th><th>Suffix</th><th>Size</th></tr></thead>
+    <tbody>${panoMedia.map(m=>`
+      <tr><td>${m.path||"--"}</td><td>${m.suffix||"--"}</td><td>${m.size!=null?m.size:"--"}</td></tr>`).join("")}</tbody>
+  ` : `<tbody><tr><td class="note">No media listed.</td></tr></tbody>`;
+}
+
+document.getElementById("panoBrightness").addEventListener("input", function(){
+  document.getElementById("panoBrightnessVal").textContent = this.value + "%";
+});
+async function setPanoBrightness(){
+  try{
+    const value = parseInt(document.getElementById("panoBrightness").value);
+    await api("/api/panorama/brightness",{method:"POST",body:JSON.stringify({value})});
+    say(`Brightness set to ${value}%.`);
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function uploadPanoMedia(asBoot){
+  const input = document.getElementById(asBoot ? "panoBootFile" : "panoApplyFile");
+  if(!input.files.length){ say("Pick a file first.","error"); return; }
+  const form = new FormData();
+  form.append("file", input.files[0]);
+  say("Uploading and encoding — this can take a moment...");
+  try{
+    const r = await api(asBoot ? "/api/panorama/boot-image" : "/api/panorama/media",
+      {method:"POST", body:form});
+    say(`Uploaded as ${r.filename}${asBoot?" (boot image)":""}.`);
+    await loadPanorama(); renderPanorama();
+  }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- scan ---------- */
+
+async function startScan(measureCurves){
+  try{
+    await api("/api/scan/start",{method:"POST",body:JSON.stringify({measure_curves:measureCurves})});
+    say(measureCurves ? "Scan started — about two minutes." : "Quick scan started.");
+    pollScan();
+  }catch(e){ say(e.message,"error"); }
+}
+async function cancelScan(){ try{ await api("/api/scan/cancel",{method:"POST"}); }catch(e){} }
+
+async function pollScan(){
+  scanState = await api("/api/scan/status");
+  renderScan();
+  if(scanState.running) setTimeout(pollScan, 700);
+  else if(scanState.results.length){
+    say("Scan finished.");
+    renderHubRgb();
+  }
+}
+
+function renderScan(){
+  if(!scanState) return;
+  document.getElementById("scanBar").style.width = (scanState.progress*100)+"%";
+  document.getElementById("scanStep").textContent = scanState.error || scanState.step || "Not run yet.";
+  document.getElementById("scanBtn").disabled = scanState.running;
+  document.getElementById("scanNote").textContent = scanState.running ? "running" : "";
+
+  document.getElementById("scanResults").innerHTML = scanState.results.length ? `
+    <table class="res">
+      <thead><tr><th>Channel</th><th>LEDs</th><th>Identified</th>
+        <th>Start</th><th>Max</th><th>Still needed</th></tr></thead>
+      <tbody>${scanState.results.map(r=>`
+        <tr>
+          <td>${r.fan_channel}${r.led_channel?" / "+r.led_channel:""}</td>
+          <td>${r.leds||"--"}</td>
+          <td>${r.model
+            ? r.model+' <span class="tag ok">'+r.confidence+'</span>'
+            : (r.present ? '<span class="tag warn">'+r.confidence+'</span>' : '<span class="note">empty</span>')}</td>
+          <td>${r.start_duty!=null?r.start_duty+" %":"--"}</td>
+          <td>${r.max_rpm!=null?r.max_rpm+" rpm":"--"}</td>
+          <td class="note">${(r.needs||[]).join(", ")||"--"}</td>
+        </tr>`).join("")}</tbody>
+    </table>` : "";
+
+  document.getElementById("scanRgbSummary").innerHTML = (scanState.mobo || (scanState.ram||[]).length) ? `
+    <div class="note" style="line-height:1.8">
+      ${scanState.mobo ? `Motherboard: ${scanState.mobo.name} · ${scanState.mobo.leds} LED<br>` : ""}
+      ${(scanState.ram||[]).map(r=>`RAM: ${r.name} · ${r.leds} LED`).join("<br>")}
+    </div>` : `<div class="note">Run a scan.</div>`;
+}
+
+/* ---------- settings ---------- */
+
+function renderSettings(){
+  if(!status_) return;
+  const {hub, openrgb, panorama} = status_;
+  document.getElementById("connections").innerHTML = `
+    <div class="note" style="line-height:1.9">
+      <strong style="color:var(--ink)">Hub</strong> — ${hub.connected?(hub.description||"connected"):hub.error}<br>
+      fan channels: ${(hub.channels&&hub.channels.fan||[]).join(", ")||"none"}<br>
+      led channels: ${(hub.channels&&hub.channels.led||[]).join(", ")||"none"}<br><br>
+      <strong style="color:var(--ink)">OpenRGB</strong> — ${openrgb.connected?"connected":openrgb.error}<br><br>
+      <strong style="color:var(--ink)">Panorama</strong> — ${panorama.connected?"connected":"not connected"}
+    </div>`;
+}
+
+async function loadRgbDump(){
+  try{
+    const devices = await api("/api/rgb/devices");
+    document.getElementById("rgbDump").textContent = JSON.stringify(devices, null, 2);
+  }catch(e){
+    document.getElementById("rgbDump").textContent = "not available: " + e.message;
+  }
+}
+
+/* ---------- loop ---------- */
+
+async function refresh(){
+  try{
+    status_ = await api("/api/status");
+    await loadFans();
+    if(!curve) await loadCurve();
+    await loadPanorama();
+    renderDevices(); renderStatus(); renderFans(); renderCurve();
+    renderPanorama(); renderSettings();
+    showPage((location.hash||"").replace("#/","")||"status");
+  }catch(e){
+    say("Lost contact with shyyctl. Is the server still running?","error");
+  }
+}
+
+(async ()=>{
+  await refresh();
+  try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); }catch(e){}
+  loadRgbDump();
+})();
+
+setInterval(async ()=>{
+  try{
+    status_ = await api("/api/status");
+    await loadFans();
+    renderDevices(); renderStatus();
+    if(document.getElementById("page-fans").classList.contains("active")) renderFans();
+  }catch(e){}
+}, 3000);
+</script>
 </body>
 </html>
