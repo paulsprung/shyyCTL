@@ -7,19 +7,26 @@ into vendor/, which is gitignored. main.py looks there first before
 falling back to PATH (see app/panorama.py's ffmpeg lookup and this
 module's find_openrgb_exe()).
 
-Unverified end to end - written without a way to actually run it against
-the real internet/a real Windows machine in this project's dev
-environment (see other docstrings in this codebase for why that's
-flagged rather than silently assumed to work). Both URLs are meant to be
-stable "always latest" endpoints per their own maintainers (ffmpeg:
-gyan.dev's own build page documents this exact URL as the always-current
-essentials build; OpenRGB: resolved dynamically via GitLab's releases
-API rather than a hardcoded per-version filename, since OpenRGB's actual
-release asset names embed a build-specific commit hash that changes every
-release) - but the exact file layout inside each downloaded archive has
-not been confirmed against a real download in this session, so the
-extraction logic below is a best-effort guess at their structure, not a
-confirmed fact.
+ffmpeg's URL is confirmed working (run against the real internet on the
+target Windows machine this session - downloads and extracts cleanly).
+
+OpenRGB moved: this script originally pointed at GitLab's releases API,
+which turned out to no longer carry any downloadable binaries at all -
+confirmed against a real run this session, GitLab's own release
+descriptions now say "downloads are now hosted on Codeberg" and the
+GitLab API's assets/links array comes back empty. OpenRGB's real
+releases now live at https://codeberg.org/OpenRGB/OpenRGB/releases -
+Codeberg runs Forgejo (a Gitea fork), whose releases API
+(GET /repos/{owner}/{repo}/releases) is standard and well-documented,
+returning each release's assets as {name, browser_download_url, ...} -
+used here instead of a hardcoded per-version filename, since OpenRGB's
+actual release asset names embed a build-specific commit hash that
+changes every release (e.g. OpenRGB_1.0rc3_Windows_64_6fbcf62.zip).
+This path is NOT yet confirmed against a real run (this project's dev
+sandbox has Codeberg blocked at the network-policy level, unrelated to
+the actual target Windows machine) - the API shape itself is standard
+Forgejo/Gitea, not a guess, but the exact asset-name filtering below
+hasn't been proven against a live response.
 
 Usage:
     python tools/setup_vendor.py
@@ -36,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-OPENRGB_RELEASES_API = "https://gitlab.com/api/v4/projects/CalcProgrammer1%2FOpenRGB/releases"
+OPENRGB_RELEASES_API = "https://codeberg.org/api/v1/repos/OpenRGB/OpenRGB/releases?limit=10"
 
 
 def _download(url: str, dest: Path):
@@ -86,25 +93,33 @@ def setup_openrgb():
         print("OpenRGB already present, skipping.")
         return
     VENDOR.mkdir(parents=True, exist_ok=True)
-    print("Looking up the latest OpenRGB release via the GitLab API ...")
-    with urllib.request.urlopen(OPENRGB_RELEASES_API, timeout=30) as resp:
-        releases = json.load(resp)
+    print("Looking up the latest OpenRGB release via the Codeberg (Forgejo) API ...")
     asset_url = None
-    for release in releases:
-        for link in release.get("assets", {}).get("links", []):
-            name = link.get("name", "")
-            lowered = name.lower()
-            if "windows" in lowered and lowered.endswith(".zip") and "debug" not in lowered:
-                asset_url = link["url"]
+    asset_name = None
+    try:
+        req = urllib.request.Request(OPENRGB_RELEASES_API, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            releases = json.load(resp)
+        for release in releases:
+            for asset in release.get("assets", []):
+                name = asset.get("name", "")
+                lowered = name.lower()
+                if "windows" in lowered and lowered.endswith(".zip") and "debug" not in lowered:
+                    asset_url = asset.get("browser_download_url")
+                    asset_name = name
+                    break
+            if asset_url:
                 break
-        if asset_url:
-            break
+    except Exception as exc:
+        print(f"Codeberg API request failed: {exc}")
     if asset_url is None:
-        print("Could not find a Windows release asset via the GitLab API - "
-              "download manually from https://gitlab.com/CalcProgrammer1/"
-              "OpenRGB/-/releases and extract it to vendor/OpenRGB/ yourself "
-              "(so that vendor/OpenRGB/OpenRGB.exe exists).")
+        print("Could not find a Windows release asset via the Codeberg API - "
+              "download manually from https://codeberg.org/OpenRGB/OpenRGB/releases "
+              "(look for a file like 'OpenRGB_<version>_Windows_64_<hash>.zip') and "
+              "extract it to vendor/OpenRGB/ yourself (so that "
+              "vendor/OpenRGB/OpenRGB.exe exists).")
         sys.exit(1)
+    print(f"Found: {asset_name}")
     zip_path = VENDOR / "_openrgb_download.zip"
     try:
         _download(asset_url, zip_path)
