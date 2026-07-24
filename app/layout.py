@@ -94,6 +94,15 @@ class Layout:
         rescan can't silently discard where the human already put this
         unit."""
         prior = current.get(fresh["id"])
+        # Confirmed by direct comparison against real F120X/F240X/F360X
+        # hardware using the split (red/blue) test: F120X's index order
+        # matches as-is, but F240X and F360X both come out shifted by
+        # exactly one corner-cluster's worth (4 LEDs) - real index 0 is
+        # what this module's geometry currently computes as index 4. This
+        # is only a first-adopt default (see the loop below) - if it
+        # turns out backwards for a given unit, the LED offset field in
+        # Setup corrects it live, no rescan needed.
+        default_led_offset = 4 if fresh.get("model") in ("F240X", "F360X") else 0
         placement_defaults = {
             "name": fresh["name"],
             "surface": "front",
@@ -102,7 +111,7 @@ class Layout:
             "rotation": 0,
             "facing": "front",
             "reversed_leds": False,
-            "led_offset": 0,
+            "led_offset": default_led_offset,
         }
         merged = dict(fresh)
         for key, default in placement_defaults.items():
