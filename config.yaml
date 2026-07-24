@@ -16,6 +16,16 @@ openrgb:
   # version 4"). Leave this unset/at auto. The hub's device data still fails
   # to parse under v4 - that's a client-library limitation to work around
   # elsewhere, not something a config value fixes.
+  #
+  # RAM RGB (SPD/SMBus access) needs OpenRGB running as Administrator on
+  # Windows or it won't detect/control the sticks - confirmed by direct
+  # user report, not something OpenRGB's non-elevated mode can do. Only
+  # applies when main.py auto-launches the bundled vendor/OpenRGB - if
+  # you run OpenRGB yourself, launch it elevated yourself instead and
+  # this setting has no effect. Triggers one UAC prompt on server
+  # startup; set to false if you don't need RAM RGB and would rather
+  # skip that prompt.
+  launch_elevated: true
 
 sensors:
   librehardwaremonitor_url: "http://127.0.0.1:8085/data.json"

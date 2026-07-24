@@ -99,14 +99,41 @@ def _launch_vendor_openrgb() -> bool:
     one the user is already running themselves. --server enables the SDK
     server per OpenRGB's own documented CLI flags; unverified whether
     --minimize-to-tray (also documented) behaves as expected across
-    versions, so it's included best-effort rather than relied on."""
+    versions, so it's included best-effort rather than relied on.
+
+    Elevated via a UAC prompt (openrgb.launch_elevated in config.yaml,
+    default on) - confirmed by direct user report that OpenRGB's RAM
+    SPD/SMBus access silently doesn't work non-elevated on Windows. This
+    elevates only the OpenRGB subprocess, not shyyctl itself - nothing
+    else this project does (liquidctl/WinUSB access) needs admin rights,
+    so the backend keeps running as a normal user."""
     exe = ROOT / "vendor" / "OpenRGB" / "OpenRGB.exe"
     if not exe.is_file():
         return False
-    log.info("Starting bundled OpenRGB (%s) with its SDK server...", exe)
+
+    elevated = CONFIG.get("openrgb", {}).get("launch_elevated", True)
+    args = "--server --minimize-to-tray"
+    log.info("Starting bundled OpenRGB (%s) with its SDK server%s...",
+            exe, " (elevated - expect a UAC prompt)" if elevated else "")
+    if elevated:
+        try:
+            import ctypes
+            # ShellExecuteW's "runas" verb elevates just this one process
+            # via the normal UAC prompt. Return value > 32 means success;
+            # <= 32 covers both real failures and the user declining the
+            # prompt - either way, fall through to report it as such.
+            result = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
+                None, "runas", str(exe), args, str(exe.parent), 1)
+            if int(result) <= 32:
+                log.warning("Elevated OpenRGB launch failed or was declined (code %s)", result)
+                return False
+        except Exception as exc:
+            log.warning("Could not launch bundled OpenRGB elevated: %s", exc)
+            return False
+        return True
+
     try:
-        subprocess.Popen([str(exe), "--server", "--minimize-to-tray"],
-                         cwd=str(exe.parent))
+        subprocess.Popen([str(exe), "--server", "--minimize-to-tray"], cwd=str(exe.parent))
     except OSError as exc:
         log.warning("Could not launch bundled OpenRGB: %s", exc)
         return False
