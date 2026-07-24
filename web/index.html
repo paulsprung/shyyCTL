@@ -175,22 +175,6 @@
       </p>
       <div class="card" id="fansList"></div>
     </section>
-
-    <section>
-      <div class="section-head"><h2>Curve</h2><div class="rule"></div>
-        <span class="note">saved only &mdash; not applied automatically yet</span></div>
-      <p class="intro">
-        Temperature/duty points, stored for when the automatic control loop lands.
-        For now, use the duty sliders above to actually change fan speed.
-      </p>
-      <div class="card">
-        <div id="curvePoints"></div>
-        <div class="row" style="margin-top:12px">
-          <button class="btn sec sm" onclick="addCurvePoint()">+ point</button>
-          <button class="btn sm" onclick="saveCurve()">Save</button>
-        </div>
-      </div>
-    </section>
   </div>
 
   <!-- ================= RGB ================= -->
@@ -287,15 +271,19 @@
       <div class="section-head"><h2>Scan</h2><div class="rule"></div>
         <span class="note" id="scanNote"></span></div>
       <p class="intro">
-        Spins each fan channel up, reads its tachometer, and reads the hub's
-        per-channel accessory ID to identify the fan model (and with it, the real
-        LED count) where possible. Also resizes the matching OpenRGB hub zones so
-        RGB control on the RGB page works right after.
+        Full/quick spin each fan channel up, read its tachometer, and read the
+        hub's per-channel accessory ID to identify the fan model (and with it,
+        the real LED count) where possible. Silent skips the fan spin-up
+        entirely - it only reads accessory IDs, so it can't confirm an
+        unrecognised channel is actually empty, just quieter and faster. All
+        three resize the matching OpenRGB hub zones and read mobo/RAM
+        afterwards, so RGB control on the RGB page works right after.
       </p>
       <div class="card">
         <div class="row">
-          <button class="btn" id="scanBtn" onclick="startScan(true)">Run full scan</button>
-          <button class="btn sec sm" onclick="startScan(false)">Quick scan, no curves</button>
+          <button class="btn" id="scanBtn" onclick="startScan('full')">Run full scan</button>
+          <button class="btn sec sm" onclick="startScan('quick')">Quick scan, no curves</button>
+          <button class="btn sec sm" onclick="startScan('rgb')">Silent scan (RGB only)</button>
           <button class="btn sec sm" onclick="cancelScan()">Cancel</button>
         </div>
         <div class="bar"><i id="scanBar" style="width:0%"></i></div>
@@ -339,7 +327,7 @@
 
 <script>
 const PAGES = ["status","fans","rgb","display","scan","settings"];
-let status_ = null, fans = null, curve = null, scanState = null, panoStatus = null, panoMedia = null;
+let status_ = null, fans = null, scanState = null, panoStatus = null, panoMedia = null;
 
 /* ---------- plumbing ---------- */
 
@@ -460,16 +448,19 @@ function renderFans(){
     const n = ch.replace("fan","");
     const rpm = (fans.readings||[]).find(r =>
       String(r.key).toLowerCase() === `fan ${n} speed`);
+    const duty = (fans.readings||[]).find(r =>
+      String(r.key).toLowerCase() === `fan ${n} duty`);
+    const dutyVal = duty ? Math.round(duty.value) : 0;
     return `<div class="fan-row">
       <div class="row" style="justify-content:space-between">
         <strong>${ch}</strong>
         <span class="note">${rpm ? rpm.value + " rpm" : "-- rpm"}</span>
       </div>
       <div class="row" style="margin-top:10px;align-items:center">
-        <input type="range" min="0" max="100" value="0" id="duty-${ch}" style="flex:1"
+        <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}" style="flex:1"
           oninput="document.getElementById('dutyval-${ch}').textContent=this.value+' %'"
           onchange="setDuty('${ch}', this.value)">
-        <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">-- %</span>
+        <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">${duty ? dutyVal+" %" : "-- %"}</span>
       </div>
     </div>`;
   }).join("");
@@ -479,34 +470,6 @@ async function setDuty(channel, value){
   try{
     await api(`/api/fans/${channel}/duty`,{method:"POST",body:JSON.stringify({duty:parseInt(value)})});
     say(`${channel} set to ${value}%.`);
-  }catch(e){ say(e.message,"error"); }
-}
-
-async function loadCurve(){
-  try{ curve = await api("/api/curve"); }catch(e){ curve = {points:[]}; }
-}
-function renderCurve(){
-  const box = document.getElementById("curvePoints");
-  box.innerHTML = (curve.points||[]).map((p,i)=>`
-    <div class="row" style="margin-bottom:6px">
-      <input type="number" value="${p[0]}" style="width:90px" placeholder="°C"
-        onchange="curve.points[${i}][0]=parseInt(this.value)">
-      <span class="note">°C →</span>
-      <input type="number" value="${p[1]}" style="width:90px" placeholder="%"
-        onchange="curve.points[${i}][1]=parseInt(this.value)">
-      <span class="note">%</span>
-      <button class="btn sec sm" onclick="curve.points.splice(${i},1);renderCurve()">remove</button>
-    </div>`).join("");
-}
-function addCurvePoint(){
-  curve.points = curve.points || [];
-  curve.points.push([50,50]);
-  renderCurve();
-}
-async function saveCurve(){
-  try{
-    await api("/api/curve",{method:"POST",body:JSON.stringify({points:curve.points})});
-    say("Curve saved.");
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -626,10 +589,12 @@ async function uploadPanoMedia(asBoot){
 
 /* ---------- scan ---------- */
 
-async function startScan(measureCurves){
+async function startScan(mode){
   try{
-    await api("/api/scan/start",{method:"POST",body:JSON.stringify({measure_curves:measureCurves})});
-    say(measureCurves ? "Scan started — about two minutes." : "Quick scan started.");
+    await api("/api/scan/start",{method:"POST",body:JSON.stringify({mode})});
+    say(mode==="full" ? "Scan started — about two minutes."
+      : mode==="rgb" ? "Silent scan started — no fans will spin."
+      : "Quick scan started.");
     pollScan();
   }catch(e){ say(e.message,"error"); }
 }
@@ -662,7 +627,9 @@ function renderScan(){
           <td>${r.leds||"--"}</td>
           <td>${r.model
             ? r.model+' <span class="tag ok">'+r.confidence+'</span>'
-            : (r.present ? '<span class="tag warn">'+r.confidence+'</span>' : '<span class="note">empty</span>')}</td>
+            : r.present === false ? '<span class="note">empty</span>'
+            : r.present === true ? '<span class="tag warn">'+r.confidence+'</span>'
+            : '<span class="note">not measured</span>'}</td>
           <td>${r.start_duty!=null?r.start_duty+" %":"--"}</td>
           <td>${r.max_rpm!=null?r.max_rpm+" rpm":"--"}</td>
           <td class="note">${(r.needs||[]).join(", ")||"--"}</td>
@@ -706,9 +673,8 @@ async function refresh(){
   try{
     status_ = await api("/api/status");
     await loadFans();
-    if(!curve) await loadCurve();
     await loadPanorama();
-    renderDevices(); renderStatus(); renderFans(); renderCurve();
+    renderDevices(); renderStatus(); renderFans();
     renderPanorama(); renderSettings();
     showPage((location.hash||"").replace("#/","")||"status");
   }catch(e){

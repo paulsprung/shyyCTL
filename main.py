@@ -82,12 +82,23 @@ async def _keepalive_loop():
     every real KANALI capture showed it pinging roughly every 2s
     continuously the whole time it ran. A failed ping here just means the
     panel is unplugged or something else (KANALI) currently has it; it's
-    not treated as fatal, the loop keeps trying."""
+    not treated as fatal, the loop keeps trying.
+
+    Holds _panorama_lock for the ping itself, not just around
+    get_panorama() - this is a single USB connection with one message in
+    flight at a time (see app/panorama.py), and this loop runs
+    continuously in the background regardless of what else is talking to
+    the panel. Without the lock, a status/media/upload request's own read
+    can consume this loop's ping reply (or vice versa), leaving the
+    request's real reply looking like it never arrived - confirmed as the
+    actual cause of /api/panorama/status intermittently coming back with
+    empty device info despite a healthy connection."""
     while True:
         try:
             panel = _panorama
             if panel is not None and panel.connected:
-                await asyncio.to_thread(panel.ping)
+                async with _panorama_lock:
+                    await asyncio.to_thread(panel.ping)
         except Exception as exc:
             log.debug("panorama keepalive ping failed: %s", exc)
         await asyncio.sleep(2)
@@ -449,9 +460,15 @@ async def set_hub_channel_color(channel: str, body: ColorRequest):
 
 # -- hardware discovery scan -------------------------------------------
 
+class ScanRequest(BaseModel):
+    mode: str = "full"  # "full" | "quick" | "rgb"
+
+
 @app.post("/api/scan/start")
-async def scan_start():
-    started = await asyncio.to_thread(scan.start)
+async def scan_start(body: ScanRequest = ScanRequest()):
+    if body.mode not in scan.MODES:
+        raise HTTPException(400, f"unknown scan mode {body.mode!r} - must be one of {scan.MODES}")
+    started = await asyncio.to_thread(scan.start, body.mode)
     if not started:
         raise HTTPException(409, "scan already running")
     return {"started": True}
@@ -475,7 +492,8 @@ async def panorama_status():
     panel = await get_panorama()
     if panel is None or not panel.connected:
         return {"connected": False}
-    info = await asyncio.to_thread(panel.handshake)
+    async with _panorama_lock:
+        info = await asyncio.to_thread(panel.handshake)
     return {"connected": True, "info": info}
 
 
@@ -484,7 +502,8 @@ async def panorama_media():
     panel = await get_panorama()
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
-    return await asyncio.to_thread(panel.list_media)
+    async with _panorama_lock:
+        return await asyncio.to_thread(panel.list_media)
 
 
 class BrightnessRequest(BaseModel):
@@ -496,7 +515,8 @@ async def panorama_brightness(body: BrightnessRequest):
     panel = await get_panorama()
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
-    ok = await asyncio.to_thread(panel.set_brightness, body.value)
+    async with _panorama_lock:
+        ok = await asyncio.to_thread(panel.set_brightness, body.value)
     return {"ok": ok}
 
 
@@ -509,15 +529,16 @@ async def _handle_media_upload(file: UploadFile, apply_as_boot: bool) -> dict:
         tmp.write(await file.read())
         tmp_path = tmp.name
     try:
-        remote_name = await asyncio.to_thread(panel.upload_media, tmp_path)
+        async with _panorama_lock:
+            remote_name = await asyncio.to_thread(panel.upload_media, tmp_path)
+            if remote_name is None:
+                raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
+            if apply_as_boot:
+                ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
+            else:
+                ok = await asyncio.to_thread(panel.set_media, remote_name)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-    if remote_name is None:
-        raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
-    if apply_as_boot:
-        ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
-    else:
-        ok = await asyncio.to_thread(panel.set_media, remote_name)
     return {"filename": remote_name, "applied": ok}
 
 

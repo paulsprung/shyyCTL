@@ -58,7 +58,23 @@ class Scan:
 
     # -- control -------------------------------------------------------
 
-    def start(self, measure_curves: bool = True) -> bool:
+    MODES = ("full", "quick", "rgb")
+
+    def start(self, mode: str = "full") -> bool:
+        """mode:
+        - "full": spins every fan up, measures start duty + max RPM, then
+          resizes/reports RGB.
+        - "quick": spins every fan up to confirm presence and read RPM,
+          skips curve measurement, then resizes/reports RGB.
+        - "rgb": never touches a single fan - reads the hub's per-channel
+          accessory IDs (no spin-up needed for that) and goes straight to
+          resizing OpenRGB hub zones + reading mobo/RAM. Silent and fast,
+          but "present" can only be inferred from whether an LED accessory
+          was detected, not confirmed via tachometer - see
+          _identify_channel_only's docstring.
+        """
+        if mode not in self.MODES:
+            raise ValueError(f"unknown scan mode {mode!r} - must be one of {self.MODES}")
         if self.running:
             return False
         self._cancel.clear()
@@ -67,7 +83,7 @@ class Scan:
         self.ram = []
         self.error = None
         self._thread = threading.Thread(
-            target=self._run, args=(measure_curves,), daemon=True, name="scan")
+            target=self._run, args=(mode,), daemon=True, name="scan")
         self._thread.start()
         return True
 
@@ -91,10 +107,10 @@ class Scan:
 
     # -- the scan ------------------------------------------------------
 
-    def _run(self, measure_curves: bool):
+    def _run(self, mode: str):
         self.running = True
         try:
-            self._scan(measure_curves)
+            self._scan(mode)
         except Exception as exc:
             log.exception("Scan failed")
             self.error = str(exc)
@@ -102,9 +118,10 @@ class Scan:
             self.running = False
             self.step = "done" if not self.error else "failed"
             self.progress = 1.0
-            self._restore()
+            if mode != "rgb":
+                self._restore()
 
-    def _scan(self, measure_curves: bool):
+    def _scan(self, mode: str):
         self.step = "Looking for the hub"
         self.progress = 0.02
         if not self.hub.connected and not self.hub.connect():
@@ -127,13 +144,22 @@ class Scan:
             log.warning("Could not read accessory IDs (falling back to manual model pick): %s", exc)
             accessory_ids = {}
 
-        total = len(fans)
-        for index, channel in enumerate(fans):
-            if self._cancel.is_set():
-                return
-            base = 0.08 + 0.62 * (index / total)
-            entry = self._probe_channel(channel, measure_curves, base, 0.62 / total, accessory_ids)
-            self.results.append(entry)
+        if mode == "rgb":
+            self.step = "Identifying channels (no fan spin-up)"
+            self.progress = 0.4
+            for channel in fans:
+                if self._cancel.is_set():
+                    return
+                self.results.append(self._identify_channel_only(channel, accessory_ids))
+        else:
+            measure_curves = mode == "full"
+            total = len(fans)
+            for index, channel in enumerate(fans):
+                if self._cancel.is_set():
+                    return
+                base = 0.08 + 0.62 * (index / total)
+                entry = self._probe_channel(channel, measure_curves, base, 0.62 / total, accessory_ids)
+                self.results.append(entry)
 
         self.step = "Sizing OpenRGB LED zones"
         self.progress = 0.72
@@ -145,6 +171,51 @@ class Scan:
 
         self.step = "Done"
         self.progress = 1.0
+
+    def _identify_channel_only(self, channel, accessory_ids) -> dict:
+        """The "rgb" scan mode's per-channel step - identical model/LED
+        identification as _probe_channel, but never calls hub.set_fan(),
+        so it never spins anything up or makes noise. The tradeoff: unlike
+        the full/quick paths, "present" here can't be confirmed by a
+        tachometer reading - it's inferred from whether the hub reports an
+        LED accessory on this channel at all. For NZXT's X-series fans
+        that's a reliable stand-in (the accessory ID literally can't exist
+        without a physical unit attached), but a channel with no LED
+        accessory is genuinely unknown here (empty, or a fan without one),
+        not confirmed empty the way a real tachometer check would be."""
+        number = channel[3:] if channel.startswith("fan") else None
+        led_channel = f"led{number}" if number else None
+        has_led = led_channel in self.hub.channels.get("led", [])
+
+        model = None
+        if has_led and led_channel in accessory_ids:
+            model = geometry.identify_by_accessory_id(accessory_ids[led_channel])
+
+        entry = {
+            "fan_channel": channel,
+            "led_channel": led_channel if has_led else None,
+            "leds": model.leds if model else None,
+            "model": model.name if model else None,
+            "present": True if has_led else None,
+            "start_duty": None,
+            "max_rpm": None,
+            "rpm_at_probe": None,
+            "confidence": "certain" if model else ("unknown" if has_led else "none"),
+            "needs": [],
+        }
+        if has_led and not model:
+            raw_id = accessory_ids.get(led_channel)
+            entry["needs"].append(
+                f"unrecognised accessory id {raw_id!r} - pick the fan model in "
+                "setup so the real count can be sent to OpenRGB" if raw_id is not None
+                else "LED count can't be auto-detected on this hub - pick the fan "
+                     "model in setup so the real count can be sent to OpenRGB")
+        elif not has_led:
+            entry["needs"].append(
+                "no LED accessory detected - run a full or quick scan to confirm "
+                "whether anything is actually connected here")
+        entry["needs"].extend(["position", "name"])
+        return entry
 
     def _probe_channel(self, channel, measure_curves, base, budget, accessory_ids) -> dict:
         number = channel[3:] if channel.startswith("fan") else None
