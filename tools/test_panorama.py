@@ -167,6 +167,31 @@ def test_set_default_image():
     print("Should be showing now on the physical panel.")
 
 
+def test_set_boot_image():
+    """Uploads an image/gif/video and sets it as the power-on screen -
+    shown before any host software connects, separate from option 9's
+    "currently active" screen. Real test of whether this actually works:
+    after this returns, fully power-cycle the PC (or unplug/replug the
+    AIO's own USB cable) and check what the panel shows with nothing
+    running - not something this script can verify on its own."""
+    raw = input("Path to the image/gif/video to upload (local file): ").strip().strip('"')
+    if not Path(raw).is_file():
+        print("File not found:", raw)
+        return
+
+    p = panel()
+    print("Encoding + uploading...")
+    remote_name = p.upload_media(raw)
+    if remote_name is None:
+        print("Upload failed - see the log line above.")
+        return
+    print(f"Uploaded as {remote_name!r}. Setting it as the boot/power-on screen...")
+    ok = p.set_boot_media(remote_name)
+    print("ok" if ok else "no response")
+    print("Now fully power-cycle the PC (or unplug/replug the AIO's USB cable) "
+          "and check what the panel shows with nothing running yet.")
+
+
 def test_keepalive_loop():
     """Uploads (if you want) or just applies the last-known media, then
     pings every 2s indefinitely (Ctrl+C to stop) - matches how often real
@@ -254,6 +279,7 @@ MENU = {
     "10": ("Raw ping byte dump (diagnostic - use if option 3 reports no response)", test_raw_ping_dump),
     "11": ("Keepalive loop - ping every 2s until Ctrl+C (tests whether this "
           "stops the image reverting)", test_keepalive_loop),
+    "12": ("Upload + set as boot/power-on screen (persists without host software)", test_set_boot_image),
 }
 
 if __name__ == "__main__":

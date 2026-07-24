@@ -346,17 +346,19 @@ def build_media_container(width: int, height: int, fps: int, h264_bytes: bytes) 
 def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDIA_HEIGHT,
                    fps: int = MEDIA_FPS, duration_s: float = 2.0,
                    ffmpeg_path: str = "ffmpeg") -> bytes | None:
-    """Encodes a local image or gif to a raw H.264 Annex-B stream matching
-    the encoder settings seen in a real captured upload (keyint=fps,
-    crf=18, baseline profile, yuv420p) - not proven to be strict
-    requirements, just what's confirmed to work. Static images are looped
-    for duration_s; gifs keep their own frame content/timing, just
-    resampled to fps. Requires ffmpeg on PATH. Returns None (logging the
-    reason) on any failure rather than raising - encoding failures are an
-    expected, recoverable case for a media-upload UI, not a bug."""
-    is_gif = Path(local_path).suffix.lower() == ".gif"
+    """Encodes a local image, gif, or video to a raw H.264 Annex-B stream
+    matching the encoder settings seen in a real captured upload
+    (keyint=fps, crf=18, baseline profile, yuv420p) - not proven to be
+    strict requirements, just what's confirmed to work. Static images are
+    looped for duration_s; gifs and video files keep their own frame
+    content/timing, just resampled to fps. Requires ffmpeg on PATH.
+    Returns None (logging the reason) on any failure rather than raising -
+    encoding failures are an expected, recoverable case for a
+    media-upload UI, not a bug."""
+    already_has_motion = Path(local_path).suffix.lower() in (
+        ".gif", ".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v")
     cmd = [ffmpeg_path, "-y"]
-    if not is_gif:
+    if not already_has_motion:
         cmd += ["-loop", "1", "-t", str(duration_s)]
     cmd += [
         "-i", local_path,
@@ -541,6 +543,21 @@ class _PanoramaBase:
         e.g. one of the built-in defaults, or a name returned by
         upload_media() below."""
         return self.set_screen_config(filename, self.last_brightness, timeout_s=timeout_s)
+
+    def set_boot_media(self, filename: str, timeout_s: float = 2.0) -> bool:
+        """Sets what shows at power-on before any host software connects -
+        the f200.f1 slot (poweron_media), independent of the currently
+        active screen (set_media() above uses f200.f3 instead). Every real
+        captured screen-config command included this as its own stable
+        field, separate from "what's showing right now" - unverified
+        whether it actually persists correctly across a real power cycle
+        with the host fully disconnected, since that's not something a
+        live USB capture can observe; worth confirming by physically
+        power-cycling the PC (or the AIO's own connector) after calling
+        this and checking what the panel shows before any software runs.
+        """
+        return self.set_screen_config(self.last_media, self.last_brightness,
+                                      poweron_media=filename, timeout_s=timeout_s)
 
     def upload_media(self, local_path: str, remote_name: str | None = None,
                      duration_s: float = 2.0, timeout_s: float = 15.0) -> str | None:
