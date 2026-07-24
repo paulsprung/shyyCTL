@@ -221,12 +221,24 @@ class OpenRgbBridge:
         a plain cached attribute that openrgb-python only repopulates on
         an explicit update() call (see class docstring) - just re-reading
         it in a loop returns the exact same frozen list forever.
-        reconnect() is the one call already proven in this codebase to
-        force a genuinely fresh read (OpenRGBClient.__init__ calls
-        update() itself - see resize_zone's docstring for the same
-        reasoning applied to the hub), so each retry here fully
-        reconnects rather than hoping a cached client's list has grown on
-        its own."""
+
+        REVERTED a first attempt at this that called self.reconnect()
+        between polls: this method runs on essentially every call to
+        motherboard()/ram(), and the RGB tab hits both on every visit, so
+        that meant tearing down and rebuilding the *entire* SDK connection
+        (fresh TCP handshake, protocol renegotiation, full device
+        re-enumeration) at least once per page load, sometimes twice
+        back-to-back on concurrent requests. That's exactly the "hammering
+        the connection" pattern this class's own docstring already
+        documents as triggering real OpenRGB server-side instability
+        (garbage LED counts, doubled zone lists) - confirmed as a real
+        regression, not a hypothetical one, by a direct user report that
+        this broke previously-working RAM/mobo detection outright.
+        self.client.update() is the actually-lightweight equivalent: it
+        re-asks the *same* connection for the current device count/data
+        (this is exactly what _devices()'s own already-safe retry uses
+        for the empty/None case), with no socket teardown and no new SDK
+        client entry created in OpenRGB's own client list each time."""
         best: list = []
         for attempt in range(retries):
             current = [d for d in self._devices() if d.type == device_type]
@@ -234,10 +246,13 @@ class OpenRgbBridge:
                 break
             best = current
             if attempt < retries - 1:
-                log.debug("%d device(s) of type %s so far, reconnecting to check for more",
+                log.debug("%d device(s) of type %s so far, re-querying to check for more",
                            len(best), device_type)
                 time.sleep(delay)
-                self.reconnect()
+                try:
+                    self.client.update()
+                except Exception as exc:
+                    log.warning("OpenRGB update() failed while settling: %s", exc)
         return best
 
     def motherboard(self) -> list:
