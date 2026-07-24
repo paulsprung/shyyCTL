@@ -343,18 +343,29 @@ def build_media_container(width: int, height: int, fps: int, h264_bytes: bytes) 
     return struct.pack("<I", len(header)) + header + h264_bytes
 
 
+def resolve_ffmpeg_path() -> str:
+    """vendor/ffmpeg.exe (see tools/setup_vendor.py) if it's been downloaded,
+    else just 'ffmpeg' to fall back on PATH - resolved at call time, not
+    import time, since the vendor file may not exist yet when this module
+    is first imported but does by the time media is actually uploaded."""
+    vendored = Path(__file__).resolve().parent.parent / "vendor" / "ffmpeg.exe"
+    return str(vendored) if vendored.is_file() else "ffmpeg"
+
+
 def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDIA_HEIGHT,
                    fps: int = MEDIA_FPS, duration_s: float = 2.0,
-                   ffmpeg_path: str = "ffmpeg") -> bytes | None:
+                   ffmpeg_path: str | None = None) -> bytes | None:
     """Encodes a local image, gif, or video to a raw H.264 Annex-B stream
     matching the encoder settings seen in a real captured upload
     (keyint=fps, crf=18, baseline profile, yuv420p) - not proven to be
     strict requirements, just what's confirmed to work. Static images are
     looped for duration_s; gifs and video files keep their own frame
-    content/timing, just resampled to fps. Requires ffmpeg on PATH.
-    Returns None (logging the reason) on any failure rather than raising -
-    encoding failures are an expected, recoverable case for a
-    media-upload UI, not a bug."""
+    content/timing, just resampled to fps. Uses vendor/ffmpeg.exe if
+    present (see resolve_ffmpeg_path()), else PATH. Returns None (logging
+    the reason) on any failure rather than raising - encoding failures are
+    an expected, recoverable case for a media-upload UI, not a bug."""
+    if ffmpeg_path is None:
+        ffmpeg_path = resolve_ffmpeg_path()
     already_has_motion = Path(local_path).suffix.lower() in (
         ".gif", ".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v")
     cmd = [ffmpeg_path, "-y"]
@@ -372,7 +383,8 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=60)
     except FileNotFoundError:
-        log.error("ffmpeg not found on PATH")
+        log.error("ffmpeg not found (checked vendor/ffmpeg.exe and PATH) - "
+                  "run tools/setup_vendor.py or install ffmpeg manually")
         return None
     except subprocess.TimeoutExpired:
         log.error("ffmpeg timed out encoding %s", local_path)

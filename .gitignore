@@ -5,3 +5,5 @@ layout.json
 pwm.json
 effect.json
 settings.json
+vendor/
+curve.json

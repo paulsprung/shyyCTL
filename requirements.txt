@@ -1,0 +1,12 @@
+# Confirmed working versions/combinations against real hardware this
+# project targets - see app/*.py docstrings for the specific caveats
+# (openrgb-python's protocol-4 cap, liquidctl's LED-count bug on 360mm
+# units, etc).
+fastapi
+uvicorn[standard]
+pyyaml
+python-multipart
+liquidctl
+openrgb-python
+pyusb
+libusb-package
