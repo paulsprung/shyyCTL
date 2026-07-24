@@ -156,9 +156,17 @@ async def lifespan(app: FastAPI):
     if not await asyncio.to_thread(openrgb.connect):
         log.warning("OpenRGB not connected: %s", openrgb.last_error)
         if _launch_vendor_openrgb():
-            await asyncio.sleep(3)  # let its SDK server come up
-            if not await asyncio.to_thread(openrgb.connect):
-                log.warning("Still not connected after starting bundled OpenRGB: %s",
+            # A single fixed short wait wasn't enough against real hardware:
+            # OpenRGB's own device scan (SMBus/PawnIO/RAM enumeration) was
+            # still visibly running in its console output well past 3s,
+            # long before its SDK server was ready to accept connections.
+            # Poll for up to ~20s instead of one fixed-delay retry.
+            for _ in range(10):
+                await asyncio.sleep(2)
+                if await asyncio.to_thread(openrgb.connect):
+                    break
+            else:
+                log.warning("Still not connected after starting bundled OpenRGB (waited ~20s): %s",
                            openrgb.last_error)
     await get_panorama()
     _keepalive_task = asyncio.create_task(_keepalive_loop())
