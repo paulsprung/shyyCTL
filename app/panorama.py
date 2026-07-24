@@ -602,21 +602,41 @@ class _PanoramaBase:
             return None
         container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264)
         session_id = random.randint(1, 999_999)
+        # The two real uploads this protocol was confirmed against (see the
+        # section docstring above) were almost certainly small looped-still
+        # images - a 2s loop of one frame compresses to roughly 20KB at
+        # these encoder settings, confirmed by direct measurement, versus
+        # ~240KB for just 3 real seconds of actual motion at the same
+        # resolution. Neither the container header format nor any message-
+        # size limit has been confirmed against a real *video* upload, so
+        # log the real size and every ack's decoded content here - if a
+        # genuine video plays back as a static frame on the panel despite
+        # every ack below coming back fine, this is the evidence needed to
+        # tell "the device silently truncated a too-large transfer" apart
+        # from "the container header needs a field we don't know about yet".
+        log.info("upload_media: %s, container=%d bytes (h264=%d bytes)",
+                 remote_name, len(container), len(h264))
 
         self._write(build_media_announce_frame(session_id, remote_name, len(container)))
-        if self.read_message(timeout_s=timeout_s) is None:
+        ack = self.read_message(timeout_s=timeout_s)
+        if ack is None:
             log.warning("upload_media: no response to announce frame")
             return None
+        log.info("upload_media: announce ack = %r", ack)
 
         self._write(build_media_data_frame(session_id, container))
-        if self.read_message(timeout_s=timeout_s) is None:
+        ack = self.read_message(timeout_s=timeout_s)
+        if ack is None:
             log.warning("upload_media: no response to data frame")
             return None
+        log.info("upload_media: data ack = %r", ack)
 
         self._write(build_media_finalize_frame(session_id))
-        if self.read_message(timeout_s=timeout_s) is None:
+        ack = self.read_message(timeout_s=timeout_s)
+        if ack is None:
             log.warning("upload_media: no response to finalize frame")
             return None
+        log.info("upload_media: finalize ack = %r", ack)
 
         return remote_name
 
