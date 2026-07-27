@@ -1229,7 +1229,12 @@ class Media:
             log.error("adb timed out: %s", " ".join(args))
             return None
         if result.returncode != 0:
+            # Same fix as hub.py's Hub._run(): a non-zero exit used to
+            # still return stdout, so a caller checking "is None" for
+            # failure (push()/delete() below) could never actually catch
+            # a real adb error.
             log.warning("adb failed (%s): %s", " ".join(args), result.stderr.strip())
+            return None
         return result.stdout
 
     def is_connected(self) -> bool:

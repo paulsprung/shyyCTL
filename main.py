@@ -32,6 +32,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.conflicts import running_conflicts
 from app.hub import Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
@@ -305,6 +306,15 @@ async def status():
         "openrgb": {"connected": openrgb.connected, "error": openrgb.last_error},
         "panorama": {"connected": panel is not None and panel.connected},
     }
+
+
+@app.get("/api/conflicts")
+async def conflicts():
+    """Other RGB/fan-controlling software running right now (see
+    app/conflicts.py) - polled far less often than /api/status since
+    listing every running process isn't free and this doesn't change
+    on any interesting timescale shorter than that."""
+    return {"running": await asyncio.to_thread(running_conflicts)}
 
 
 @app.post("/api/reconnect")

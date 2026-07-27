@@ -147,8 +147,24 @@ class Scan:
                 "supported by this liquidctl build, or CAM/CAM Service still "
                 "holds it open.")
 
+        # Motherboard/RAM (OpenRGB's own separate devices, not the hub) go
+        # first now, before any fan gets spun up - this doesn't depend on
+        # anything the per-channel probing below produces, and checking it
+        # first means a broken OpenRGB/PawnIO setup (see skip_rgb_devices'
+        # docstring) fails fast in a few seconds instead of only being
+        # discovered after ~2 minutes of fan probing already ran.
+        if self._skip_rgb_devices:
+            self.step = "Skipped motherboard/RAM check"
+            self.progress = 0.05
+        else:
+            self.step = "Checking motherboard and RAM lighting"
+            self.progress = 0.05
+            self._scan_openrgb()
+        if self._cancel.is_set():
+            return
+
         self.step = f"Reading channel list ({len(fans)} fan, {len(leds)} led)"
-        self.progress = 0.06
+        self.progress = 0.1
 
         try:
             accessory_ids = self.hub.accessory_ids()
@@ -169,21 +185,20 @@ class Scan:
             for index, channel in enumerate(fans):
                 if self._cancel.is_set():
                     return
-                base = 0.08 + 0.62 * (index / total)
-                entry = self._probe_channel(channel, measure_curves, base, 0.62 / total, accessory_ids)
-                self.results.append(entry)
+                base = 0.12 + 0.6 * (index / total)
+                entry = self._probe_channel(channel, measure_curves, base, 0.6 / total, accessory_ids)
+                # A channel that never answered a tachometer probe (no rpm
+                # at all - see _probe_channel's "nothing responded" path)
+                # is not confirmed to have anything attached, LED accessory
+                # or not - excluded entirely rather than carried forward as
+                # an "empty" entry, so Setup/RGB never get a fan unit for a
+                # channel nothing ever confirmed responds to speed control.
+                if entry["present"]:
+                    self.results.append(entry)
 
         self.step = "Sizing OpenRGB LED zones"
-        self.progress = 0.72
+        self.progress = 0.75
         self._resize_hub_zones()
-
-        if self._skip_rgb_devices:
-            self.step = "Skipped motherboard/RAM check"
-            self.progress = 0.75
-        else:
-            self.step = "Checking motherboard and RAM lighting"
-            self.progress = 0.75
-            self._scan_openrgb()
 
         self.step = "Done"
         self.progress = 1.0

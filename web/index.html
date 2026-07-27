@@ -143,6 +143,12 @@
     padding:12px 14px;display:none;z-index:20}
   #log[data-kind="error"]{background:var(--warn);color:#fff}
 
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;
+    display:flex;align-items:center;justify-content:center;padding:20px}
+  .modal-box{background:var(--panel);border:1px solid var(--warn);max-width:480px;
+    width:100%;padding:22px;box-shadow:0 12px 40px rgba(0,0,0,.4)}
+  .modal-box ul{font-family:var(--mono);font-size:13px;color:var(--ink);line-height:1.9}
+
   pre.dump{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;
     margin:0;max-height:320px;overflow:auto}
 
@@ -365,12 +371,16 @@
       <div class="section-head"><h2>Scan</h2><div class="rule"></div>
         <span class="note" id="scanNote"></span></div>
       <p class="intro">
-        Full/quick spin each fan channel up, read its tachometer, and read the
-        hub's per-channel accessory ID to identify the fan model (and with it,
-        the real LED count) where possible. Silent skips the fan spin-up
-        entirely - it only reads accessory IDs, so it can't confirm an
-        unrecognised channel is actually empty, just quieter and faster. All
-        three resize the matching OpenRGB hub zones and read mobo/RAM
+        Checks motherboard/RAM lighting first (before touching any fan, so a
+        broken OpenRGB setup fails fast rather than after two minutes of
+        spinning fans - see the skip option below). Full/quick then spin
+        each fan channel up, read its tachometer, and read the hub's
+        per-channel accessory ID to identify the fan model (and with it, the
+        real LED count) where possible - a channel that never answers a
+        tachometer probe at all is left out of the results entirely, not
+        listed as empty. Silent skips the fan spin-up entirely - it only
+        reads accessory IDs, so it can't confirm anything via speed, just
+        quieter and faster. All three resize the matching OpenRGB hub zones
         afterwards, so RGB control on the RGB page works right after.
       </p>
       <div class="card">
@@ -462,6 +472,25 @@
   </div>
 
   </main>
+</div>
+
+<div id="conflictModal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="card-title" style="color:var(--warn)">Other lighting/fan software running</div>
+    <p class="note" style="line-height:1.6;margin:10px 0">
+      shyyctl and another controller can't both hold the same hardware at
+      once - whichever one grabbed a device last usually wins, and the
+      other's changes silently don't apply. Detected:
+    </p>
+    <ul id="conflictList" style="margin:0 0 14px 20px;padding:0"></ul>
+    <p class="note" style="line-height:1.6;margin:0 0 14px">
+      Close the program(s) above before controlling anything from shyyctl,
+      or expect the two to intermittently fight over fans/RGB.
+    </p>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn sec sm" onclick="dismissConflictModal()">Dismiss</button>
+    </div>
+  </div>
 </div>
 
 <div id="log"></div>
@@ -1498,6 +1527,7 @@ async function refresh(){
   loadHubModes();
   pollEffectStatus();
   loadRgbDump();
+  checkConflicts();
 })();
 
 setInterval(async ()=>{
@@ -1508,6 +1538,35 @@ setInterval(async ()=>{
     if(document.getElementById("page-fans").classList.contains("active")) renderFans();
   }catch(e){}
 }, 3000);
+
+/* ---------- other controller detection ----------
+   Polled far less often than /api/status - listing every running
+   process isn't free, and this doesn't need to be near-real-time. The
+   popup only re-appears if the *set* of detected software changes after
+   a dismissal (e.g. CAM was closed and iCUE got opened instead) - not
+   every 30s for the same thing the user already acknowledged. */
+let dismissedConflictKey = null;
+
+async function checkConflicts(){
+  try{
+    const r = await api("/api/conflicts");
+    const running = r.running || [];
+    const key = running.slice().sort().join("|");
+    if(running.length && key !== dismissedConflictKey){
+      document.getElementById("conflictList").innerHTML =
+        running.map(name=>`<li>${name}</li>`).join("");
+      document.getElementById("conflictModal").style.display = "flex";
+    }
+  }catch(e){}
+}
+
+function dismissConflictModal(){
+  const items = Array.from(document.querySelectorAll("#conflictList li")).map(li=>li.textContent);
+  dismissedConflictKey = items.slice().sort().join("|");
+  document.getElementById("conflictModal").style.display = "none";
+}
+
+setInterval(checkConflicts, 30000);
 </script>
 </body>
 </html>
