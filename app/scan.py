@@ -181,7 +181,21 @@ class Scan:
             for channel in fans:
                 if self._cancel.is_set():
                     return
-                self.results.append(self._identify_channel_only(channel, accessory_ids))
+                entry = self._identify_channel_only(channel, accessory_ids)
+                # No LED accessory detected at all (not even an
+                # unrecognised one) - this mode never spins a fan, so an
+                # accessory ID is the only confirmation signal it has, and
+                # there isn't one. Excluded entirely rather than shown as
+                # a dashes-and-"not measured" row, same reasoning as the
+                # full/quick path's speed-based exclusion below, and
+                # recorded in self.absent so the Fans page hides it too.
+                # A channel WITH an accessory ID but an unrecognised model
+                # still shows - there's a real, confirmed accessory there,
+                # it just needs a manual model pick in Setup.
+                if entry["led_channel"] is not None:
+                    self.results.append(entry)
+                else:
+                    self.absent.append(channel)
         else:
             measure_curves = mode == "full"
             total = len(fans)
