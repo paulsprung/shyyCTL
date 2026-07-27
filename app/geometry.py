@@ -8,16 +8,21 @@ The published/assumed LED counts were meant to decompose exactly:
     F120X   16 = 8 + 8            two end caps, no straight section
     F240X   24 = 16 caps + 8      one fan gap  -> 4 LEDs per side, confirmed
                                                    against real hardware
-    F360X   36 = 16 caps + 20     two fan gaps -> 5 LEDs per side, INFERRED
+    F360X   32 = 16 caps + 16     two fan gaps -> 4 LEDs per side, confirmed
+                                                   against real hardware
 
-F360X's real LED count is 36, confirmed against real hardware this project
-targets - not the 32 a uniform "4 per side per gap" rule would predict (that
-rule is only confirmed for F240X). The 5-per-side value above is derived
-just to make F360X's total reconcile with 8 LEDs/cap; it has NOT been walked
-on real F360X hardware, so its exact per-LED positions are a best-effort
-placeholder, not confirmed fact. Run the setup screen's LED walk on a real
-F360X unit before trusting `led_positions()` for anything beyond an
-approximate preview on that model.
+REVISED this session: F360X was previously modelled as 36 LEDs (5 per side
+per gap), on the strength of an earlier real-hardware check. A later,
+more direct comparison - running the split (red/blue) and chase LED-order
+tests side by side against the real unit - measured 4 LEDs per seam
+cluster, not 5, matching F240X's density exactly and making the uniform
+"4 per side per gap" rule (previously confirmed only for F240X) hold for
+F360X too. 32 is the newly-confirmed total; the earlier 36 is believed to
+have come from trusting NZXT's advertised spec for this fan combo rather
+than an independent per-LED count. This matters beyond the preview shape:
+this total also sizes the real OpenRGB zone during a scan, so if the true
+count turns out to be neither, hub RGB control on the real strip will be
+wrong until MODELS below is corrected again.
 
 Because the per-gap density isn't the same across models, LED count no
 longer safely inverts to a fan count for an arbitrary total (see
@@ -31,7 +36,7 @@ against real hardware this session:
 
     0x20 (32)  ->  F120X  (1 fan,  16 LEDs)
     0x22 (34)  ->  F240X  (2 fans, 24 LEDs)
-    0x24 (36)  ->  F360X  (3 fans, 36 LEDs)
+    0x24 (36)  ->  F360X  (3 fans, 32 LEDs)
 
 Sequential IDs, +2 per additional fan in the frame - looks like NZXT's own
 internal model numbering, not something coincidental. This makes automatic
@@ -70,7 +75,7 @@ class Model:
 MODELS = (
     Model("F120X", 1, 16, 120, False, accessory_id=0x20),
     Model("F240X", 2, 24, 240, True, accessory_id=0x22),
-    Model("F360X", 3, 36, 360, True, geometry_walked=False, accessory_id=0x24),
+    Model("F360X", 3, 32, 360, True, accessory_id=0x24),
 )
 
 BY_LEDS = {m.leds: m for m in MODELS}
@@ -79,8 +84,9 @@ BY_ACCESSORY_ID = {m.accessory_id: m for m in MODELS if m.accessory_id is not No
 
 def _side_leds_per_gap(model: Model) -> int:
     """LEDs per straight side per fan-gap, derived from the model's
-    confirmed total rather than a single global constant - F240X and F360X
-    do not share the same per-gap density (4 vs an inferred 5)."""
+    confirmed total rather than a hardcoded constant - F240X and F360X
+    both come out to 4 per gap per side once F360X's real total (32, not
+    the earlier assumed 36) is used."""
     gaps = model.fans - 1
     if gaps == 0:
         return 0
@@ -92,7 +98,7 @@ def _side_leds_per_gap(model: Model) -> int:
 def fans_from_leds(leds: int) -> int | None:
     """Exact-match only: with per-model density no longer uniform, a bare
     LED count can't be safely inverted to a fan count for anything that
-    isn't one of the known totals (16/24/36)."""
+    isn't one of the known totals (16/24/32)."""
     model = BY_LEDS.get(leds)
     return model.fans if model else None
 
@@ -144,7 +150,7 @@ def led_positions(model: Model, radius: float = 1.0,
     evenly - this changes *where* a given index renders, not how many
     LEDs exist or their traversal order, so it doesn't touch any
     confirmed LED count (F120X/F240X/F360X are unaffected: still
-    16/24/36) and rotate()/reversed_leds keep working unchanged.
+    16/24/32) and rotate()/reversed_leds keep working unchanged.
 
     `radius` is the fan radius. A 120 mm fan is 120 mm across, so in
     millimetres radius = 60.

@@ -343,7 +343,13 @@ async def list_fans():
     if not hub.connected:
         raise HTTPException(503, "hub not connected")
     readings = await asyncio.to_thread(hub.status)
-    return {"channels": hub.channels.get("fan", []), "readings": readings}
+    # A channel a full/quick scan actually confirmed nothing responds to
+    # (scan.absent - see scan.py's _scan()) is left out here entirely,
+    # not just hidden from Setup - there's no point offering a duty
+    # slider for a header confirmed empty. A channel never scanned at
+    # all still shows, since nothing's confirmed either way for it yet.
+    channels = [c for c in hub.channels.get("fan", []) if c not in scan.absent]
+    return {"channels": channels, "readings": readings}
 
 
 class DutyRequest(BaseModel):

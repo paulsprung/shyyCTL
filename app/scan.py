@@ -52,6 +52,7 @@ class Scan:
         self.results: list[dict] = []
         self.mobo: dict | None = None
         self.ram: list[dict] = []
+        self.absent: list[str] = []
         self.error: str | None = None
         self._thread = None
         self._cancel = threading.Event()
@@ -92,6 +93,7 @@ class Scan:
         self.results = []
         self.mobo = None
         self.ram = []
+        self.absent = []
         self.error = None
         self._skip_rgb_devices = skip_rgb_devices
         self._thread = threading.Thread(
@@ -110,6 +112,7 @@ class Scan:
             "results": self.results,
             "mobo": self.mobo,
             "ram": self.ram,
+            "absent": self.absent,
             "error": self.error,
         }
 
@@ -193,8 +196,14 @@ class Scan:
                 # or not - excluded entirely rather than carried forward as
                 # an "empty" entry, so Setup/RGB never get a fan unit for a
                 # channel nothing ever confirmed responds to speed control.
+                # Recorded in self.absent instead, purely so the Fans page
+                # can hide a duty slider for something confirmed not there
+                # (rather than every unscanned channel losing its slider,
+                # which would be wrong for a channel nobody's checked yet).
                 if entry["present"]:
                     self.results.append(entry)
+                else:
+                    self.absent.append(channel)
 
         self.step = "Sizing OpenRGB LED zones"
         self.progress = 0.75

@@ -95,14 +95,18 @@ class Layout:
         unit."""
         prior = current.get(fresh["id"])
         # Confirmed by direct comparison against real F120X/F240X/F360X
-        # hardware using the split (red/blue) test: F120X's index order
-        # matches as-is, but F240X and F360X both come out shifted by
-        # exactly one corner-cluster's worth (4 LEDs) - real index 0 is
-        # what this module's geometry currently computes as index 4. This
-        # is only a first-adopt default (see the loop below) - if it
-        # turns out backwards for a given unit, the LED offset field in
-        # Setup corrects it live, no rescan needed.
-        default_led_offset = 4 if fresh.get("model") in ("F240X", "F360X") else 0
+        # hardware using the split (red/blue) and chase tests: F120X's
+        # index order matches as-is; F240X needs -4 and F360X needs -3 to
+        # line up (an *earlier* pass through this same comparison found
+        # +4 for both - these replace that, measured after F360X's real
+        # per-seam LED count also turned out to be 4 rather than the
+        # previously assumed 5, see geometry.py's module docstring; -3 on
+        # the new 32-LED/4-per-seam shape hasn't been independently
+        # re-confirmed since that geometry change, only carried over from
+        # what worked against the old 36-LED shape). Only a first-adopt
+        # default (see the loop below) - if it's off for a given unit, the
+        # LED offset field in Setup corrects it live, no rescan needed.
+        default_led_offset = {"F240X": -4, "F360X": -3}.get(fresh.get("model"), 0)
         placement_defaults = {
             "name": fresh["name"],
             "surface": "front",
