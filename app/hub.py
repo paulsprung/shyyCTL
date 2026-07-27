@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 
 log = logging.getLogger("hub")
 
@@ -95,7 +96,16 @@ class Hub:
         return duty
 
     def status(self) -> list[dict]:
-        out = self._run("status", "--verbose", match=self.match)
+        """Confirmed against a real run: liquidctl's own control_hub driver
+        can fail outright with "missing messages (attempts=12, missing=1)"
+        - a single dropped HID reply that its own 12-attempt internal read
+        never recovers from - and this was happening on essentially every
+        poll, not as an occasional blip. A fresh subprocess re-opens the
+        HID handle from scratch each time, which is a much bigger reset
+        than anything liquidctl retries internally, so a couple of retries
+        here (not just liquidctl's own) are worth it before actually
+        reporting no readings."""
+        out = self._run("status", "--verbose", match=self.match, retries=3, retry_delay=0.3)
         return self._parse_status(out) if out is not None else []
 
     def rpm(self, channel: str) -> int | None:
@@ -156,25 +166,45 @@ class Hub:
 
     # -- internals -----------------------------------------------------
 
-    def _run(self, *args: str, match: str | None = None) -> str | None:
+    def _run(self, *args: str, match: str | None = None,
+             retries: int = 1, retry_delay: float = 0.3) -> str | None:
+        """retries>1 re-runs the whole subprocess (not just something
+        internal to liquidctl) on a non-zero exit - a fresh process
+        re-opens the HID handle from scratch, a bigger reset than
+        anything liquidctl retries on its own. Only status() asks for
+        more than the default 1 (see its docstring for why); every other
+        caller keeps the original one-shot behaviour.
+
+        Returns None on a non-zero exit (after exhausting retries), not
+        just on FileNotFoundError/TimeoutExpired - every caller already
+        treats None as "this failed" (set_fan/set_color raise HubError,
+        connect() reports last_error), so silently returning a failed
+        command's stdout instead of None meant those checks could never
+        actually catch a real liquidctl error, only a missing binary or a
+        hang."""
         cmd = ["liquidctl"] + (["-m", match] if match else []) + list(args)
-        try:
-            # encoding="utf-8" explicitly, not just text=True: the child is
-            # forced to write utf-8 via PYTHONIOENCODING below, but without
-            # this the parent decodes its stdout using the platform default
-            # (cp1252 on Windows) and mangles every box-drawing character,
-            # which then breaks every downstream regex silently.
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                                     errors="replace", timeout=30, env=_ENV)
-        except FileNotFoundError:
-            log.error("liquidctl not found on PATH")
-            return None
-        except subprocess.TimeoutExpired:
-            log.error("liquidctl timed out: %s", " ".join(cmd))
-            return None
-        if result.returncode != 0:
+        for attempt in range(retries):
+            try:
+                # encoding="utf-8" explicitly, not just text=True: the child
+                # is forced to write utf-8 via PYTHONIOENCODING below, but
+                # without this the parent decodes its stdout using the
+                # platform default (cp1252 on Windows) and mangles every
+                # box-drawing character, which then breaks every
+                # downstream regex silently.
+                result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                         errors="replace", timeout=30, env=_ENV)
+            except FileNotFoundError:
+                log.error("liquidctl not found on PATH")
+                return None
+            except subprocess.TimeoutExpired:
+                log.error("liquidctl timed out: %s", " ".join(cmd))
+                return None
+            if result.returncode == 0:
+                return result.stdout
             log.warning("liquidctl failed (%s): %s", " ".join(cmd), result.stderr.strip())
-        return result.stdout
+            if attempt < retries - 1:
+                time.sleep(retry_delay)
+        return None
 
     @staticmethod
     def _parse_description(listing: str, match: str) -> str | None:
