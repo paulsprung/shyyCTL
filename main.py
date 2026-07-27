@@ -1029,13 +1029,23 @@ async def start_position_effect(body: PositionEffectRequest):
     if body.palette not in PALETTES:
         raise HTTPException(400, f"unknown palette {body.palette!r} - must be one of {PALETTES}")
     rgb_colors = [_hex_to_rgb(c) for c in body.colors] or [(255, 255, 255)]
+    period_s = max(body.period_s, 0.5)
     await _stop_effect()
     _effect_stop.clear()
-    _effect_status = {"running": True, "kind": "position", "direction": body.direction,
-                       "palette": body.palette, "error": None}
+    # started_at (wall-clock, not the loop's own time.monotonic() reference)
+    # is what lets the browser reconstruct the *same* phase the backend is
+    # currently showing - see startSyncedPreview() in the frontend - so the
+    # Advanced canvas can display the effect continuously, kept in step
+    # with the real hardware, rather than only during an explicit local
+    # Preview that drifts out of phase with whatever's actually running.
+    _effect_status = {
+        "running": True, "kind": "position", "direction": body.direction,
+        "palette": body.palette, "colors": body.colors, "period_s": period_s,
+        "moving": body.moving, "started_at": time.time(), "error": None,
+    }
     _effect_task = asyncio.create_task(
         asyncio.to_thread(_run_position_effect, body.direction, body.palette,
-                          rgb_colors, max(body.period_s, 0.5), body.moving))
+                          rgb_colors, period_s, body.moving))
     return {"ok": True}
 
 

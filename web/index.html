@@ -1100,6 +1100,7 @@ function effectBounds(leds){
 }
 
 function previewPositionEffect(){
+  manualPreviewActive = true;
   stopPreview();
   if(!layoutData) return;
   const leds = layoutData.leds.filter(l=>{
@@ -1124,7 +1125,45 @@ function previewPositionEffect(){
   }
   previewRaf = requestAnimationFrame(frame);
   const note = document.getElementById("effectStatusNote");
-  if(note) note.textContent = "previewing - not applied to hardware yet";
+  if(note) note.textContent = "previewing these settings locally - not applied yet";
+}
+
+/* Whenever the backend reports a position effect running, the canvas
+   shows it continuously, kept in step with the real hardware - not just
+   during an explicit Preview click. started_at is a wall-clock
+   timestamp (not the backend loop's own time.monotonic() reference, see
+   main.py's start_position_effect) so elapsed-time-since-start, and
+   therefore phase, comes out the same on both sides regardless of when
+   this tab loaded or last polled. manualPreviewActive is the only thing
+   that suppresses this - an explicit Preview click means "let me try
+   different settings before applying", and should show what's being
+   tried, not what's still running from before. */
+let manualPreviewActive = false;
+
+function startSyncedPreview(status){
+  if(!layoutData) return;
+  stopPreview();
+  const {direction, palette, colors: colorsHex, period_s, moving, started_at} = status;
+  const leds = layoutData.leds.filter(l=>{
+    const u = layoutData.units.find(x=>x.id===l.unit);
+    return u && u.kind !== "display";
+  });
+  if(!leds.length) return;
+  const colors = palette === "rainbow" ? [] : (colorsHex || []).map(hexToRgb);
+  const cyclic = moving || palette === "rainbow";
+  const bounds = effectBounds(leds);
+  function frame(){
+    const elapsed = (Date.now() / 1000) - started_at;
+    const phase = moving ? (((elapsed / period_s) % 1) + 1) % 1 : 0;
+    for(const l of leds){
+      const pos = positionValue(direction, l, bounds);
+      const [r,g,b] = samplePalette(palette, colors, pos - phase, cyclic);
+      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
+      if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
+    }
+    previewRaf = requestAnimationFrame(frame);
+  }
+  previewRaf = requestAnimationFrame(frame);
 }
 
 function stopPreview(){
@@ -1132,6 +1171,7 @@ function stopPreview(){
 }
 
 async function applyPositionEffect(){
+  manualPreviewActive = false;
   stopPreview();
   try{
     await api("/api/rgb/effects/position/start",{method:"POST",body:JSON.stringify({
@@ -1146,6 +1186,7 @@ async function applyPositionEffect(){
   }catch(e){ say(e.message,"error"); }
 }
 async function stopEffect(){
+  manualPreviewActive = false;
   stopPreview();
   try{ await api("/api/rgb/effects/stop",{method:"POST"}); say("Effect stopped."); }
   catch(e){ say(e.message,"error"); }
@@ -1155,11 +1196,11 @@ async function pollEffectStatus(){
   try{
     const s = await api("/api/rgb/effects/status");
     const note = document.getElementById("effectStatusNote");
-    if(note && previewRaf === null){
-      note.textContent = s.running ? "running on the PC" : (s.error ? "stopped - " + s.error : "");
-    }
-    if(s.running) setTimeout(pollEffectStatus, 2000);
-  }catch(e){}
+    if(note) note.textContent = s.running ? "running on the PC" : (s.error ? "stopped - " + s.error : "");
+    if(s.running && s.kind === "position" && !manualPreviewActive) startSyncedPreview(s);
+    else if(!s.running && !manualPreviewActive) stopPreview();
+    setTimeout(pollEffectStatus, s.running ? 2000 : 5000);
+  }catch(e){ setTimeout(pollEffectStatus, 5000); }
 }
 
 async function loadHubModes(){
