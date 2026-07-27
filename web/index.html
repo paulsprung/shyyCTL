@@ -273,22 +273,54 @@
     </section>
 
     <section>
-      <div class="section-head"><h2>Layout animation</h2><div class="rule"></div>
-        <span class="note" id="waveStatusNote"></span></div>
+      <div class="section-head"><h2>Effect</h2><div class="rule"></div>
+        <span class="note" id="effectStatusNote"></span></div>
       <div class="card">
         <p class="note" style="line-height:1.6;margin:0 0 10px">
-          A wave that runs across every placed fan channel using each LED's
-          real position from Setup, top to bottom - not a flat per-channel
-          colour cycle. Preview plays right here in the layout above without
-          touching the hardware; Apply starts the real thing.
+          Every effect is driven by each LED's real position from Setup -
+          not a flat per-channel colour cycle. Preview plays right here in
+          the layout above without touching the hardware; Apply starts the
+          real thing on every fan channel, RAM stick and the motherboard
+          that's actually been placed. Starting one stops whatever was
+          running before it automatically.
         </p>
-        <div class="row">
-          <input type="color" id="waveColorA" value="#4c79ff">
-          <input type="color" id="waveColorB" value="#ff7a30">
-          <label class="inline">period <input type="number" id="wavePeriod" value="4" min="0.5"
+
+        <div class="prop"><label>Direction</label>
+          <div class="seg" id="effectDirSeg">
+            <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
+            <button data-v="bottom_to_top">Bottom&uarr;Top</button>
+            <button data-v="left_to_right">Left&rarr;Right</button>
+            <button data-v="right_to_left">Right&larr;Left</button>
+            <button data-v="outward">In&rarr;Out</button>
+            <button data-v="inward">Out&rarr;In</button>
+          </div>
+        </div>
+
+        <div class="prop"><label>Palette</label>
+          <div class="seg" id="effectPaletteSeg">
+            <button data-v="solid">Solid</button>
+            <button data-v="two_color" aria-pressed="true">Two-colour</button>
+            <button data-v="multicolor">Multicolour</button>
+            <button data-v="rainbow">Rainbow</button>
+          </div>
+        </div>
+
+        <div class="prop"><label>Colours</label>
+          <div class="row" id="effectColorsRow" style="flex-wrap:wrap"></div>
+        </div>
+
+        <div class="row" style="margin-top:4px">
+          <label class="inline">speed <input type="number" id="effectPeriod" value="4" min="0.5"
             step="0.5" style="width:64px"> s</label>
-          <button class="btn sec sm" onclick="previewWaveEffect()">Preview</button>
-          <button class="btn sm" onclick="startWaveEffect()">Apply to PC</button>
+          <div class="seg" id="effectMovingSeg" style="width:160px">
+            <button data-v="moving" aria-pressed="true">Moving</button>
+            <button data-v="static">Static</button>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <button class="btn sec sm" onclick="previewPositionEffect()">Preview</button>
+          <button class="btn sm" onclick="applyPositionEffect()">Apply to PC</button>
           <button class="btn sec sm" onclick="stopEffect()">Stop</button>
         </div>
       </div>
@@ -942,44 +974,156 @@ async function applyLedColor(){
   }catch(e){ say(e.message,"error"); }
 }
 
-/* Preview plays entirely in the browser (no API calls) so an animation
-   can be tuned before it ever touches real hardware - the same cosine
-   blend main.py's _run_wave_effect uses, so what's previewed matches
-   what Apply actually runs. Only updates each circle's fill attribute
-   directly (not a full re-render) so it can run at animation-frame rate. */
+/* ---------- position effects (Advanced) ----------
+   One generalised effect - direction picks which axis/reference a LED's
+   position comes from, palette picks how a colour is sampled at that
+   position - mirrors main.py's _position_value/_sample_palette exactly
+   (including the cyclic-vs-clamped gradient distinction: a *moving*
+   effect must wrap smoothly as phase advances, but a *static* one-way
+   gradient must not wrap or its far end snaps back to the start colour -
+   confirmed as a real bug during backend testing, fixed by clamping the
+   static case to n-1 segments instead of wrapping n of them) so what's
+   previewed here matches what Apply actually runs on real hardware.
+   Preview only updates each circle's fill attribute directly (not a full
+   re-render) so it can run at animation-frame rate with no API calls. */
+let effectDirection = "top_to_bottom";
+let effectPalette = "two_color";
+let effectColors = ["#4c79ff", "#ff7a30"];
+let effectMoving = true;
 let previewRaf = null;
 
-function blendRgb(a, b, t){
-  const w = (1 - Math.cos(t * 2 * Math.PI)) / 2;
-  return [0,1,2].map(i => Math.round(a[i] + (b[i]-a[i]) * w));
+function initEffectControls(){
+  document.getElementById("effectDirSeg").addEventListener("click", e=>{
+    const btn = e.target.closest("button"); if(!btn) return;
+    effectDirection = btn.dataset.v;
+    setPressed("effectDirSeg", effectDirection);
+  });
+  document.getElementById("effectPaletteSeg").addEventListener("click", e=>{
+    const btn = e.target.closest("button"); if(!btn) return;
+    setEffectPalette(btn.dataset.v);
+  });
+  document.getElementById("effectMovingSeg").addEventListener("click", e=>{
+    const btn = e.target.closest("button"); if(!btn) return;
+    effectMoving = btn.dataset.v === "moving";
+    setPressed("effectMovingSeg", btn.dataset.v);
+  });
+  renderEffectColors();
 }
 
-function previewWaveEffect(){
+function setPressed(segId, value){
+  document.querySelectorAll(`#${segId} button`).forEach(b=>
+    b.setAttribute("aria-pressed", b.dataset.v===value ? "true" : "false"));
+}
+
+function setEffectPalette(p){
+  effectPalette = p;
+  setPressed("effectPaletteSeg", p);
+  if(p === "solid" && effectColors.length !== 1) effectColors = [effectColors[0] || "#4c79ff"];
+  else if(p === "two_color" && effectColors.length !== 2)
+    effectColors = [effectColors[0] || "#4c79ff", effectColors[1] || "#ff7a30"];
+  else if(p === "multicolor" && effectColors.length < 3)
+    effectColors = ["#4c79ff", "#ff7a30", "#2ecc71"];
+  renderEffectColors();
+}
+
+function renderEffectColors(){
+  const box = document.getElementById("effectColorsRow");
+  if(effectPalette === "rainbow"){
+    box.innerHTML = `<span class="note">full hue cycle - no colours to pick</span>`;
+    return;
+  }
+  box.innerHTML = effectColors.map((hex,i)=>`
+    <span class="row" style="gap:4px">
+      <input type="color" value="${hex}" onchange="setEffectColor(${i}, this.value)">
+      ${effectPalette==="multicolor" && effectColors.length>2
+        ? `<button class="btn sec sm" onclick="removeEffectColor(${i})">&times;</button>` : ""}
+    </span>`).join("")
+    + (effectPalette==="multicolor" && effectColors.length<6
+      ? `<button class="btn sec sm" onclick="addEffectColor()">+ colour</button>` : "");
+}
+
+function setEffectColor(i, hex){ effectColors[i] = hex; }
+function addEffectColor(){ effectColors.push("#ffffff"); renderEffectColors(); }
+function removeEffectColor(i){ effectColors.splice(i,1); renderEffectColors(); }
+
+function hsvToRgb(h, s, v){
+  const i = Math.floor(h*6), f = h*6-i, p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
+  switch(i%6){
+    case 0: return [v,t,p]; case 1: return [q,v,p]; case 2: return [p,v,t];
+    case 3: return [p,q,v]; case 4: return [t,p,v]; default: return [v,p,q];
+  }
+}
+
+function positionValue(direction, led, b){
+  const {x, y} = led;
+  if(direction === "top_to_bottom") return (y - b.yMin) / b.ySpan;
+  if(direction === "bottom_to_top") return 1 - (y - b.yMin) / b.ySpan;
+  if(direction === "left_to_right") return (x - b.xMin) / b.xSpan;
+  if(direction === "right_to_left") return 1 - (x - b.xMin) / b.xSpan;
+  const dx = (x - b.cx) / b.rMax, dy = (y - b.cy) / b.rMax;
+  const dist = Math.min(1, Math.hypot(dx, dy));
+  return direction === "outward" ? dist : 1 - dist;
+}
+
+function samplePalette(palette, colors, t, cyclic){
+  if(palette === "solid") return colors[0];
+  if(palette === "rainbow"){
+    const [r,g,b] = hsvToRgb(((t%1)+1)%1, 1, 1);
+    return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+  }
+  const n = colors.length;
+  if(n <= 1) return colors[0] || [255,255,255];
+  let i, frac;
+  if(cyclic){
+    t = ((t%1)+1)%1;
+    const seg = t*n;
+    i = Math.floor(seg) % n;
+    frac = seg - Math.floor(seg);
+  } else {
+    t = Math.max(0, Math.min(1, t));
+    const seg = t*(n-1);
+    i = Math.min(Math.floor(seg), n-2);
+    frac = seg - i;
+  }
+  const a = colors[i], b2 = colors[cyclic ? (i+1)%n : i+1];
+  const w = (1 - Math.cos(frac*Math.PI))/2;
+  return [0,1,2].map(k => Math.round(a[k] + (b2[k]-a[k])*w));
+}
+
+function effectBounds(leds){
+  const xs = leds.map(l=>l.x), ys = leds.map(l=>l.y);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const cx = (xMin+xMax)/2, cy = (yMin+yMax)/2;
+  const rMax = Math.max(...leds.map(l=>Math.hypot(l.x-cx, l.y-cy))) || 1;
+  return {xMin, xSpan:(xMax-xMin)||1, yMin, ySpan:(yMax-yMin)||1, cx, cy, rMax};
+}
+
+function previewPositionEffect(){
   stopPreview();
   if(!layoutData) return;
-  const colorA = hexToRgb(document.getElementById("waveColorA").value);
-  const colorB = hexToRgb(document.getElementById("waveColorB").value);
-  const period = parseFloat(document.getElementById("wavePeriod").value) || 4;
-  const fanLeds = layoutData.leds.filter(l=>{
+  const leds = layoutData.leds.filter(l=>{
     const u = layoutData.units.find(x=>x.id===l.unit);
-    return u && u.kind === "fan" && u.led_channel;
+    return u && u.kind !== "display";
   });
-  if(!fanLeds.length){ say("No fan LED channels placed in Setup yet.","error"); return; }
-  const ys = fanLeds.map(l=>l.y);
-  const yMin = Math.min(...ys), ySpan = (Math.max(...ys) - yMin) || 1;
+  if(!leds.length){ say("No units placed in Setup yet.","error"); return; }
+  const colors = effectPalette === "rainbow" ? [] : effectColors.map(hexToRgb);
+  const cyclic = effectMoving || effectPalette === "rainbow";
+  const period = parseFloat(document.getElementById("effectPeriod").value) || 4;
+  const bounds = effectBounds(leds);
   const start = performance.now();
   function frame(now){
-    const phase = ((now - start) / 1000 / period) % 1;
-    for(const l of fanLeds){
-      const t = (((l.y - yMin) / ySpan) - phase + 1) % 1;
-      const [r,g,b] = blendRgb(colorA, colorB, t);
+    const phase = effectMoving ? ((now - start) / 1000 / period) % 1 : 0;
+    for(const l of leds){
+      const pos = positionValue(effectDirection, l, bounds);
+      const [r,g,b] = samplePalette(effectPalette, colors, pos - phase, cyclic);
       const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
       if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
     }
     previewRaf = requestAnimationFrame(frame);
   }
   previewRaf = requestAnimationFrame(frame);
-  const note = document.getElementById("waveStatusNote");
+  const note = document.getElementById("effectStatusNote");
   if(note) note.textContent = "previewing - not applied to hardware yet";
 }
 
@@ -987,15 +1131,17 @@ function stopPreview(){
   if(previewRaf !== null){ cancelAnimationFrame(previewRaf); previewRaf = null; }
 }
 
-async function startWaveEffect(){
+async function applyPositionEffect(){
   stopPreview();
   try{
-    await api("/api/rgb/effects/wave/start",{method:"POST",body:JSON.stringify({
-      color_a: document.getElementById("waveColorA").value,
-      color_b: document.getElementById("waveColorB").value,
-      period_s: parseFloat(document.getElementById("wavePeriod").value) || 4,
+    await api("/api/rgb/effects/position/start",{method:"POST",body:JSON.stringify({
+      direction: effectDirection,
+      palette: effectPalette,
+      colors: effectPalette === "rainbow" ? [] : effectColors,
+      period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
+      moving: effectMoving,
     })});
-    say("Wave effect applied to the PC.");
+    say("Effect applied to the PC.");
     pollEffectStatus();
   }catch(e){ say(e.message,"error"); }
 }
@@ -1008,7 +1154,7 @@ async function stopEffect(){
 async function pollEffectStatus(){
   try{
     const s = await api("/api/rgb/effects/status");
-    const note = document.getElementById("waveStatusNote");
+    const note = document.getElementById("effectStatusNote");
     if(note && previewRaf === null){
       note.textContent = s.running ? "running on the PC" : (s.error ? "stopped - " + s.error : "");
     }
@@ -1524,6 +1670,7 @@ async function refresh(){
   try{ scanState = await api("/api/scan/status"); renderScan(); renderHubRgb(); renderHubSizes(); }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
   try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
+  initEffectControls();
   loadHubModes();
   pollEffectStatus();
   loadRgbDump();

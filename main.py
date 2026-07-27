@@ -14,6 +14,7 @@ Run:
 """
 
 import asyncio
+import colorsys
 import contextlib
 import json
 import logging
@@ -61,7 +62,7 @@ _panorama_lock = asyncio.Lock()
 _keepalive_task: asyncio.Task | None = None
 
 # Host-driven, position-aware hub effects (Advanced RGB view) - see
-# _run_wave_effect below. A plain threading.Event rather than an asyncio
+# _run_position_effect below. A plain threading.Event rather than an asyncio
 # primitive because the effect body is a tight blocking-socket loop run
 # via asyncio.to_thread on a worker thread, not a coroutine; setting the
 # event from a request handler's own thread is safe without a lock, it's
@@ -718,27 +719,20 @@ async def set_hub_mode(body: HubModeRequest):
     return {"ok": True}
 
 
-def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
-    """Runs until _effect_stop is set, on its own worker thread (via
-    asyncio.to_thread) - one raw connection held for the whole effect
-    rather than reopened per frame (see openrgb_raw.py's docstring on this
-    hub's server-side instability under repeated REQUEST_CONTROLLER_DATA
-    hammering). Drives every fan channel, RAM stick and the motherboard's
-    real zone - whatever's actually been placed in Setup - from its real
-    per-LED y-coordinate (app/layout.py), blended against a moving phase:
-    a wave that visibly runs top-to-bottom across the whole case, not
-    just the fans.
+DIRECTIONS = ("top_to_bottom", "bottom_to_top", "left_to_right", "right_to_left", "outward", "inward")
+PALETTES = ("solid", "two_color", "multicolor", "rainbow")
 
-    RAM/mobo go through the separate openrgb-python bridge (protocol 4 is
-    fine for them, unlike the hub's effects-only zones - see
-    openrgb_bridge.py's own docstring), resolved and mode-selected once
-    here before the loop starts, not on every frame - re-resolving them
-    per frame would reintroduce exactly the per-request OpenRGB latency
-    just fixed elsewhere (see RECONNECT_RETRIES's comment). If they can't
-    be resolved (not placed, or OpenRGB can't currently see them), the
-    fan channels still animate - RAM/mobo just sit out silently rather
-    than failing the whole effect."""
-    global _effect_status
+
+def _resolve_effect_targets():
+    """Every real per-LED write target the position effect can drive,
+    resolved once (not per-frame - re-resolving RAM/mobo every frame
+    would reintroduce exactly the per-request OpenRGB latency fixed
+    elsewhere, see RECONNECT_RETRIES's comment). Fan channels are
+    resolved separately inside the effect loop itself since they go
+    through the hub's raw v5 connection, which needs to be held open for
+    the whole effect (see openrgb_raw.py's docstring on this hub's
+    server-side instability under repeated reconnects) rather than
+    fetched here alongside RAM/mobo's protocol-4 bridge."""
     data = layout.with_leds()
     leds_by_unit: dict[str, list[dict]] = {}
     for led in data["leds"]:
@@ -746,30 +740,6 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
     fan_units = [u for u in data["units"] if u.get("kind") == "fan" and u.get("led_channel")]
     ram_units = [u for u in data["units"] if u.get("kind") == "ram"]
     mobo_units = [u for u in data["units"] if u.get("kind") == "mobo"]
-
-    all_units = fan_units + ram_units + mobo_units
-    all_ys = [led["y"] for u in all_units for led in leds_by_unit.get(u["id"], [])]
-    if not all_ys:
-        _effect_status = {"running": False, "kind": None,
-                           "error": "no units placed in Setup yet"}
-        return
-    y_min, y_max = min(all_ys), max(all_ys)
-    y_span = (y_max - y_min) or 1.0
-
-    def blend(a, b, t):
-        # Cosine ease instead of a linear lerp - a linear wave has a
-        # visible seam where it wraps from b back to a; cosine keeps the
-        # loop smooth all the way around.
-        w = (1 - math.cos(t * 2 * math.pi)) / 2
-        return tuple(round(a[i] + (b[i] - a[i]) * w) for i in range(3))
-
-    def frame_colors(u):
-        unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
-        return unit_leds, [
-            blend(color_a, color_b, ((led["y"] - y_min) / y_span - phase[0]) % 1.0)
-            for led in unit_leds
-        ]
-    phase = [0.0]  # mutable cell frame_colors closes over
 
     ram_targets: list[tuple[dict, object]] = []
     if ram_units:
@@ -781,7 +751,7 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
                 if idx is not None and 0 <= idx < len(ram_devices):
                     ram_targets.append((u, ram_devices[idx]))
         except Exception as exc:
-            log.warning("wave effect: could not resolve RAM sticks: %s", exc)
+            log.warning("effect: could not resolve RAM sticks: %s", exc)
 
     mobo_target = None
     if mobo_units:
@@ -793,7 +763,126 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
                 if zone_index is not None:
                     mobo_target = (mobo_units[0], device, zone_index)
         except Exception as exc:
-            log.warning("wave effect: could not resolve motherboard: %s", exc)
+            log.warning("effect: could not resolve motherboard: %s", exc)
+
+    return leds_by_unit, fan_units, ram_targets, mobo_target
+
+
+def _position_value(direction: str, led: dict, bounds: dict) -> float:
+    """Normalised 0..1 position of one LED along whichever axis
+    `direction` cares about - the single thing every effect (wave,
+    rainbow, whatever) samples its colour from. outward/inward are
+    radial distance from the bounding box's centre, not a straight axis,
+    so a fan in the middle of the case and one at a corner get genuinely
+    different positions, not just a flat top/bottom or left/right split."""
+    x, y = led["x"], led["y"]
+    if direction == "top_to_bottom":
+        return (y - bounds["y_min"]) / bounds["y_span"]
+    if direction == "bottom_to_top":
+        return 1.0 - (y - bounds["y_min"]) / bounds["y_span"]
+    if direction == "left_to_right":
+        return (x - bounds["x_min"]) / bounds["x_span"]
+    if direction == "right_to_left":
+        return 1.0 - (x - bounds["x_min"]) / bounds["x_span"]
+    # outward / inward
+    dx = (x - bounds["cx"]) / bounds["r_max"]
+    dy = (y - bounds["cy"]) / bounds["r_max"]
+    dist = min(1.0, math.hypot(dx, dy))
+    return dist if direction == "outward" else 1.0 - dist
+
+
+def _sample_palette(palette: str, colors: list[tuple], t: float, cyclic: bool) -> tuple:
+    """The colour at position/phase `t` for whichever palette was picked.
+
+    cyclic matters for two_color/multicolor specifically: a *moving*
+    effect needs the gradient to loop back on itself smoothly as phase
+    advances (n stops, wrapping from the last back to the first), but a
+    *static* one-way gradient (moving=False) must NOT wrap - confirmed as
+    a real bug by a direct test: with cyclic wrapping always on, the LED
+    at position exactly 1.0 folds back to t%1.0==0.0 and renders the
+    *start* colour again, so the far end of a static left-to-right
+    gradient snapped back to the near end's colour instead of ending on
+    the last stop. Non-cyclic clamps t to 0..1 and spans it across n-1
+    segments instead, so position 0 is exactly the first colour and
+    position 1 is exactly the last, no wraparound. Rainbow is always
+    cyclic regardless - a hue wheel wrapping at 360°/0° is the whole
+    point of a rainbow gradient, static or moving. solid ignores t
+    entirely, cyclic or not."""
+    if palette == "solid":
+        return colors[0]
+    if palette == "rainbow":
+        r, g, b = colorsys.hsv_to_rgb(t % 1.0, 1.0, 1.0)
+        return (round(r * 255), round(g * 255), round(b * 255))
+    n = len(colors)
+    if n <= 1:
+        return colors[0] if colors else (255, 255, 255)
+    if cyclic:
+        t = t % 1.0
+        seg = t * n
+        i = int(seg) % n
+        frac = seg - int(seg)
+        a, b = colors[i], colors[(i + 1) % n]
+    else:
+        t = max(0.0, min(1.0, t))
+        seg = t * (n - 1)
+        i = min(int(seg), n - 2)
+        frac = seg - i
+        a, b = colors[i], colors[i + 1]
+    w = (1 - math.cos(frac * math.pi)) / 2
+    return tuple(round(a[k] + (b[k] - a[k]) * w) for k in range(3))
+
+
+def _run_position_effect(direction: str, palette: str, colors: list[tuple],
+                         period_s: float, moving: bool):
+    """Runs until _effect_stop is set, on its own worker thread (via
+    asyncio.to_thread) - one raw hub connection held for the whole effect
+    rather than reopened per frame (see openrgb_raw.py's docstring on
+    this hub's server-side instability under repeated
+    REQUEST_CONTROLLER_DATA hammering). Drives every fan channel, RAM
+    stick and the motherboard's real zone that's actually been placed in
+    Setup, each LED coloured by _sample_palette() at its _position_value()
+    - a single generalised effect covering directional wipes, radial
+    in/out, solid colour, multi-stop gradients and a moving rainbow,
+    rather than one hardcoded top-to-bottom two-colour wave.
+
+    A non-moving (static) effect still runs this same loop rather than
+    writing once and exiting - phase just never advances - so Stop keeps
+    working the same way for every effect kind, at the cost of a few
+    harmless redundant identical writes a second instead of one."""
+    global _effect_status
+    leds_by_unit, fan_units, ram_targets, mobo_target = _resolve_effect_targets()
+
+    driven_ids = {u["id"] for u in fan_units} | {u["id"] for u, _ in ram_targets}
+    if mobo_target is not None:
+        driven_ids.add(mobo_target[0]["id"])
+    all_leds = [led for uid in driven_ids for led in leds_by_unit.get(uid, [])]
+    if not all_leds:
+        _effect_status = {"running": False, "kind": None,
+                           "error": "no units placed in Setup yet"}
+        return
+    xs = [l["x"] for l in all_leds]
+    ys = [l["y"] for l in all_leds]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+    r_max = max((math.hypot(l["x"] - cx, l["y"] - cy) for l in all_leds), default=0) or 1.0
+    bounds = {
+        "x_min": x_min, "x_span": (x_max - x_min) or 1.0,
+        "y_min": y_min, "y_span": (y_max - y_min) or 1.0,
+        "cx": cx, "cy": cy, "r_max": r_max,
+    }
+
+    phase = [0.0]  # mutable cell frame_colors closes over
+
+    cyclic = moving or palette == "rainbow"
+
+    def frame_colors(u):
+        unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
+        return unit_leds, [
+            _sample_palette(palette, colors,
+                            _position_value(direction, led, bounds) - phase[0], cyclic)
+            for led in unit_leds
+        ]
 
     for _, device in ram_targets:
         openrgb.select_mode(device, "direct")
@@ -804,41 +893,42 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
         with _open_hub_raw() as raw:
             ctrl = raw.find_controller("NZXT") if fan_units else None
             if fan_units and ctrl is None:
-                log.warning("wave effect: no hub RGB device found, fan channels won't animate")
+                log.warning("effect: no hub RGB device found, fan channels won't animate")
             elif ctrl is not None:
                 raw.select_mode(ctrl, "direct")
             start = time.monotonic()
             while not _effect_stop.is_set():
-                phase[0] = ((time.monotonic() - start) / period_s) % 1.0
+                if moving:
+                    phase[0] = ((time.monotonic() - start) / period_s) % 1.0
 
                 if ctrl is not None:
                     for u in fan_units:
                         zone = raw.zone_for_channel(ctrl, u["led_channel"])
                         if zone is None or zone.leds_count == 0:
                             continue
-                        unit_leds, colors = frame_colors(u)
+                        unit_leds, frame = frame_colors(u)
                         if len(unit_leds) != zone.leds_count:
                             continue
-                        raw.set_zone_colors(ctrl.index, zone.index, colors)
+                        raw.set_zone_colors(ctrl.index, zone.index, frame)
 
                 for u, device in ram_targets:
-                    _, colors = frame_colors(u)
+                    _, frame = frame_colors(u)
                     try:
-                        openrgb.set_zone_colors_by_index(device, 0, colors)
+                        openrgb.set_zone_colors_by_index(device, 0, frame)
                     except Exception as exc:
-                        log.debug("wave effect: RAM write failed for %s: %s", u["id"], exc)
+                        log.debug("effect: RAM write failed for %s: %s", u["id"], exc)
 
                 if mobo_target is not None:
                     u, device, zone_index = mobo_target
-                    _, colors = frame_colors(u)
+                    _, frame = frame_colors(u)
                     try:
-                        openrgb.set_zone_colors_by_index(device, zone_index, colors)
+                        openrgb.set_zone_colors_by_index(device, zone_index, frame)
                     except Exception as exc:
-                        log.debug("wave effect: motherboard write failed: %s", exc)
+                        log.debug("effect: motherboard write failed: %s", exc)
 
-                _effect_stop.wait(0.08)
+                _effect_stop.wait(0.08 if moving else 1.0)
     except Exception as exc:
-        log.warning("wave effect stopped: %s", exc)
+        log.warning("position effect stopped: %s", exc)
         _effect_status = {"running": False, "kind": None, "error": str(exc)}
         return
     _effect_status = {"running": False, "kind": None, "error": None}
@@ -907,9 +997,13 @@ class ChaseEffectRequest(BaseModel):
 
 @app.post("/api/rgb/hub/{channel}/chase/start")
 async def start_chase_effect(channel: str, body: ChaseEffectRequest):
+    """Starting this (or a position effect, or a native hub mode) always
+    stops whatever's currently running first, rather than rejecting the
+    request - only one thing should ever be driving the hardware at
+    once, and making the caller stop the old one first was just an extra
+    round trip for no benefit."""
     global _effect_task, _effect_status
-    if _effect_status.get("running"):
-        raise HTTPException(409, "an effect is already running - stop it first")
+    await _stop_effect()
     _effect_stop.clear()
     _effect_status = {"running": True, "kind": "chase", "channel": channel, "error": None}
     _effect_task = asyncio.create_task(
@@ -917,23 +1011,31 @@ async def start_chase_effect(channel: str, body: ChaseEffectRequest):
     return {"ok": True}
 
 
-class WaveEffectRequest(BaseModel):
-    color_a: str = "#4c79ff"
-    color_b: str = "#ff7a30"
+class PositionEffectRequest(BaseModel):
+    direction: str = "top_to_bottom"
+    palette: str = "two_color"
+    colors: list[str] = ["#4c79ff", "#ff7a30"]
     period_s: float = 4.0
+    moving: bool = True
 
 
-@app.post("/api/rgb/effects/wave/start")
-async def start_wave_effect(body: WaveEffectRequest):
+@app.post("/api/rgb/effects/position/start")
+async def start_position_effect(body: PositionEffectRequest):
+    """See start_chase_effect's docstring re: always stopping whatever
+    was running first instead of rejecting the request."""
     global _effect_task, _effect_status
-    if _effect_status.get("running"):
-        raise HTTPException(409, "an effect is already running - stop it first")
+    if body.direction not in DIRECTIONS:
+        raise HTTPException(400, f"unknown direction {body.direction!r} - must be one of {DIRECTIONS}")
+    if body.palette not in PALETTES:
+        raise HTTPException(400, f"unknown palette {body.palette!r} - must be one of {PALETTES}")
+    rgb_colors = [_hex_to_rgb(c) for c in body.colors] or [(255, 255, 255)]
+    await _stop_effect()
     _effect_stop.clear()
-    _effect_status = {"running": True, "kind": "wave", "error": None}
-    color_a = _hex_to_rgb(body.color_a)
-    color_b = _hex_to_rgb(body.color_b)
+    _effect_status = {"running": True, "kind": "position", "direction": body.direction,
+                       "palette": body.palette, "error": None}
     _effect_task = asyncio.create_task(
-        asyncio.to_thread(_run_wave_effect, color_a, color_b, max(body.period_s, 0.5)))
+        asyncio.to_thread(_run_position_effect, body.direction, body.palette,
+                          rgb_colors, max(body.period_s, 0.5), body.moving))
     return {"ok": True}
 
 
