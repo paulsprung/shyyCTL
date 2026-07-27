@@ -424,6 +424,28 @@ class OpenRgbBridge:
             self._select_mode(device, mode_name)
             device.leds[led_index].set_color(RGBColor(*color))
 
+    def select_mode(self, device, mode_name: str):
+        """Public entry point to _select_mode - for a caller (main.py's
+        wave effect) that resolves a device once before a continuous
+        animation loop starts and needs to select 'direct' mode itself,
+        the same way set_color()/set_zone_color() etc already do
+        internally on every call."""
+        with self._lock:
+            self._select_mode(device, mode_name)
+
+    def set_zone_colors_by_index(self, device, zone_index: int, colors: list[tuple[int, int, int]]):
+        """Multi-LED write to one zone with no mode reselection - for a
+        continuous animation loop (main.py's wave effect) that already
+        called select_mode() once before starting; reselecting the mode
+        on every single frame would double the round trips for zero
+        benefit, the same reasoning set_zone_colors_by_index's siblings
+        above apply to a one-off write."""
+        with self._lock:
+            if zone_index < 0 or zone_index >= len(device.zones):
+                raise ValueError(f"{device.name} has no zone at index {zone_index}")
+            from openrgb.utils import RGBColor
+            device.zones[zone_index].set_colors([RGBColor(*c) for c in colors])
+
     @staticmethod
     def _select_mode(device, mode_name: str):
         for i, mode in enumerate(device.modes):

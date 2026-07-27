@@ -380,6 +380,11 @@
           <button class="btn sec sm" onclick="startScan('rgb')">Silent scan (RGB only)</button>
           <button class="btn sec sm" onclick="cancelScan()">Cancel</button>
         </div>
+        <label class="inline" style="margin-top:10px;display:block">
+          <input type="checkbox" id="scanSkipRgb"> Skip motherboard &amp; RAM check
+          (only if it hangs/fails on this system - the hub's own fan LED
+          channels still get sized either way)
+        </label>
         <div class="bar"><i id="scanBar" style="width:0%"></i></div>
         <div class="note" id="scanStep">Not run yet.</div>
         <div id="scanResults" style="margin-top:16px"></div>
@@ -1062,7 +1067,8 @@ async function uploadPanoMedia(asBoot){
 
 async function startScan(mode){
   try{
-    await api("/api/scan/start",{method:"POST",body:JSON.stringify({mode})});
+    const skip_rgb_devices = document.getElementById("scanSkipRgb").checked;
+    await api("/api/scan/start",{method:"POST",body:JSON.stringify({mode, skip_rgb_devices})});
     say(mode==="full" ? "Scan started — about two minutes."
       : mode==="rgb" ? "Silent scan started — no fans will spin."
       : "Quick scan started.");

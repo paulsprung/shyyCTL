@@ -55,12 +55,13 @@ class Scan:
         self.error: str | None = None
         self._thread = None
         self._cancel = threading.Event()
+        self._skip_rgb_devices = False
 
     # -- control -------------------------------------------------------
 
     MODES = ("full", "quick", "rgb")
 
-    def start(self, mode: str = "full") -> bool:
+    def start(self, mode: str = "full", skip_rgb_devices: bool = False) -> bool:
         """mode:
         - "full": spins every fan up, measures start duty + max RPM, then
           resizes/reports RGB.
@@ -72,6 +73,16 @@ class Scan:
           but "present" can only be inferred from whether an LED accessory
           was detected, not confirmed via tachometer - see
           _identify_channel_only's docstring.
+
+        skip_rgb_devices: skips the motherboard/RAM check entirely (the
+        hub's own LED zones still get resized/reported regardless - this
+        only concerns OpenRGB's separate motherboard/DRAM devices). An
+        escape hatch for a system where OpenRGB genuinely can't detect
+        them (confirmed by a real report: PawnIO, OpenRGB's SMBus access
+        driver, failing to initialize) - the trimmed retry budget in
+        OpenRgbBridge now fails in a few seconds instead of minutes, but
+        a few seconds still isn't free when it happens on every single
+        scan and is never going to succeed on this particular machine.
         """
         if mode not in self.MODES:
             raise ValueError(f"unknown scan mode {mode!r} - must be one of {self.MODES}")
@@ -82,6 +93,7 @@ class Scan:
         self.mobo = None
         self.ram = []
         self.error = None
+        self._skip_rgb_devices = skip_rgb_devices
         self._thread = threading.Thread(
             target=self._run, args=(mode,), daemon=True, name="scan")
         self._thread.start()
@@ -165,9 +177,13 @@ class Scan:
         self.progress = 0.72
         self._resize_hub_zones()
 
-        self.step = "Checking motherboard and RAM lighting"
-        self.progress = 0.75
-        self._scan_openrgb()
+        if self._skip_rgb_devices:
+            self.step = "Skipped motherboard/RAM check"
+            self.progress = 0.75
+        else:
+            self.step = "Checking motherboard and RAM lighting"
+            self.progress = 0.75
+            self._scan_openrgb()
 
         self.step = "Done"
         self.progress = 1.0

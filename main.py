@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import subprocess
 import tempfile
 import threading
@@ -706,20 +707,35 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
     asyncio.to_thread) - one raw connection held for the whole effect
     rather than reopened per frame (see openrgb_raw.py's docstring on this
     hub's server-side instability under repeated REQUEST_CONTROLLER_DATA
-    hammering). Drives every fan channel that's actually been placed in
-    Setup from its real per-LED y-coordinate (app/layout.py), blended
-    against a moving phase - a wave that visibly runs top-to-bottom across
-    the case, not just a flat per-channel colour cycle blind to position."""
+    hammering). Drives every fan channel, RAM stick and the motherboard's
+    real zone - whatever's actually been placed in Setup - from its real
+    per-LED y-coordinate (app/layout.py), blended against a moving phase:
+    a wave that visibly runs top-to-bottom across the whole case, not
+    just the fans.
+
+    RAM/mobo go through the separate openrgb-python bridge (protocol 4 is
+    fine for them, unlike the hub's effects-only zones - see
+    openrgb_bridge.py's own docstring), resolved and mode-selected once
+    here before the loop starts, not on every frame - re-resolving them
+    per frame would reintroduce exactly the per-request OpenRGB latency
+    just fixed elsewhere (see RECONNECT_RETRIES's comment). If they can't
+    be resolved (not placed, or OpenRGB can't currently see them), the
+    fan channels still animate - RAM/mobo just sit out silently rather
+    than failing the whole effect."""
     global _effect_status
     data = layout.with_leds()
     leds_by_unit: dict[str, list[dict]] = {}
     for led in data["leds"]:
         leds_by_unit.setdefault(led["unit"], []).append(led)
     fan_units = [u for u in data["units"] if u.get("kind") == "fan" and u.get("led_channel")]
-    all_ys = [led["y"] for u in fan_units for led in leds_by_unit.get(u["id"], [])]
-    if not fan_units or not all_ys:
+    ram_units = [u for u in data["units"] if u.get("kind") == "ram"]
+    mobo_units = [u for u in data["units"] if u.get("kind") == "mobo"]
+
+    all_units = fan_units + ram_units + mobo_units
+    all_ys = [led["y"] for u in all_units for led in leds_by_unit.get(u["id"], [])]
+    if not all_ys:
         _effect_status = {"running": False, "kind": None,
-                           "error": "no fan LED channels placed in Setup yet"}
+                           "error": "no units placed in Setup yet"}
         return
     y_min, y_max = min(all_ys), max(all_ys)
     y_span = (y_max - y_min) or 1.0
@@ -731,29 +747,79 @@ def _run_wave_effect(color_a: tuple, color_b: tuple, period_s: float):
         w = (1 - math.cos(t * 2 * math.pi)) / 2
         return tuple(round(a[i] + (b[i] - a[i]) * w) for i in range(3))
 
+    def frame_colors(u):
+        unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
+        return unit_leds, [
+            blend(color_a, color_b, ((led["y"] - y_min) / y_span - phase[0]) % 1.0)
+            for led in unit_leds
+        ]
+    phase = [0.0]  # mutable cell frame_colors closes over
+
+    ram_targets: list[tuple[dict, object]] = []
+    if ram_units:
+        try:
+            ram_devices = openrgb.ram()
+            for u in ram_units:
+                m = re.search(r"-(\d+)$", u["id"])
+                idx = int(m.group(1)) if m else None
+                if idx is not None and 0 <= idx < len(ram_devices):
+                    ram_targets.append((u, ram_devices[idx]))
+        except Exception as exc:
+            log.warning("wave effect: could not resolve RAM sticks: %s", exc)
+
+    mobo_target = None
+    if mobo_units:
+        try:
+            mobo_devices = openrgb.motherboard()
+            if mobo_devices:
+                device = mobo_devices[0]
+                zone_index = openrgb.real_zone_index(device)
+                if zone_index is not None:
+                    mobo_target = (mobo_units[0], device, zone_index)
+        except Exception as exc:
+            log.warning("wave effect: could not resolve motherboard: %s", exc)
+
+    for _, device in ram_targets:
+        openrgb.select_mode(device, "direct")
+    if mobo_target is not None:
+        openrgb.select_mode(mobo_target[1], "direct")
+
     try:
         with _open_hub_raw() as raw:
-            ctrl = raw.find_controller("NZXT")
-            if ctrl is None:
-                _effect_status = {"running": False, "kind": None,
-                                   "error": "no hub RGB device found"}
-                return
-            raw.select_mode(ctrl, "direct")
+            ctrl = raw.find_controller("NZXT") if fan_units else None
+            if fan_units and ctrl is None:
+                log.warning("wave effect: no hub RGB device found, fan channels won't animate")
+            elif ctrl is not None:
+                raw.select_mode(ctrl, "direct")
             start = time.monotonic()
             while not _effect_stop.is_set():
-                phase = ((time.monotonic() - start) / period_s) % 1.0
-                for u in fan_units:
-                    zone = raw.zone_for_channel(ctrl, u["led_channel"])
-                    if zone is None or zone.leds_count == 0:
-                        continue
-                    unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
-                    if len(unit_leds) != zone.leds_count:
-                        continue
-                    colors = [
-                        blend(color_a, color_b, ((led["y"] - y_min) / y_span - phase) % 1.0)
-                        for led in unit_leds
-                    ]
-                    raw.set_zone_colors(ctrl.index, zone.index, colors)
+                phase[0] = ((time.monotonic() - start) / period_s) % 1.0
+
+                if ctrl is not None:
+                    for u in fan_units:
+                        zone = raw.zone_for_channel(ctrl, u["led_channel"])
+                        if zone is None or zone.leds_count == 0:
+                            continue
+                        unit_leds, colors = frame_colors(u)
+                        if len(unit_leds) != zone.leds_count:
+                            continue
+                        raw.set_zone_colors(ctrl.index, zone.index, colors)
+
+                for u, device in ram_targets:
+                    _, colors = frame_colors(u)
+                    try:
+                        openrgb.set_zone_colors_by_index(device, 0, colors)
+                    except Exception as exc:
+                        log.debug("wave effect: RAM write failed for %s: %s", u["id"], exc)
+
+                if mobo_target is not None:
+                    u, device, zone_index = mobo_target
+                    _, colors = frame_colors(u)
+                    try:
+                        openrgb.set_zone_colors_by_index(device, zone_index, colors)
+                    except Exception as exc:
+                        log.debug("wave effect: motherboard write failed: %s", exc)
+
                 _effect_stop.wait(0.08)
     except Exception as exc:
         log.warning("wave effect stopped: %s", exc)
@@ -870,13 +936,14 @@ async def effect_status():
 
 class ScanRequest(BaseModel):
     mode: str = "full"  # "full" | "quick" | "rgb"
+    skip_rgb_devices: bool = False
 
 
 @app.post("/api/scan/start")
 async def scan_start(body: ScanRequest = ScanRequest()):
     if body.mode not in scan.MODES:
         raise HTTPException(400, f"unknown scan mode {body.mode!r} - must be one of {scan.MODES}")
-    started = await asyncio.to_thread(scan.start, body.mode)
+    started = await asyncio.to_thread(scan.start, body.mode, body.skip_rgb_devices)
     if not started:
         raise HTTPException(409, "scan already running")
     return {"started": True}
