@@ -1837,11 +1837,24 @@ async function loadGallery(){
   catch(e){ galleryItems = []; }
 }
 
+const VIDEO_SUFFIXES = ['.mp4', '.webm', '.mov', '.avi'];
+function isVideoItem(item){ return !!(item.suffix && VIDEO_SUFFIXES.includes(item.suffix.toLowerCase())); }
+// Mirrors main.py's gallery_original() media_type mapping exactly, so the
+// <source type> the browser sees matches what the response actually sends.
+function videoMimeType(suffix){
+  const s = (suffix || "").toLowerCase();
+  if(s === ".mp4") return "video/mp4";
+  if(s === ".webm") return "video/webm";
+  if(s === ".mov") return "video/quicktime";
+  if(s === ".avi") return "video/x-msvideo";
+  return "video/mp4";
+}
+
 function renderGallery(){
   const box = document.getElementById("galleryGrid");
   if(!box) return;
   if(!galleryItems.length){ box.innerHTML = `<div class="note">No media uploaded yet.</div>`; return; }
-  const isVideo = item => item.suffix && ['.mp4', '.webm', '.mov', '.avi'].includes(item.suffix.toLowerCase());
+  const isVideo = isVideoItem;
   box.innerHTML = galleryItems.slice().reverse().map(item=>`
     <div class="gallery-tile${item.id===lastGalleryId?" active":""}" onclick="applyGalleryItem('${item.id}'); event.stopPropagation();" style="cursor:pointer">
       ${item.has_thumb
@@ -1878,13 +1891,12 @@ async function uploadToGallery(){
 function openGalleryViewer(id){
   const item = galleryItems.find(i => i.id === id);
   if(!item) return;
-  const isVideo = item.suffix && ['.mp4', '.webm', '.mov', '.avi'].includes(item.suffix.toLowerCase());
   const viewer = document.getElementById("galleryViewer");
   const content = document.getElementById("galleryViewerContent");
   const info = document.getElementById("galleryViewerInfo");
 
-  if(isVideo){
-    content.innerHTML = `<video class="gallery-viewer-video" controls autoplay><source src="/api/panorama/gallery/${item.id}/original" type="video/${item.suffix.replace('.', '')}"</source></video>`;
+  if(isVideoItem(item)){
+    content.innerHTML = `<video class="gallery-viewer-video" controls autoplay><source src="/api/panorama/gallery/${item.id}/original" type="${videoMimeType(item.suffix)}"></video>`;
   }else{
     content.innerHTML = `<img class="gallery-viewer-img" src="/api/panorama/gallery/${item.id}/original" alt="${item.name}">`;
   }

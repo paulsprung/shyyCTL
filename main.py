@@ -21,7 +21,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -1815,7 +1814,6 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     }
 
     phase = [0.0]  # mutable cell frame_colors closes over
-    sparkle_states = {}  # track per-LED random values for sparkle effect
 
     cyclic = moving or palette == "rainbow"
 
@@ -1859,19 +1857,22 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             ]
 
         if shape == "sparkle":
-            # Random LED twinkling with base color
+            # Twinkling with a base colour - each LED's twinkle offset is a
+            # deterministic function of its own index (golden-ratio
+            # multiplication, a cheap standard trick for spreading integer
+            # indices evenly across 0..1 without a lookup table), not
+            # random.random(). A real random per-LED offset would only
+            # ever exist on this side - the frontend's local Preview and
+            # the synced canvas both replay this same shape client-side to
+            # show exactly what Apply put on real hardware (see
+            # effectFrameColor's docstring), and have no way to learn a
+            # value this process rolled privately. Same offset formula on
+            # both sides (see effectFrameColor's "sparkle" branch) keeps
+            # that guarantee intact for this shape too.
             base_color = _sample_palette(palette, colors, 0.0, False)
-            uid = u["id"]
-            if uid not in sparkle_states:
-                sparkle_states[uid] = {led["index"]: random.random() for led in unit_leds}
 
             def get_twinkle_brightness(led_index):
-                # Each LED has its own random twinkle offset
-                state_key = led_index
-                if state_key not in sparkle_states[uid]:
-                    sparkle_states[uid][state_key] = random.random()
-                offset = sparkle_states[uid][state_key]
-                # Phase through brightness based on offset
+                offset = (led_index % 256) * 0.618 % 1.0
                 t = (phase[0] + offset) % 1.0
                 # Smooth brightness envelope: ramp up 0->1, then down 1->0
                 if t < 0.5:
