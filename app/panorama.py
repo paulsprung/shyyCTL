@@ -350,18 +350,73 @@ def build_media_finalize_frame(session_id: int) -> bytes:
     return build_tryx_frame(body)
 
 
-def build_media_container(width: int, height: int, fps: int, h264_bytes: bytes) -> bytes:
+def count_h264_frames(h264_bytes: bytes) -> int:
+    """Counts real coded slice NAL units (type 1 = non-IDR, type 5 = IDR)
+    in a raw H.264 Annex-B stream - actual displayable frames, not the
+    SPS/PPS/SEI/AUD housekeeping NALs also present in the stream.
+
+    This exists because build_media_container's f8 field (below) was
+    wrongly assumed to be a constant "1", inferred from a single earlier
+    real sample that turned out to be a short static-image loop. A real
+    KANALI capture of an actual ~38s video upload (session traced this
+    session) showed f8=2272 instead - not a constant at all, and closely
+    matching that video's own real frame count (2272 / 60fps ≈ 38s,
+    consistent with the clip's actual length; a direct NAL count of the
+    ~29% of that same stream this project could capture already showed
+    proportionally the right ballpark). Sending "1" regardless of the
+    real stream length is the most likely reason a genuine video upload
+    only ever showed its first frame on the panel: the device most
+    likely trusts this declared count rather than independently parsing
+    the whole stream to find out how long it actually is."""
+    count = 0
+    pos = 0
+    n = len(h264_bytes)
+    while True:
+        pos = h264_bytes.find(b"\x00\x00\x01", pos)
+        if pos == -1 or pos + 3 >= n:
+            break
+        if h264_bytes[pos + 3] & 0x1F in (1, 5):
+            count += 1
+        pos += 3
+    return count or 1
+
+
+def build_media_container(width: int, height: int, fps: int, h264_bytes: bytes,
+                          frame_count: int, content_type: int = 2) -> bytes:
+    """content_type (f3) and frame_count (f8) were both wrongly assumed
+    to be constants (2 and 1 respectively) from a single real sample
+    that turned out to be a short static-image loop - see
+    count_h264_frames's docstring for the frame_count evidence.
+    content_type's real meaning is still a guess beyond two data points
+    (2 for that image sample, 4 for a real ~38s video sample) - "still
+    image" vs "real video/motion" is the interpretation used here,
+    matching upload_media()'s own image-vs-motion distinction exactly
+    (see _has_own_motion), but genuinely unconfirmed as anything more
+    specific than that."""
     header = (
         pb_varint_field(1, MEDIA_MAGIC)
         + pb_string_field(2, f"Tryx media header v1, fps={fps}, size={width}x{height}")
-        + pb_varint_field(3, 2)
+        + pb_varint_field(3, content_type)
         + pb_varint_field(4, 1)
         + pb_varint_field(5, fps)
         + pb_varint_field(6, width)
         + pb_varint_field(7, height)
-        + pb_varint_field(8, 1)
+        + pb_varint_field(8, frame_count)
     )
     return struct.pack("<I", len(header)) + header + h264_bytes
+
+
+_MOTION_SUFFIXES = (".gif", ".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v")
+
+
+def _has_own_motion(local_path: str) -> bool:
+    """Whether local_path already carries its own frame timing (a real
+    video or animated gif) rather than being a single still image that
+    needs to be looped into one. Shared between encode_to_h264 (decides
+    whether to loop it) and upload_media (decides the container header's
+    content-type field, see build_media_container) so the two can never
+    disagree about what kind of thing is actually being uploaded."""
+    return Path(local_path).suffix.lower() in _MOTION_SUFFIXES
 
 
 def resolve_ffmpeg_path() -> str:
@@ -387,8 +442,7 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
     an expected, recoverable case for a media-upload UI, not a bug."""
     if ffmpeg_path is None:
         ffmpeg_path = resolve_ffmpeg_path()
-    already_has_motion = Path(local_path).suffix.lower() in (
-        ".gif", ".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v")
+    already_has_motion = _has_own_motion(local_path)
     cmd = [ffmpeg_path, "-y"]
     if not already_has_motion:
         cmd += ["-loop", "1", "-t", str(duration_s)]
@@ -449,14 +503,19 @@ def generate_thumbnail(local_path: str, out_path: str, size: int = 240,
 
 
 def default_media_name(local_path: str) -> str:
-    """Matches the naming pattern seen in real KANALI uploads exactly:
-    a millisecond-precision timestamp, a '.png' middle extension
-    REGARDLESS of the source file's real type (confirmed against a real
-    .jpg upload that still ended up named '....png.h264_WxH' - the middle
-    extension appears to just be a generic label, not tied to source
-    format), then the confirmed .h264_WxH suffix."""
+    """Matches the naming pattern seen in real KANALI uploads: a
+    millisecond-precision timestamp, a middle extension, then the
+    confirmed .h264_WxH suffix. The middle extension is '.png' for a
+    still image regardless of its real format (confirmed against a real
+    .jpg upload that still ended up named '....png.h264_WxH'), but the
+    real source extension for anything with its own motion (confirmed
+    against a real KANALI .mp4 upload, which kept '.mp4' rather than
+    being relabelled) - this corrects an earlier, too-narrow reading of
+    that single .jpg sample as "the middle extension is just a generic
+    label"; it turns out that's only true for still images."""
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
-    return f"{ts}.png{MEDIA_SUFFIX}"
+    suffix = Path(local_path).suffix if _has_own_motion(local_path) else ".png"
+    return f"{ts}{suffix}{MEDIA_SUFFIX}"
 
 
 # -- shared command layer: identical over every transport -------------------
@@ -662,22 +721,18 @@ class _PanoramaBase:
         h264 = encode_to_h264(local_path, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, duration_s)
         if h264 is None:
             return None
-        container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264)
+        # content_type/frame_count used to be hardcoded (2, 1) - see
+        # build_media_container's and count_h264_frames' docstrings for
+        # the real capture evidence that this was wrong for anything with
+        # more than one real frame, and the most likely reason a genuine
+        # video previously only ever showed its first frame on the panel.
+        frame_count = count_h264_frames(h264)
+        content_type = 4 if _has_own_motion(local_path) else 2
+        container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264,
+                                          frame_count=frame_count, content_type=content_type)
         session_id = random.randint(1, 999_999)
-        # The two real uploads this protocol was confirmed against (see the
-        # section docstring above) were almost certainly small looped-still
-        # images - a 2s loop of one frame compresses to roughly 20KB at
-        # these encoder settings, confirmed by direct measurement, versus
-        # ~240KB for just 3 real seconds of actual motion at the same
-        # resolution. Neither the container header format nor any message-
-        # size limit has been confirmed against a real *video* upload, so
-        # log the real size and every ack's decoded content here - if a
-        # genuine video plays back as a static frame on the panel despite
-        # every ack below coming back fine, this is the evidence needed to
-        # tell "the device silently truncated a too-large transfer" apart
-        # from "the container header needs a field we don't know about yet".
-        log.info("upload_media: %s, container=%d bytes (h264=%d bytes)",
-                 remote_name, len(container), len(h264))
+        log.info("upload_media: %s, container=%d bytes (h264=%d bytes, frames=%d, content_type=%d)",
+                 remote_name, len(container), len(h264), frame_count, content_type)
 
         self._write(build_media_announce_frame(session_id, remote_name, len(container)))
         ack = self.read_message(timeout_s=timeout_s)
