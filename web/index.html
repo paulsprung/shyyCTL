@@ -480,6 +480,35 @@
             <button class="btn sec" id="themeToggle" onclick="toggleTheme()">Switch to light</button>
           </div>
         </section>
+        <section id="backgroundServicesSection">
+          <div class="section-head"><h2>Background services</h2><div class="rule"></div>
+            <span class="note" id="servicesStatusNote"></span></div>
+          <div class="card">
+            <p class="note" style="margin:0 0 12px">Only OpenRGB is needed for RGB effects; only SensorHelper
+              is needed for fan curves and the Status page's temperatures. Fans themselves and the display
+              don't need either.</p>
+            <div class="row">
+              <button class="btn sec sm" data-mode="all" onclick="setServiceMode('all')">All enabled</button>
+              <button class="btn sec sm" data-mode="effects" onclick="setServiceMode('effects')">Effects only</button>
+              <button class="btn sec sm" data-mode="fans_display" onclick="setServiceMode('fans_display')">Fans &amp; display only</button>
+              <button class="btn sec sm" data-mode="stop" onclick="setServiceMode('stop')">Stop all</button>
+            </div>
+            <div class="row" style="margin-top:14px">
+              <button class="btn hot sm" onclick="quitShyyctl()">Quit shyyctl completely</button>
+            </div>
+          </div>
+        </section>
+        <section id="autostartSection" style="display:none">
+          <div class="section-head"><h2>Startup</h2><div class="rule"></div></div>
+          <div class="card">
+            <label class="inline">
+              <input type="checkbox" id="autostartToggle" onchange="setAutostart(this.checked)">
+              Start shyyctl automatically when Windows logs in
+            </label>
+            <p class="note" style="margin:10px 0 0">Runs silently in the background - opening shyyctl from
+              the Start Menu just opens this page against it, it won't start a second copy.</p>
+          </div>
+        </section>
       </div>
 
       <!-- ---- scan ---- -->
@@ -2269,6 +2298,66 @@ function dismissConflictModal(){
 }
 
 setInterval(checkConflicts, 30000);
+
+/* ---------- background services / autostart ----------
+   Same "not near-real-time" polling cadence as checkConflicts above -
+   these only change when a human clicks a mode button here, or (rarely)
+   when a helper crashes on its own. */
+
+async function loadSystemInfo(){
+  try{
+    const [services, autostart] = await Promise.all([
+      api("/api/system/services"),
+      api("/api/system/autostart"),
+    ]);
+    renderServicesStatus(services);
+    renderAutostart(autostart);
+  }catch(e){}
+}
+
+function renderServicesStatus(s){
+  document.getElementById("servicesStatusNote").textContent =
+    `OpenRGB: ${s.openrgb ? "running" : "stopped"} · SensorHelper: ${s.sensor_helper ? "running" : "stopped"}`;
+}
+
+function renderAutostart(a){
+  document.getElementById("autostartSection").style.display = a.available ? "" : "none";
+  document.getElementById("autostartToggle").checked = a.enabled;
+}
+
+async function setServiceMode(mode){
+  try{
+    const r = await api("/api/system/services",{method:"POST",body:JSON.stringify({mode})});
+    renderServicesStatus(r);
+    say(`Background services: ${mode.replace("_"," & ")}.`);
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function quitShyyctl(){
+  if(!confirm("Quit shyyctl completely? This closes the web UI and every background helper - "+
+              "reopen it from the Start Menu when you need it again.")) return;
+  try{
+    await api("/api/system/quit",{method:"POST"});
+  }catch(e){
+    // The process exiting mid-response can surface here as a fetch
+    // error even though the quit itself worked - not a real failure.
+  }
+  say("shyyctl is shutting down.");
+}
+
+async function setAutostart(enabled){
+  try{
+    const r = await api("/api/system/autostart",{method:"POST",body:JSON.stringify({enabled})});
+    renderAutostart(r);
+    say(enabled ? "Autostart enabled." : "Autostart disabled.");
+  }catch(e){
+    say(e.message,"error");
+    document.getElementById("autostartToggle").checked = !enabled;
+  }
+}
+
+loadSystemInfo();
+setInterval(loadSystemInfo, 30000);
 </script>
 </body>
 </html>

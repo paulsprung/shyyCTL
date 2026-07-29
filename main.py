@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -43,6 +44,7 @@ from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
 from app.panorama import PanoramaError, find_print_panel, find_usb_panel, generate_thumbnail
+from app.procflags import NO_WINDOW
 from app.scan import Scan
 from app import sensors as sensors_mod
 
@@ -507,6 +509,134 @@ def _launch_vendor_sensor_helper() -> bool:
     return True
 
 
+# -- background-services mode control ---------------------------------------
+#
+# Direct user request: with only RGB effects wanted, there's no reason to
+# also keep SensorHelper running (it exists purely for CPU/RAM/mobo
+# temperature, which effects never read); with only fans/curves and the
+# display wanted, there's no reason to keep OpenRGB running (RGB effects are
+# the only thing that talks to it - hub fan control is direct liquidctl,
+# and the Panorama display is direct USB, neither goes through OpenRGB).
+# "Stop everything" additionally needs to actually free the two vendored
+# .exe's, not just stop shyyctl from using them - matches the same
+# uninstall-blocking problem the NSIS uninstaller's taskkill fix addresses,
+# just triggered by hand instead of by the installer.
+#
+# Detection/killing is by process name (tasklist/taskkill), not by tracked
+# PIDs - the elevated launch path (ShellExecuteW "runas", see
+# _launch_vendor_openrgb/_launch_vendor_sensor_helper above) doesn't hand
+# back a PID at all, so this is the only approach that works uniformly
+# regardless of how - or whether shyyctl itself - started the process.
+# Only ever touches shyyctl's own bundled vendor/ copies by construction
+# (start_* below only launches those); a same-named process the user
+# started independently would also be caught by stop_*, which is the
+# expected, documented behaviour of an "OpenRGB off" button, not a bug.
+
+def _process_running(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {name}"],
+            capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW,
+        )
+    except Exception:
+        return False
+    return name.lower() in result.stdout.lower()
+
+
+def _kill_process(name: str) -> None:
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True,
+                        timeout=5, creationflags=NO_WINDOW)
+    except Exception as exc:
+        log.warning("could not stop %s: %s", name, exc)
+
+
+def _stop_openrgb():
+    _kill_process("OpenRGB.exe")
+    openrgb.disconnect()
+
+
+def _stop_sensor_helper():
+    _kill_process("SensorHelper.exe")
+
+
+def _start_openrgb_if_needed():
+    if not _process_running("OpenRGB.exe"):
+        _launch_vendor_openrgb()
+
+
+def _start_sensor_helper_if_needed():
+    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
+    if lhm_url and not _lhm_reachable(lhm_url):
+        _launch_vendor_sensor_helper()
+
+
+_SERVICE_MODES = {
+    # (want OpenRGB running, want SensorHelper running)
+    "all": (True, True),
+    "effects": (True, False),
+    "fans_display": (False, True),
+    "stop": (False, False),
+}
+
+
+def _apply_service_mode(mode: str):
+    want_openrgb, want_sensor_helper = _SERVICE_MODES[mode]
+    if want_openrgb:
+        _start_openrgb_if_needed()
+    else:
+        _stop_openrgb()
+    if want_sensor_helper:
+        _start_sensor_helper_if_needed()
+    else:
+        _stop_sensor_helper()
+
+
+# -- autostart (HKCU Run key) ------------------------------------------------
+#
+# Only meaningful for the installed/frozen build - the installer is what
+# sets this key up in the first place (see tools/build_installer/
+# installer.nsi), and "start shyyctl.exe --background at login" makes no
+# sense pointed at a dev checkout's `python main.py`. Exposed as a toggle
+# here (Settings) rather than only at install time, direct user request:
+# install-time is a one-shot decision, this is one a human may want to
+# flip later without reinstalling.
+
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE = "shyyctl"
+
+
+def _autostart_available() -> bool:
+    return getattr(sys, "frozen", False) and sys.platform == "win32"
+
+
+def _autostart_enabled() -> bool:
+    if not _autostart_available():
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY) as key:
+            winreg.QueryValueEx(key, _AUTOSTART_VALUE)
+            return True
+    except FileNotFoundError:
+        return False
+
+
+def _set_autostart(enabled: bool):
+    if not _autostart_available():
+        raise HTTPException(400, "autostart is only available in the installed build")
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            command = f'"{sys.executable}" --background'
+            winreg.SetValueEx(key, _AUTOSTART_VALUE, 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_VALUE)
+            except FileNotFoundError:
+                pass
+
+
 async def _reapply_rgb_state():
     """Pushes every colour saved by _save_rgb_state_entry back to the
     hardware. Called unconditionally on every launch, same reasoning as
@@ -768,6 +898,85 @@ async def reconnect_all():
         "openrgb": {"connected": openrgb_ok, "error": openrgb.last_error},
         "panorama": {"connected": panel is not None and panel.connected},
     }
+
+
+# -- system control (background services / autostart) ---------------------
+
+class ServiceModeRequest(BaseModel):
+    mode: str
+
+
+@app.get("/api/system/services")
+async def system_services():
+    """Live running state of the two vendored background helpers - not
+    shyyctl's own connection state (openrgb.connected can be false with
+    the process still up, e.g. right after a reconnect failure), the
+    process itself, since that's what the mode buttons below actually
+    start/stop."""
+    return {
+        "openrgb": await asyncio.to_thread(_process_running, "OpenRGB.exe"),
+        "sensor_helper": await asyncio.to_thread(_process_running, "SensorHelper.exe"),
+    }
+
+
+@app.post("/api/system/services")
+async def set_system_services(body: ServiceModeRequest):
+    """Direct user request: rather than a single all-or-nothing toggle,
+    four modes matching what each background helper is actually for -
+    "effects" keeps OpenRGB (RGB effects need it) but drops SensorHelper
+    (effects never read temperature); "fans_display" is the reverse (fan
+    curves need SensorHelper's temperature, but nothing about fan control
+    or the Panorama display goes through OpenRGB); "all" is today's
+    default behaviour; "stop" frees both .exe's entirely, e.g. right
+    before uninstalling by hand rather than trusting the installer's own
+    taskkill step."""
+    if body.mode not in _SERVICE_MODES:
+        raise HTTPException(400, f"unknown mode {body.mode!r} - expected one of {sorted(_SERVICE_MODES)}")
+    await asyncio.to_thread(_apply_service_mode, body.mode)
+    return {
+        "openrgb": await asyncio.to_thread(_process_running, "OpenRGB.exe"),
+        "sensor_helper": await asyncio.to_thread(_process_running, "SensorHelper.exe"),
+    }
+
+
+class AutostartRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/system/autostart")
+async def get_autostart():
+    return {"available": _autostart_available(), "enabled": _autostart_enabled()}
+
+
+@app.post("/api/system/autostart")
+async def set_autostart(body: AutostartRequest):
+    await asyncio.to_thread(_set_autostart, body.enabled)
+    return {"available": _autostart_available(), "enabled": _autostart_enabled()}
+
+
+@app.post("/api/system/quit")
+async def quit_shyyctl():
+    """The "full close" the Stop-services modes above don't cover on
+    their own - shyyctl.exe itself keeps running under all four modes,
+    including "stop" (which only frees OpenRGB/SensorHelper). This is
+    the one control that also ends the web server process, for a human
+    who wants nothing at all left running - most usefully right before
+    an uninstall the installer's own taskkill step (see installer.nsi)
+    would otherwise need to do on their behalf.
+
+    os._exit rather than a graceful uvicorn shutdown: this request's own
+    response has to make it back to the browser first, and any orderly
+    shutdown path here would race the HTTP response against tearing down
+    the very server sending it. A short delay via a background task lets
+    the response flush before the process actually disappears."""
+    await asyncio.to_thread(_apply_service_mode, "stop")
+
+    async def _delayed_exit():
+        await asyncio.sleep(0.5)
+        os._exit(0)
+
+    asyncio.create_task(_delayed_exit())
+    return {"ok": True}
 
 
 # -- fans -----------------------------------------------------------------

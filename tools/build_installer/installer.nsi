@@ -112,7 +112,17 @@ Section "shyyctl" SecMain
 SectionEnd
 
 Function un.onInit
+  ; shyyctl.exe itself, plus the two vendored helper processes it may have
+  ; launched (OpenRGB.exe, SensorHelper.exe - see main.py's
+  ; _launch_vendor_openrgb/_launch_vendor_sensor_helper) - confirmed by
+  ; direct user report that uninstall failed with files still locked when
+  ; only shyyctl.exe was killed here: RMDir /r below needs every .exe
+  ; under $INSTDIR\vendor closed too, not just the main one.
   nsExec::Exec 'taskkill /F /IM shyyctl.exe'
+  Pop $0
+  nsExec::Exec 'taskkill /F /IM OpenRGB.exe'
+  Pop $0
+  nsExec::Exec 'taskkill /F /IM SensorHelper.exe'
   Pop $0
 FunctionEnd
 

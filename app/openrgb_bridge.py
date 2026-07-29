@@ -130,6 +130,20 @@ class OpenRgbBridge:
             self.connected = False
             return self.connect()
 
+    def disconnect(self) -> None:
+        """Drops the SDK connection without reconnecting - used when the
+        OpenRGB process itself is being stopped (see main.py's service-mode
+        control), so this object doesn't keep reporting connected: true
+        against a socket whose other end no longer exists."""
+        with self._lock:
+            if self.client is not None:
+                try:
+                    self.client.disconnect()
+                except Exception:
+                    pass
+            self.client = None
+            self.connected = False
+
     def debug_info(self) -> dict:
         """Raw introspection of the SDK connection itself, not the usual
         cleaned-up device lists - for pinning down exactly which device
