@@ -306,13 +306,26 @@ def build_commit_frame() -> bytes:
 # separate real captures showed happening instead, byte-for-byte identical
 # in structure between them:
 #
-#   f400 announce: {session_id, filename, size}       -> ack (f800)
-#   f401 data:     {session_id, <container bytes>}    -> ack (f801)
+#   f400 announce: {session_id, filename, size}       -> ack (f800, session_id echoed back)
+#   f401 data:     {session_id, <container chunk>}     -> ack (f800 again, per chunk)
 #   f402 finalize: {session_id, "media"}               -> ack (f802)
 #
 # session_id is a fresh small integer per upload (56559 and 176425 in the
 # two captures) - nothing suggests it needs to be anything but different
 # from other in-flight uploads, so a random int is used here.
+#
+# f401 is NOT one message carrying the whole container - confirmed by
+# reassembling a real 55,642,710-byte upload's OUT traffic at the raw USB
+# level: it was sent as 212 separate f401 messages of exactly 262144
+# (256 KiB) raw bytes each, plus one final 68182-byte remainder -
+# 212*262144 + 68182 = 55,642,710 exactly. Each chunk is its own complete
+# TRYX-framed message, individually acked (same f800-shaped ack as the
+# announce, session_id echoed each time) before the next chunk is sent.
+# Sending the entire container as a single f401 (this project's original
+# assumption) works for small files by coincidence - anything under one
+# chunk fits fine - but silently stalls the device for anything larger,
+# matching every large/inconsistent real-hardware upload failure seen
+# this session. See MEDIA_CHUNK_SIZE and upload_media() below.
 #
 # The container bytes (f401's payload) are NOT the original image/gif -
 # confirmed by fully decoding a real one field-by-field:
@@ -338,6 +351,7 @@ def build_commit_frame() -> bytes:
 
 MEDIA_MAGIC = 1297631300
 MEDIA_FPS = 30
+MEDIA_CHUNK_SIZE = 262144  # 256 KiB - the real per-f401-message chunk size, see the comment above
 
 
 def _media_envelope(session_id: int) -> bytes:
@@ -841,27 +855,33 @@ class _PanoramaBase:
             return None
         log.info("upload_media: announce ack = %r (raw=%s)", decode_pb(raw), raw.hex())
 
-        # A tiny control message (announce/finalize) fits well within
-        # self.timeout's 1s default - the data frame carrying the actual
-        # container can be tens of MB, and this project has no confirmed
-        # measurement of how long that genuinely takes to reach and be
-        # received by the device over this connection. A write that gets
-        # cut off before it's actually done, or a read that gives up
-        # before the device has finished receiving tens of MB, both look
-        # identical from here to "something's wrong" - and either was a
-        # real candidate for why a large upload could silently go
-        # nowhere while a small one (well within the old 1s/15s budget)
-        # worked fine. Erring generous (2s/MB, 30s floor) costs nothing
-        # when the transfer is actually fine; it only ever matters when
-        # something is genuinely slow, which is exactly when the old
-        # tight timeouts could have been cutting it off.
-        big_timeout = max(30.0, len(container) / (1024 * 1024) * 2)
-        self._write(build_media_data_frame(session_id, container), timeout_s=big_timeout)
-        raw = self._read_message(max(timeout_s, big_timeout))
-        if not raw:
-            log.warning("upload_media: no response to data frame")
-            return None
-        log.info("upload_media: data ack = %r (raw=%s)", decode_pb(raw), raw.hex())
+        # The container is sent as a sequence of MEDIA_CHUNK_SIZE-byte f401
+        # messages, not one message carrying the whole thing - see the
+        # comment above this class and MEDIA_CHUNK_SIZE's definition for
+        # the real capture evidence (a real 55,642,710-byte upload was
+        # exactly 212 chunks of 262144 bytes plus one 68182-byte
+        # remainder). Sending it all as one oversized f401 - this
+        # project's original assumption - happened to work for anything
+        # under one chunk, and silently stalled the device for anything
+        # bigger, with no distinguishing symptom from here beyond "no
+        # response" once the device gave up waiting for it.
+        num_chunks = -(-len(container) // MEDIA_CHUNK_SIZE)  # ceil division
+        for chunk_i, offset in enumerate(range(0, len(container), MEDIA_CHUNK_SIZE), start=1):
+            chunk = container[offset:offset + MEDIA_CHUNK_SIZE]
+            frame = build_media_data_frame(session_id, chunk)
+            chunk_timeout = max(5.0, len(frame) / (1024 * 1024) * 2)
+            self._write(frame, timeout_s=chunk_timeout)
+            raw = self._read_message(max(timeout_s, chunk_timeout))
+            if not raw:
+                log.warning("upload_media: no response to data chunk %d/%d", chunk_i, num_chunks)
+                return None
+            # Logging every chunk's ack would flood the log for a large
+            # upload (hundreds of chunks) - first, last, and every 25th
+            # is enough to see it's progressing without drowning out
+            # everything else.
+            if chunk_i == 1 or chunk_i == num_chunks or chunk_i % 25 == 0:
+                log.info("upload_media: data chunk %d/%d ack = %r (raw=%s)",
+                         chunk_i, num_chunks, decode_pb(raw), raw.hex())
 
         self._write(build_media_finalize_frame(session_id))
         raw = self._read_message(timeout_s)
