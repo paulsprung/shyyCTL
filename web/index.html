@@ -350,8 +350,16 @@
             <div class="row" id="effectPresetsRow" style="flex-wrap:wrap;gap:6px"></div>
           </div>
 
+          <div class="prop" style="margin-bottom:16px">
+            <label>Shape</label>
+            <div class="seg" id="effectShapeSeg">
+              <button data-v="wave" aria-pressed="true">Wave</button>
+              <button data-v="breathing">Breathing</button>
+            </div>
+          </div>
+
           <div class="effect-grid">
-            <div class="prop"><label>Direction</label>
+            <div class="prop" id="effectDirProp"><label>Direction</label>
               <div class="seg" id="effectDirSeg">
                 <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
                 <button data-v="bottom_to_top">Bottom&uarr;Top</button>
@@ -394,15 +402,6 @@
         </div>
       </section>
 
-      <section>
-        <div class="section-head"><h2>Standalone animation</h2><div class="rule"></div></div>
-        <div class="card">
-          <div class="row">
-            <select id="hubModeSelect"><option>loading&hellip;</option></select>
-            <button class="btn sm" onclick="applyHubMode()">Apply</button>
-          </div>
-        </div>
-      </section>
     </div>
 
     <!-- ================= DISPLAY ================= -->
@@ -1322,6 +1321,7 @@ let effectDirection = "top_to_bottom";
 let effectPalette = "two_color";
 let effectColors = ["#4c79ff", "#ff7a30"];
 let effectMoving = true;
+let effectShape = "wave";
 let previewRaf = null;
 
 /* Named, server-persisted snapshots of the effect controls below
@@ -1359,9 +1359,12 @@ function loadEffectPreset(id){
   effectPalette = p.palette;
   effectColors = p.colors && p.colors.length ? [...p.colors] : ["#4c79ff", "#ff7a30"];
   effectMoving = p.moving;
+  effectShape = p.shape || "wave";
   setPressed("effectDirSeg", effectDirection);
   setPressed("effectPaletteSeg", effectPalette);
   setPressed("effectMovingSeg", effectMoving ? "moving" : "static");
+  setPressed("effectShapeSeg", effectShape);
+  updateEffectShapeUi();
   const periodInput = document.getElementById("effectPeriod");
   if(periodInput) periodInput.value = p.period_s;
   renderEffectColors();
@@ -1383,6 +1386,7 @@ async function saveCurrentAsPreset(){
     colors: effectPalette === "rainbow" ? [] : [...effectColors],
     period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
     moving: effectMoving,
+    shape: effectShape,
   };
   effectPresets.push(preset);
   renderEffectPresets();
@@ -1398,6 +1402,12 @@ async function deleteEffectPreset(id){
 }
 
 function initEffectControls(){
+  document.getElementById("effectShapeSeg").addEventListener("click", e=>{
+    const btn = e.target.closest("button"); if(!btn) return;
+    effectShape = btn.dataset.v;
+    setPressed("effectShapeSeg", effectShape);
+    updateEffectShapeUi();
+  });
   document.getElementById("effectDirSeg").addEventListener("click", e=>{
     const btn = e.target.closest("button"); if(!btn) return;
     effectDirection = btn.dataset.v;
@@ -1412,7 +1422,19 @@ function initEffectControls(){
     effectMoving = btn.dataset.v === "moving";
     setPressed("effectMovingSeg", btn.dataset.v);
   });
+  updateEffectShapeUi();
   renderEffectColors();
+}
+
+function updateEffectShapeUi(){
+  // Direction only means anything for the "wave" shape - "breathing"
+  // shows the same colour on every LED, so greying it out (rather than
+  // hiding it) makes clear it's not being ignored by accident.
+  const dirProp = document.getElementById("effectDirProp");
+  if(!dirProp) return;
+  const isBreathing = effectShape === "breathing";
+  dirProp.style.opacity = isBreathing ? "0.4" : "1";
+  dirProp.style.pointerEvents = isBreathing ? "none" : "auto";
 }
 
 function setPressed(segId, value){
@@ -1495,6 +1517,27 @@ function samplePalette(palette, colors, t, cyclic){
   return [0,1,2].map(k => Math.round(a[k] + (b2[k]-a[k])*w));
 }
 
+function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, moving, cyclic){
+  // Mirrors main.py's _run_position_effect.frame_colors exactly, so
+  // Preview/the synced canvas both show precisely what Apply would put
+  // on real hardware. "breathing": every LED gets the same colour - it
+  // cycles through the palette via phase just like the wave shape's
+  // gradient does, with brightness pulsing through a sine envelope once
+  // per period while moving, or held at full brightness when static
+  // (a frozen mid-pulse brightness would look like an arbitrary dim
+  // colour rather than the effect actually being "off").
+  if(shape === "breathing"){
+    if(moving){
+      const [r,g,b] = samplePalette(palette, colors, phase, true);
+      const brightness = (1 - Math.cos(phase * 2 * Math.PI)) / 2;
+      return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+    }
+    return samplePalette(palette, colors, 0, false);
+  }
+  const pos = positionValue(direction, l, bounds);
+  return samplePalette(palette, colors, pos - phase, cyclic);
+}
+
 function effectBounds(leds){
   const xs = leds.map(l=>l.x), ys = leds.map(l=>l.y);
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
@@ -1521,8 +1564,8 @@ function previewPositionEffect(){
   function frame(now){
     const phase = effectMoving ? ((now - start) / 1000 / period) % 1 : 0;
     for(const l of leds){
-      const pos = positionValue(effectDirection, l, bounds);
-      const [r,g,b] = samplePalette(effectPalette, colors, pos - phase, cyclic);
+      const [r,g,b] = effectFrameColor(effectShape, effectDirection, effectPalette, colors,
+        l, bounds, phase, effectMoving, cyclic);
       const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
       if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
     }
@@ -1548,7 +1591,7 @@ let manualPreviewActive = false;
 function startSyncedPreview(status){
   if(!layoutData) return;
   stopPreview();
-  const {direction, palette, colors: colorsHex, period_s, moving, started_at} = status;
+  const {direction, palette, colors: colorsHex, period_s, moving, shape, started_at} = status;
   const leds = layoutData.leds.filter(l=>{
     const u = layoutData.units.find(x=>x.id===l.unit);
     return u && u.kind !== "display";
@@ -1561,8 +1604,8 @@ function startSyncedPreview(status){
     const elapsed = (Date.now() / 1000) - started_at;
     const phase = moving ? (((elapsed / period_s) % 1) + 1) % 1 : 0;
     for(const l of leds){
-      const pos = positionValue(direction, l, bounds);
-      const [r,g,b] = samplePalette(palette, colors, pos - phase, cyclic);
+      const [r,g,b] = effectFrameColor(shape || "wave", direction, palette, colors,
+        l, bounds, phase, moving, cyclic);
       const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
       if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
     }
@@ -1585,6 +1628,7 @@ async function applyPositionEffect(){
       colors: effectPalette === "rainbow" ? [] : effectColors,
       period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
       moving: effectMoving,
+      shape: effectShape,
     })});
     say("Effect applied to the PC.");
     pollEffectStatus();
@@ -1606,30 +1650,6 @@ async function pollEffectStatus(){
     else if(!s.running && !manualPreviewActive) stopPreview();
     setTimeout(pollEffectStatus, s.running ? 2000 : 5000);
   }catch(e){ setTimeout(pollEffectStatus, 5000); }
-}
-
-async function loadHubModes(){
-  const select = document.getElementById("hubModeSelect");
-  if(!select) return;
-  try{
-    const devices = await api("/api/rgb/devices");
-    const hub = devices.find(d=>d.name && d.name.includes("NZXT"));
-    if(!hub || !hub.modes || !hub.modes.length){
-      select.innerHTML = `<option>no hub device found</option>`;
-      return;
-    }
-    select.innerHTML = hub.modes.map(m=>`<option>${m}</option>`).join("");
-  }catch(e){
-    select.innerHTML = `<option>unavailable</option>`;
-  }
-}
-async function applyHubMode(){
-  const name = document.getElementById("hubModeSelect").value;
-  try{
-    await api("/api/rgb/hub/mode",{method:"POST",body:JSON.stringify({name})});
-    say(`Hub mode set to ${name}.`);
-    pollEffectStatus();
-  }catch(e){ say(e.message,"error"); }
 }
 
 /* ---------- display (panorama) ---------- */
@@ -2183,7 +2203,6 @@ async function refresh(){
   pollCurveStatus();
   initEffectControls();
   try{ await loadEffectPresets(); renderEffectPresets(); }catch(e){}
-  loadHubModes();
   pollEffectStatus();
   loadRgbDump();
   checkConflicts();

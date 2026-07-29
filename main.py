@@ -1207,46 +1207,15 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
     return {"ok": True}
 
 
-class HubModeRequest(BaseModel):
-    name: str
-
-
-@app.post("/api/rgb/hub/mode")
-async def set_hub_mode(body: HubModeRequest):
-    """Selects one of the hub's own native firmware modes (Static, Direct,
-    Fading, Spectrum Cycle, Rainbow Wave, etc - whatever ctrl.modes lists,
-    read straight off the hub itself and surfaced via /api/rgb/devices'
-    merged hub entry) - the 'standalone animation' tier of the Advanced RGB
-    view: rainbow-style effects the hub's own IC drives on its own,
-    distinct from the position-aware wave effect below, which is
-    host-driven and needs shyyctl running continuously. Stops that wave
-    effect first if one is active, so the two don't fight over the zone's
-    active mode."""
-    await _stop_effect()
-    _clear_effect_state()
-
-    def _do():
-        with _open_hub_raw() as raw:
-            ctrl = raw.find_controller("NZXT")
-            if ctrl is None:
-                return "no_device"
-            if not raw.select_mode(ctrl, body.name):
-                return f"no mode named '{body.name}' on {ctrl.name}"
-            return None
-
-    try:
-        error = await asyncio.to_thread(_do)
-    except Exception as exc:
-        raise HTTPException(503, f"OpenRGB not connected: {exc}")
-    if error == "no_device":
-        raise HTTPException(404, "no hub RGB device found")
-    if error:
-        raise HTTPException(400, error)
-    return {"ok": True}
-
-
 DIRECTIONS = ("top_to_bottom", "bottom_to_top", "left_to_right", "right_to_left", "outward", "inward")
 PALETTES = ("solid", "two_color", "multicolor", "rainbow")
+# "wave" is the original behaviour (colour sampled by each LED's own
+# position along `direction`, unchanged). "breathing" is a new shape
+# added alongside removing the broken standalone hub-mode feature - one
+# uniform colour across every driven LED, with `moving` now controlling
+# brightness pulsing (sine 0..1..0) instead of a travelling gradient;
+# `direction` is meaningless for it and ignored.
+SHAPES = ("wave", "breathing")
 
 
 def _resolve_effect_targets():
@@ -1359,7 +1328,7 @@ def _sample_palette(palette: str, colors: list[tuple], t: float, cyclic: bool) -
 
 
 def _run_position_effect(direction: str, palette: str, colors: list[tuple],
-                         period_s: float, moving: bool):
+                         period_s: float, moving: bool, shape: str = "wave"):
     """Runs until _effect_stop is set, on its own worker thread (via
     asyncio.to_thread) - one raw hub connection held for the whole effect
     rather than reopened per frame (see openrgb_raw.py's docstring on
@@ -1370,6 +1339,18 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     - a single generalised effect covering directional wipes, radial
     in/out, solid colour, multi-stop gradients and a moving rainbow,
     rather than one hardcoded top-to-bottom two-colour wave.
+
+    shape="breathing" is a second effect added alongside removing the
+    broken standalone hub-mode feature: every driven LED shows the same
+    colour (direction/position is meaningless here, so it's ignored) -
+    while moving, that colour cycles through the palette exactly like
+    the wave shape's gradient does (phase drives _sample_palette the
+    same way), and brightness pulses through one full sine envelope per
+    period_s, in sync with that same phase - a classic "breathe" rather
+    than a travelling wipe. Static (moving=False) breathing shows a
+    fixed full-brightness colour rather than freezing mid-pulse, which
+    would otherwise land on an arbitrary (possibly near-zero)
+    brightness depending on where the phase happened to stop.
 
     A non-moving (static) effect still runs this same loop rather than
     writing once and exiting - phase just never advances - so Stop keeps
@@ -1404,6 +1385,14 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
 
     def frame_colors(u):
         unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
+        if shape == "breathing":
+            if moving:
+                color = _sample_palette(palette, colors, phase[0], True)
+                brightness = (1 - math.cos(phase[0] * 2 * math.pi)) / 2
+                final = tuple(round(c * brightness) for c in color)
+            else:
+                final = _sample_palette(palette, colors, 0.0, False)
+            return unit_leds, [final] * len(unit_leds)
         return unit_leds, [
             _sample_palette(palette, colors,
                             _position_value(direction, led, bounds) - phase[0], cyclic)
@@ -1559,6 +1548,7 @@ class PositionEffectRequest(BaseModel):
     colors: list[str] = ["#4c79ff", "#ff7a30"]
     period_s: float = 4.0
     moving: bool = True
+    shape: str = "wave"
 
 
 async def _do_start_position_effect(body: PositionEffectRequest, persist: bool = True):
@@ -1575,6 +1565,8 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
         raise HTTPException(400, f"unknown direction {body.direction!r} - must be one of {DIRECTIONS}")
     if body.palette not in PALETTES:
         raise HTTPException(400, f"unknown palette {body.palette!r} - must be one of {PALETTES}")
+    if body.shape not in SHAPES:
+        raise HTTPException(400, f"unknown shape {body.shape!r} - must be one of {SHAPES}")
     rgb_colors = [_hex_to_rgb(c) for c in body.colors] or [(255, 255, 255)]
     period_s = max(body.period_s, 0.5)
     await _stop_effect()
@@ -1588,11 +1580,11 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
     _effect_status = {
         "running": True, "kind": "position", "direction": body.direction,
         "palette": body.palette, "colors": body.colors, "period_s": period_s,
-        "moving": body.moving, "started_at": time.time(), "error": None,
+        "moving": body.moving, "shape": body.shape, "started_at": time.time(), "error": None,
     }
     _effect_task = asyncio.create_task(
         asyncio.to_thread(_run_position_effect, body.direction, body.palette,
-                          rgb_colors, period_s, body.moving))
+                          rgb_colors, period_s, body.moving, body.shape))
     if persist:
         _save_effect_state(body)
 
@@ -1625,6 +1617,7 @@ class EffectPreset(BaseModel):
     colors: list[str] = ["#4c79ff", "#ff7a30"]
     period_s: float = 4.0
     moving: bool = True
+    shape: str = "wave"
 
 
 class EffectPresetsRequest(BaseModel):
