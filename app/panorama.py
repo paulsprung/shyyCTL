@@ -4,8 +4,18 @@ The real wire protocol, confirmed against a genuine KANALI session this
 project captured (Wireshark + USBPcap, decoded byte-for-byte, correlated
 against a precise documented action timeline - not reverse-engineered by
 guesswork): b"TRYX" + a 4-byte little-endian length + a real Protocol
-Buffers message, on host->device (OUT) frames. Device->host (IN) replies
-skip the "TRYX" prefix entirely and are raw protobuf directly.
+Buffers message, on both host->device (OUT) frames AND device->host (IN)
+replies. An earlier version of this docstring claimed IN replies skip
+the "TRYX" prefix and are raw protobuf directly - that was wrong, and
+came from reading the two halves of a reply as if they were one message.
+Directly decoding two independent real USBPcap captures at the
+USB-transaction level shows every single device reply (245/245 and
+13/13 across the two captures) is sent as two separate low-level
+bulk-IN transfers: the 8-byte "TRYX"+length header, then the raw
+protobuf body as its own transfer immediately after. See
+_PanoramaBase._read_message in the transport classes below, which
+reassembles the two before stripping the header - a single OS-level
+read (_read_chunk) is NOT guaranteed to contain a whole reply.
 
 This supersedes an earlier version of this file that ported
 github.com/fadli0029/reed-tpse's JSON-over-0x5A-frames protocol - that
@@ -553,10 +563,62 @@ class _PanoramaBase:
         timeout for that one write instead of reusing the tiny default."""
         raise NotImplementedError
 
-    def _read_message(self, timeout_s: float) -> bytes:
-        """One read attempt; returns whatever came back (already a
-        complete protobuf message) or b'' on timeout/nothing."""
+    def _read_chunk(self, timeout_s: float) -> bytes:
+        """One raw OS-level read attempt (one ReadFile call / one bulk-IN
+        transfer). Returns whatever the device has sent so far - NOT
+        reliably one complete reply, see _read_message below - or b''
+        on timeout/nothing."""
         raise NotImplementedError
+
+    def _read_message(self, timeout_s: float) -> bytes:
+        """Reassembles one full reply out of _read_chunk calls and
+        strips its TRYX framing, returning just the raw protobuf body.
+
+        Confirmed by directly decoding two independent real USBPcap
+        captures at the USB-transaction level (not just this app's own
+        read() calls): every single device reply - 245/245 in one
+        capture, 13/13 in the other, zero exceptions - is sent as TWO
+        separate low-level bulk-IN transfers, an 8-byte "TRYX"+u32-LE
+        length header first, then the raw protobuf body as its own
+        transfer immediately after (microseconds apart). Device replies
+        are NOT unframed the way the earlier version of this method
+        assumed ("confirmed against real captured traffic that a single
+        read already carries exactly one complete protobuf reply") -
+        that assumption only held when timing happened to let the OS/
+        driver coalesce both transfers into a single _read_chunk call.
+        Whenever it didn't, _read_chunk returned just the bare 8-byte
+        header as if it were a whole reply, leaving the real body
+        sitting unread in the pipe for whatever unrelated later read
+        happened to consume it next - the exact, direct cause of every
+        "stray TRYX-prefixed garbage" and misplaced ping-pong reply seen
+        in real upload logs this session, and almost certainly of the
+        inconsistent (sometimes-black-screen) upload behaviour itself:
+        with the real per-step ack silently misrouted, the code had no
+        genuine signal of whether announce/data/finalize actually
+        succeeded."""
+        first = self._read_chunk(timeout_s)
+        if not first:
+            return b""
+        if first[:4] != b"TRYX" or len(first) < 8:
+            # Not a framed header - either an already-coalesced body from
+            # a path that doesn't apply here, or corrupt/unexpected data.
+            # Returning it as-is matches the old behaviour rather than
+            # silently dropping something a caller might still be able
+            # to use.
+            return first
+        length = int.from_bytes(first[4:8], "little")
+        body = bytearray(first[8:])
+        # The real capture shows the body transfer following the header
+        # by microseconds, never longer - a short fixed timeout per
+        # continuation read is plenty and avoids a slow, indefinite wait
+        # if the device only ever sends the header (e.g. a genuinely
+        # truncated/corrupt reply).
+        while len(body) < length:
+            more = self._read_chunk(min(timeout_s, 1.0))
+            if not more:
+                break
+            body.extend(more)
+        return bytes(body[:length])
 
     def read_message(self, timeout_s: float = 2.0) -> list | None:
         raw = self._read_message(timeout_s)
@@ -1037,10 +1099,11 @@ class PanoramaUSB(_PanoramaBase):
         t = self.timeout if timeout_s is None else timeout_s
         self.ep_out.write(frame, timeout=max(int(t * 1000), 1000))
 
-    def _read_message(self, timeout_s: float) -> bytes:
-        """One bulk-IN read. Confirmed against real captured traffic that a
-        single USB bulk transfer already carries exactly one complete
-        protobuf reply - no framing marker needed to know where it ends."""
+    def _read_chunk(self, timeout_s: float) -> bytes:
+        """One bulk-IN read - whatever the device has sent so far, which
+        is NOT reliably one complete reply (see
+        _PanoramaBase._read_message, which reassembles the real
+        TRYX-framed message this returns fragments of)."""
         import usb.core
         # Confirmed real replies as large as ~10.7KB in captured traffic
         # (media metadata) - the buffer must cover the whole message, not
@@ -1358,11 +1421,12 @@ class PanoramaPrint(_PanoramaBase):
         if transferred != len(frame):
             raise PanoramaError(f"WriteFile only sent {transferred}/{len(frame)} bytes")
 
-    def _read_message(self, timeout_s: float) -> bytes:
-        """One ReadFile. Confirmed against real captured traffic that a
-        single read already carries exactly one complete protobuf reply -
-        no framing marker needed to know where it ends. Buffer sized well
-        above the largest real reply seen (~10.7KB, media metadata)."""
+    def _read_chunk(self, timeout_s: float) -> bytes:
+        """One ReadFile - whatever the device has sent so far, which is
+        NOT reliably one complete reply (see _PanoramaBase._read_message,
+        which reassembles the real TRYX-framed message this returns
+        fragments of). Buffer sized well above the largest real reply
+        seen (~10.7KB, media metadata)."""
         chunk = ctypes.create_string_buffer(32768)
         transferred = self._overlapped_call(self._kernel32.ReadFile, chunk, 32768, timeout_s)
         return chunk.raw[:transferred] if transferred else b""
