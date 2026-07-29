@@ -862,7 +862,7 @@ async def _curve_loop():
         if hub.connected:
             sensors_cfg = CONFIG.get("sensors", {})
             cpu_t = await asyncio.to_thread(
-                sensors_mod.cpu_temp,
+                sensors_mod.lhm_temp,
                 sensors_cfg.get("librehardwaremonitor_url", ""),
                 sensors_cfg.get("cpu_sensor_match", "CPU Package"),
             )
