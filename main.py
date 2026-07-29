@@ -52,6 +52,7 @@ LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
 EFFECT_STATE_FILE = ROOT / "effect_state.json"
 RGB_STATE_FILE = ROOT / "rgb_state.json"
+EFFECT_PRESETS_FILE = ROOT / "effect_presets.json"
 GALLERY_DIR = ROOT / "media_gallery"
 GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
@@ -1437,6 +1438,44 @@ async def stop_effect_endpoint():
 @app.get("/api/rgb/effects/status")
 async def effect_status():
     return _effect_status
+
+
+class EffectPreset(BaseModel):
+    id: str
+    name: str
+    direction: str = "top_to_bottom"
+    palette: str = "two_color"
+    colors: list[str] = ["#4c79ff", "#ff7a30"]
+    period_s: float = 4.0
+    moving: bool = True
+
+
+class EffectPresetsRequest(BaseModel):
+    presets: list[EffectPreset]
+
+
+@app.get("/api/rgb/effects/presets")
+async def get_effect_presets():
+    """Saved position-effect configs (direction/palette/colours/speed) a
+    human can name and recall instead of re-entering the same settings
+    every time - same whole-list GET/POST shape as /api/curve, so the
+    frontend can add/rename/delete locally and just POST the resulting
+    array back, same as renameCurve/deleteCurve already do for curves."""
+    if EFFECT_PRESETS_FILE.is_file():
+        try:
+            data = json.loads(EFFECT_PRESETS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data.get("presets"), list):
+                return data
+        except Exception:
+            pass
+    return {"presets": []}
+
+
+@app.post("/api/rgb/effects/presets")
+async def set_effect_presets(body: EffectPresetsRequest):
+    EFFECT_PRESETS_FILE.write_text(
+        json.dumps({"presets": [p.model_dump() for p in body.presets]}), encoding="utf-8")
+    return {"ok": True}
 
 
 # -- hardware discovery scan -------------------------------------------

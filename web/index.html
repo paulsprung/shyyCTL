@@ -170,6 +170,14 @@
   .rgb-card input[type=color]{width:52px;height:38px}
   .rgb-card .row{flex-wrap:wrap}
 
+  .effect-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  .preset-chip{display:inline-flex;align-items:center;gap:7px;padding:6px 8px 6px 12px;border-radius:20px;
+    background:var(--panel-2);border:1px solid var(--rule);font-size:11.5px;cursor:pointer;color:var(--ink)}
+  .preset-chip:hover{border-color:var(--accent)}
+  .preset-chip button{background:none;border:none;color:var(--ink-soft);cursor:pointer;font-size:13px;
+    padding:2px 4px;line-height:1}
+  .preset-chip button:hover{color:var(--warn)}
+
   .subnav{display:flex;gap:2px;background:var(--panel-2);border-radius:9px;padding:3px;margin-bottom:20px;
     width:fit-content}
   .subnav button{padding:8px 16px;background:none;border:none;border-radius:7px;color:var(--ink-soft);
@@ -337,23 +345,30 @@
         <div class="section-head"><h2>Effect</h2><div class="rule"></div>
           <span class="note" id="effectStatusNote"></span></div>
         <div class="card">
-          <div class="prop"><label>Direction</label>
-            <div class="seg" id="effectDirSeg">
-              <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
-              <button data-v="bottom_to_top">Bottom&uarr;Top</button>
-              <button data-v="left_to_right">Left&rarr;Right</button>
-              <button data-v="right_to_left">Right&larr;Left</button>
-              <button data-v="outward">In&rarr;Out</button>
-              <button data-v="inward">Out&rarr;In</button>
-            </div>
+          <div class="prop" style="margin-bottom:16px">
+            <label>Presets</label>
+            <div class="row" id="effectPresetsRow" style="flex-wrap:wrap;gap:6px"></div>
           </div>
 
-          <div class="prop"><label>Palette</label>
-            <div class="seg" id="effectPaletteSeg">
-              <button data-v="solid">Solid</button>
-              <button data-v="two_color" aria-pressed="true">Two-colour</button>
-              <button data-v="multicolor">Multicolour</button>
-              <button data-v="rainbow">Rainbow</button>
+          <div class="effect-grid">
+            <div class="prop"><label>Direction</label>
+              <div class="seg" id="effectDirSeg">
+                <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
+                <button data-v="bottom_to_top">Bottom&uarr;Top</button>
+                <button data-v="left_to_right">Left&rarr;Right</button>
+                <button data-v="right_to_left">Right&larr;Left</button>
+                <button data-v="outward">In&rarr;Out</button>
+                <button data-v="inward">Out&rarr;In</button>
+              </div>
+            </div>
+
+            <div class="prop"><label>Palette</label>
+              <div class="seg" id="effectPaletteSeg">
+                <button data-v="solid">Solid</button>
+                <button data-v="two_color" aria-pressed="true">Two-colour</button>
+                <button data-v="multicolor">Multicolour</button>
+                <button data-v="rainbow">Rainbow</button>
+              </div>
             </div>
           </div>
 
@@ -361,19 +376,20 @@
             <div class="row" id="effectColorsRow" style="flex-wrap:wrap"></div>
           </div>
 
-          <div class="row" style="margin-top:4px">
+          <div class="effect-grid" style="align-items:end;margin-bottom:0">
             <label class="inline">speed <input type="number" id="effectPeriod" value="4" min="0.5"
               step="0.5" style="width:64px"> s</label>
-            <div class="seg" id="effectMovingSeg" style="width:160px">
+            <div class="seg" id="effectMovingSeg">
               <button data-v="moving" aria-pressed="true">Moving</button>
               <button data-v="static">Static</button>
             </div>
           </div>
 
-          <div class="row" style="margin-top:12px">
+          <div class="row" style="margin-top:14px">
             <button class="btn sec sm" onclick="previewPositionEffect()">Preview</button>
             <button class="btn sm" onclick="applyPositionEffect()">Apply to PC</button>
             <button class="btn sec sm" onclick="stopEffect()">Stop</button>
+            <button class="btn sec sm" onclick="saveCurrentAsPreset()">Save as preset</button>
           </div>
         </div>
       </section>
@@ -1287,6 +1303,79 @@ let effectColors = ["#4c79ff", "#ff7a30"];
 let effectMoving = true;
 let previewRaf = null;
 
+/* Named, server-persisted snapshots of the effect controls below
+   (direction/palette/colours/speed/moving) - same whole-list GET/POST
+   shape as /api/curve (see main.py's get_effect_presets), so saving,
+   renaming-by-delete-and-resave, and deleting all just mutate this local
+   array and push the whole thing back. Loading a preset only fills in
+   the controls above - it doesn't apply or even preview by itself, so
+   trying one out is just as safe as changing any control by hand. */
+let effectPresets = [];
+
+async function loadEffectPresets(){
+  try{ effectPresets = (await api("/api/rgb/effects/presets")).presets || []; }
+  catch(e){ effectPresets = []; }
+}
+
+function renderEffectPresets(){
+  const box = document.getElementById("effectPresetsRow");
+  if(!box) return;
+  if(!effectPresets.length){
+    box.innerHTML = `<span class="note">no presets saved yet - set up an effect below and click "Save as preset"</span>`;
+    return;
+  }
+  box.innerHTML = effectPresets.map(p=>`
+    <span class="preset-chip" onclick="loadEffectPreset('${p.id}')">
+      ${p.name}
+      <button onclick="event.stopPropagation(); deleteEffectPreset('${p.id}')" title="Delete preset">&times;</button>
+    </span>`).join("");
+}
+
+function loadEffectPreset(id){
+  const p = effectPresets.find(x=>x.id===id);
+  if(!p) return;
+  effectDirection = p.direction;
+  effectPalette = p.palette;
+  effectColors = p.colors && p.colors.length ? [...p.colors] : ["#4c79ff", "#ff7a30"];
+  effectMoving = p.moving;
+  setPressed("effectDirSeg", effectDirection);
+  setPressed("effectPaletteSeg", effectPalette);
+  setPressed("effectMovingSeg", effectMoving ? "moving" : "static");
+  const periodInput = document.getElementById("effectPeriod");
+  if(periodInput) periodInput.value = p.period_s;
+  renderEffectColors();
+  say(`Loaded preset "${p.name}" - Preview or Apply to use it.`);
+}
+
+async function saveEffectPresetList(){
+  await api("/api/rgb/effects/presets",{method:"POST",body:JSON.stringify({presets:effectPresets})});
+}
+
+async function saveCurrentAsPreset(){
+  const name = prompt("Name this preset:");
+  if(!name) return;
+  const preset = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    direction: effectDirection,
+    palette: effectPalette,
+    colors: effectPalette === "rainbow" ? [] : [...effectColors],
+    period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
+    moving: effectMoving,
+  };
+  effectPresets.push(preset);
+  renderEffectPresets();
+  try{ await saveEffectPresetList(); say(`Preset "${name}" saved.`); }
+  catch(e){ say(e.message,"error"); }
+}
+
+async function deleteEffectPreset(id){
+  effectPresets = effectPresets.filter(p=>p.id!==id);
+  renderEffectPresets();
+  try{ await saveEffectPresetList(); }
+  catch(e){ say(e.message,"error"); }
+}
+
 function initEffectControls(){
   document.getElementById("effectDirSeg").addEventListener("click", e=>{
     const btn = e.target.closest("button"); if(!btn) return;
@@ -2072,6 +2161,7 @@ async function refresh(){
   try{ await loadCurve(); renderCurveList(); renderFans(); }catch(e){}
   pollCurveStatus();
   initEffectControls();
+  try{ await loadEffectPresets(); renderEffectPresets(); }catch(e){}
   loadHubModes();
   pollEffectStatus();
   loadRgbDump();
