@@ -40,7 +40,7 @@ from app.hub import Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
-from app.panorama import find_print_panel, find_usb_panel, generate_thumbnail
+from app.panorama import PanoramaError, find_print_panel, find_usb_panel, generate_thumbnail
 from app.scan import Scan
 from app import sensors as sensors_mod
 
@@ -228,12 +228,26 @@ async def _keepalive_loop():
     request's real reply looking like it never arrived - confirmed as the
     actual cause of /api/panorama/status intermittently coming back with
     empty device info despite a healthy connection."""
+    global _panorama
     while True:
         try:
             panel = _panorama
             if panel is not None and panel.connected:
                 async with _panorama_lock:
                     await asyncio.to_thread(panel.ping)
+        except PanoramaError as exc:
+            # A real protocol-level failure (not just "nothing plugged in
+            # yet") - most likely something else (KANALI) grabbed the
+            # device out from under this already-open handle. connected
+            # (app/panorama.py) is only a Python-side flag, never a live
+            # check, so it would otherwise stay True forever and every
+            # future request would keep reusing and re-breaking the same
+            # handle. Dropping it here means the next real request's own
+            # get_panorama() call attempts a fresh reconnect within
+            # ~2s of the failure, instead of only discovering it's dead
+            # when a human-facing request crashes on it.
+            log.debug("panorama keepalive ping failed, dropping the cached connection: %s", exc)
+            _panorama = None
         except Exception as exc:
             log.debug("panorama keepalive ping failed: %s", exc)
         await asyncio.sleep(2)
@@ -1401,6 +1415,31 @@ async def identify_unit(unit_id: str):
 
 # -- panorama display -----------------------------------------------------
 
+async def _call_panel(fn, *args):
+    """Runs a blocking panel.<method> call in a thread and treats a write/
+    read failure on the underlying handle as "this connection is dead"
+    rather than an unhandled 500. panel.connected (app/panorama.py) is
+    only a Python-side flag (self._handle is not None), never a live
+    check - it stays True even after another program grabs the device
+    out from under an already-open handle (KANALI is the documented real
+    case - see PanoramaPrint.connect()'s own comment). Confirmed against
+    a real crash: the very first write of an upload (the small announce
+    frame, not the payload) failed with gle=5 (ACCESS_DENIED) on a handle
+    every earlier call in the same session had used successfully.
+    Dropping the cached _panorama here means the *next* call goes through
+    get_panorama()'s normal reconnect path instead of reusing the same
+    broken handle and crashing identically every time until the whole
+    server restarts."""
+    global _panorama
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except PanoramaError as exc:
+        log.warning("panel command failed, dropping the cached connection: %s", exc)
+        _panorama = None
+        raise HTTPException(503, f"lost the panel connection mid-command ({exc}) - "
+                                  "another program (KANALI?) may have grabbed it; try again")
+
+
 @app.get("/api/panorama/status")
 async def panorama_status():
     """Returns the info handshaked once when this connection was
@@ -1431,7 +1470,7 @@ async def panorama_media():
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
     async with _panorama_lock:
-        return await asyncio.to_thread(panel.list_media)
+        return await _call_panel(panel.list_media)
 
 
 class BrightnessRequest(BaseModel):
@@ -1444,7 +1483,7 @@ async def panorama_brightness(body: BrightnessRequest):
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
     async with _panorama_lock:
-        ok = await asyncio.to_thread(panel.set_brightness, body.value)
+        ok = await _call_panel(panel.set_brightness, body.value)
     if ok:
         _save_panorama_state(panel.last_media, panel.last_brightness)
     return {"ok": ok}
@@ -1507,13 +1546,13 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
     async with _panorama_lock:
-        remote_name = await asyncio.to_thread(panel.upload_media, str(original))
+        remote_name = await _call_panel(panel.upload_media, str(original))
         if remote_name is None:
             raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
         if as_boot:
-            ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
+            ok = await _call_panel(panel.set_boot_media, remote_name)
         else:
-            ok = await asyncio.to_thread(panel.set_media, remote_name)
+            ok = await _call_panel(panel.set_media, remote_name)
             if ok:
                 _save_panorama_state(panel.last_media, panel.last_brightness)
     return {"filename": remote_name, "applied": ok}
