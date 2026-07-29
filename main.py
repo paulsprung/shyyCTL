@@ -456,6 +456,31 @@ async def _reapply_hub_rgb_state_delayed():
         await _reapply_rgb_state()
 
 
+async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
+    """Waits for the startup quick-scan to actually finish before
+    resuming a saved position effect, instead of starting it right
+    alongside the scan. _run_position_effect silently skips every fan
+    channel whose hub zone isn't sized yet (0 LEDs, see its own loop) -
+    confirmed as a real, visible symptom: on restart, RAM/motherboard
+    animated immediately but every fan sat out the first several seconds
+    of a resumed effect while the scan was still resizing their zones.
+
+    Polls scan.running rather than blocking the whole lifespan/server
+    startup on it - the web UI should stay usable immediately even if
+    the scan takes a while, this is just about not racing the effect
+    against it. Capped at ~30s in case the scan never finishes (nothing
+    to scan, or something's genuinely stuck) - the effect still starts
+    at the cap either way rather than never running at all."""
+    for _ in range(150):
+        if not scan.running:
+            break
+        await asyncio.sleep(0.2)
+    try:
+        await _do_start_position_effect(saved_effect, persist=False)
+    except Exception as exc:
+        log.warning("Could not resume saved effect: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _keepalive_task, _curve_task
@@ -510,13 +535,13 @@ async def lifespan(app: FastAPI):
     # this does. persist=False - don't touch the saved file just for
     # replaying it, and don't wipe it if this particular attempt fails
     # (a device that isn't connected *yet* this early shouldn't cost a
-    # human their saved effect for every future launch).
+    # human their saved effect for every future launch). Runs as a
+    # background task (see _resume_effect_after_scan) so it can wait for
+    # the quick-scan above to actually finish sizing the hub's zones
+    # first, without delaying server startup itself.
     saved_effect = _load_effect_state()
     if saved_effect is not None:
-        try:
-            await _do_start_position_effect(saved_effect, persist=False)
-        except Exception as exc:
-            log.warning("Could not resume saved effect: %s", exc)
+        asyncio.create_task(_resume_effect_after_scan(saved_effect))
 
     if CONFIG.get("server", {}).get("open_browser"):
         url = f"http://{CONFIG['server']['host']}:{CONFIG['server']['port']}"
