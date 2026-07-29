@@ -1,4 +1,4 @@
-"""Tryx Panorama display - USB control channel + ADB for media.
+"""Tryx Panorama display - one USB control channel for everything.
 
 The real wire protocol, confirmed against a genuine KANALI session this
 project captured (Wireshark + USBPcap, decoded byte-for-byte, correlated
@@ -30,7 +30,8 @@ public):
         file already on the device (both user-uploaded and built-in
         defaults), each named "<original filename>.h264_<W>x<H>" - the
         device transcodes everything (including plain images) to H.264
-        video internally after an ADB push completes.
+        video internally after upload_media() below finishes (see f400/
+        f401/f402 further down).
     f10 ("hello?") -> f10 ("Hey!") - lightweight periodic keepalive,
         confirmed sent roughly every 2-4s during an active KANALI session.
     f200 (screen config: poweron media, standby media, active media,
@@ -43,14 +44,19 @@ public):
         when 0, since protobuf skips default/zero values - confirmed by
         directly diffing a 0% and a 100% capture, byte for byte.
 
-Two separate channels, confirmed from reed-tpse's own README (still true
-for this hardware, this part isn't protocol-specific):
-- The USB control channel above - handshake, brightness, screen config.
-- ADB (adb.exe on Windows, must be on PATH): file transfer only, media is
-  pushed to /sdcard/pcMedia/ on the panel's own (Android-based) storage,
-  then transcoded internally before it can be referenced in a screen
-  config message - see MEDIA_SUFFIX below. liquidctl/OpenRGB are never
-  involved here - this is a third, independent control surface.
+Media transfer is NOT ADB, despite an earlier version of this project
+assuming it would be (ported from reed-tpse's approach, which used ADB
+push against a different Panorama variant): `adb devices` sees nothing
+for this panel at all, confirmed directly. Real uploads go over the exact
+same usbprint.sys connection as everything else above, via a separate
+confirmed three-message exchange (f400 announce/f401 data/f402 finalize -
+see upload_media() and the section docstring near those builders further
+down). The Media class and MEDIA_PATH near the bottom of this file are
+what's left of that disproven ADB theory - kept only because
+tools/test_panorama.py still has an (unused-by-anything-real) menu option
+for it, not because anything here still relies on it. liquidctl/OpenRGB
+are never involved with this panel either way - it's a fully independent
+control surface from the fan/RGB side of this project.
 """
 
 import ctypes
