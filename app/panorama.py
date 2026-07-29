@@ -544,7 +544,13 @@ class _PanoramaBase:
     def disconnect(self):
         raise NotImplementedError
 
-    def _write(self, frame: bytes):
+    def _write(self, frame: bytes, timeout_s: float | None = None):
+        """timeout_s overrides self.timeout for this one call - every
+        write used the same fixed 1s default regardless of frame size
+        until this was added, which is fine for a tiny control message
+        but was never a safe assumption for the media data frame, which
+        can be tens of MB. upload_media() below now passes a size-scaled
+        timeout for that one write instead of reusing the tiny default."""
         raise NotImplementedError
 
     def _read_message(self, timeout_s: float) -> bytes:
@@ -567,27 +573,33 @@ class _PanoramaBase:
             out.append(entries)
         return out
 
-    def _drain_stray_reply(self, timeout_s: float = 0.3):
-        """One short, low-timeout read that discards whatever comes back -
-        called right before starting a multi-step exchange (currently
-        just upload_media's announce/data/finalize sequence below).
+    def _drain_stray_reply(self, timeout_s: float = 0.3, max_reads: int = 5):
+        """Short, low-timeout reads that discard whatever comes back, in a
+        loop rather than just once - called right before starting a
+        multi-step exchange (currently just upload_media's announce/data/
+        finalize sequence below).
 
-        Confirmed necessary against two real uploads: the keepalive
-        loop's periodic ping (main.py's _keepalive_loop) can have its own
-        write already in flight when a slower operation starts, and if
-        the device's "Hey!" reply for that ping arrives a moment late -
-        after our own ping() call already gave up waiting for it - it
-        sits there for whatever the NEXT read happens to be, regardless
-        of which logical step issued it. Confirmed directly: two separate
-        real upload attempts each showed the ping's literal "Hey!" reply
-        content displacing a different one of the three real acks
-        (announce ack the first time, data ack the second) - not a fixed
-        position, exactly what a stray leftover reply landing wherever
-        the timing happens to put it would look like. A short timeout
-        here is deliberate - if nothing stray is pending, this should
-        return almost immediately empty-handed."""
-        raw = self._read_message(timeout_s)
-        if raw:
+        Confirmed necessary against real uploads: the keepalive loop's
+        periodic ping (main.py's _keepalive_loop) can have its own write
+        already in flight when a slower operation starts, and if the
+        device's "Hey!" reply for that ping arrives a moment late - after
+        our own ping() call already gave up waiting for it - it sits
+        there for whatever the NEXT read happens to be, regardless of
+        which logical step issued it. Confirmed directly across three
+        separate real upload attempts, each showing a different one of
+        the announce/data/finalize acks displaced by something that
+        wasn't a real ack for that step - not a fixed position, exactly
+        what stray leftover replies landing wherever timing puts them
+        would look like. One drain wasn't always enough on its own (a
+        large, slow transfer gives more opportunity for more than one
+        stray reply to pile up before this runs) - looping with a small
+        safety cap means a real backlog gets fully cleared, while a
+        genuinely idle connection still returns almost immediately after
+        the first empty read."""
+        for _ in range(max_reads):
+            raw = self._read_message(timeout_s)
+            if not raw:
+                return
             log.info("upload_media: drained a stray reply before starting: %r (raw=%s)",
                      decode_pb(raw), raw.hex())
 
@@ -767,8 +779,23 @@ class _PanoramaBase:
             return None
         log.info("upload_media: announce ack = %r (raw=%s)", decode_pb(raw), raw.hex())
 
-        self._write(build_media_data_frame(session_id, container))
-        raw = self._read_message(timeout_s)
+        # A tiny control message (announce/finalize) fits well within
+        # self.timeout's 1s default - the data frame carrying the actual
+        # container can be tens of MB, and this project has no confirmed
+        # measurement of how long that genuinely takes to reach and be
+        # received by the device over this connection. A write that gets
+        # cut off before it's actually done, or a read that gives up
+        # before the device has finished receiving tens of MB, both look
+        # identical from here to "something's wrong" - and either was a
+        # real candidate for why a large upload could silently go
+        # nowhere while a small one (well within the old 1s/15s budget)
+        # worked fine. Erring generous (2s/MB, 30s floor) costs nothing
+        # when the transfer is actually fine; it only ever matters when
+        # something is genuinely slow, which is exactly when the old
+        # tight timeouts could have been cutting it off.
+        big_timeout = max(30.0, len(container) / (1024 * 1024) * 2)
+        self._write(build_media_data_frame(session_id, container), timeout_s=big_timeout)
+        raw = self._read_message(max(timeout_s, big_timeout))
         if not raw:
             log.warning("upload_media: no response to data frame")
             return None
@@ -1006,8 +1033,9 @@ class PanoramaUSB(_PanoramaBase):
     def connected(self) -> bool:
         return self.dev is not None
 
-    def _write(self, frame: bytes):
-        self.ep_out.write(frame, timeout=max(int(self.timeout * 1000), 1000))
+    def _write(self, frame: bytes, timeout_s: float | None = None):
+        t = self.timeout if timeout_s is None else timeout_s
+        self.ep_out.write(frame, timeout=max(int(t * 1000), 1000))
 
     def _read_message(self, timeout_s: float) -> bytes:
         """One bulk-IN read. Confirmed against real captured traffic that a
@@ -1323,9 +1351,10 @@ class PanoramaPrint(_PanoramaBase):
             self._handle, ctypes.byref(ov), ctypes.byref(transferred), True)
         return transferred.value
 
-    def _write(self, frame: bytes):
+    def _write(self, frame: bytes, timeout_s: float | None = None):
+        t = self.timeout if timeout_s is None else timeout_s
         buf = ctypes.create_string_buffer(frame, len(frame))
-        transferred = self._overlapped_call(self._kernel32.WriteFile, buf, len(frame), self.timeout)
+        transferred = self._overlapped_call(self._kernel32.WriteFile, buf, len(frame), t)
         if transferred != len(frame):
             raise PanoramaError(f"WriteFile only sent {transferred}/{len(frame)} bytes")
 
