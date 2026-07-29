@@ -14,3 +14,7 @@ effect_presets.json
 media_gallery/
 sensor-helper/bin/
 sensor-helper/obj/
+build/
+dist/
+shyyctl.log
+tools/build_installer/*.exe

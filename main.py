@@ -22,6 +22,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -45,9 +46,44 @@ from app.panorama import PanoramaError, find_print_panel, find_usb_panel, genera
 from app.scan import Scan
 from app import sensors as sensors_mod
 
-ROOT = Path(__file__).resolve().parent
-CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-WEB_DIR = ROOT / "web"
+# ROOT is where persistent, writable state lives (config.yaml, curve.json,
+# layout.json, ... and vendor/, which the installer stages here directly,
+# not PyInstaller) - sys.executable's parent, the stable --onedir folder
+# the installer places everything in, so nothing here gets wiped or
+# re-extracted between launches.
+#
+# ASSETS_DIR is where read-only bundled files PyInstaller itself packed
+# live (web/, config.example.yaml). Confirmed empirically this session
+# (PyInstaller 6.x): in --onedir mode, COLLECT puts bundled datas/binaries
+# under an "_internal" subfolder next to the exe, not flat alongside it -
+# so ASSETS_DIR must be sys._MEIPASS, not sys.executable's parent, or
+# WEB_DIR/config.example.yaml simply wouldn't be found. sys._MEIPASS is
+# still the right (and only) choice despite --onefile's usual "fresh temp
+# dir every launch" caveat: in --onedir mode it points at that same stable
+# _internal folder every time, it's just --onefile where it's ephemeral -
+# so this never revisits the "one process, one folder" simplicity ROOT
+# above relies on for actual persistent state.
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+    ASSETS_DIR = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+else:
+    ROOT = Path(__file__).resolve().parent
+    ASSETS_DIR = ROOT
+
+_CONFIG_FILE = ROOT / "config.yaml"
+_CONFIG_EXAMPLE = ASSETS_DIR / "config.example.yaml"
+if not _CONFIG_FILE.is_file() and _CONFIG_EXAMPLE.is_file():
+    # First run of a frozen build: config.yaml itself isn't shipped (only
+    # config.example.yaml is bundled - see the PyInstaller spec) so that a
+    # future installer upgrade never has a bundled file to overwrite a
+    # user's already-tuned config.yaml with. Seed it once, here, rather
+    # than at install time, since this is the one place that already knows
+    # "config.yaml is genuinely missing" vs "the installer just hasn't run
+    # yet".
+    shutil.copyfile(_CONFIG_EXAMPLE, _CONFIG_FILE)
+
+CONFIG = yaml.safe_load(_CONFIG_FILE.read_text(encoding="utf-8"))
+WEB_DIR = ASSETS_DIR / "web"
 CURVE_FILE = ROOT / "curve.json"
 LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
@@ -57,7 +93,29 @@ EFFECT_PRESETS_FILE = ROOT / "effect_presets.json"
 GALLERY_DIR = ROOT / "media_gallery"
 GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
-logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
+_log_handlers: list = []
+if getattr(sys, "frozen", False):
+    # The frozen exe is built with console=False (see
+    # tools/build_installer/shyyctl.spec) - no console subsystem at all, so
+    # sys.stdout/sys.stderr are actually None (not just unread), not merely
+    # a stderr handler writing into the void. That's worse than the
+    # "SensorHelper.exe silently doing nothing" problem sensor-helper/
+    # Program.cs's own file logging was built to avoid: uvicorn.run()
+    # below installs its own default logging config pointed at
+    # sys.stderr, and any other library that does a bare print() would
+    # raise AttributeError on a None stream and crash startup outright.
+    # Redirecting both to the same log file - rather than just adding a
+    # FileHandler alongside untouched None streams - fixes both problems
+    # at once with one file, and keeps uvicorn's own startup banner in
+    # the same place as this app's own log lines.
+    _log_file = open(ROOT / "shyyctl.log", "a", encoding="utf-8", buffering=1)
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+    _log_handlers.append(logging.StreamHandler(_log_file))
+else:
+    _log_handlers.append(logging.StreamHandler())
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+                     handlers=_log_handlers)
 log = logging.getLogger("shyyctl")
 
 hub = Hub(match=CONFIG["hub"]["match"])
@@ -624,7 +682,13 @@ async def lifespan(app: FastAPI):
     if saved_effect is not None:
         asyncio.create_task(_resume_effect_after_scan(saved_effect))
 
-    if CONFIG.get("server", {}).get("open_browser"):
+    # --background (only ever passed by the installer's silent autostart
+    # shortcut - see tools/build_installer/installer.nsi's Registry Run
+    # entry) means "keep curves/effects/display alive, don't pop a browser
+    # tab at every login" - the Start Menu shortcut launches with no flag,
+    # so a human deliberately opening shyyctl still gets config.yaml's
+    # normal open_browser behaviour (default on).
+    if "--background" not in sys.argv and CONFIG.get("server", {}).get("open_browser"):
         url = f"http://{CONFIG['server']['host']}:{CONFIG['server']['port']}"
         webbrowser.open(url)
 
@@ -1922,6 +1986,34 @@ if WEB_DIR.is_dir():
     app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
 
 
+def _already_running(host: str, port: int) -> bool:
+    """True if something is already answering /api/status on our own port -
+    i.e. shyyctl itself is already running. Only used for the frozen/
+    installed build: the Registry Run key autostart launches this exe
+    silently at every login, but a human can also open it again from the
+    Start Menu shortcut at any time - without this check, that second
+    launch would just crash trying to bind a port the first instance
+    already holds, instead of doing the one useful thing a second launch
+    should do (open a browser tab onto the instance that's already up)."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/status", timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=CONFIG["server"]["host"], port=CONFIG["server"]["port"])
+
+    _host = CONFIG["server"]["host"]
+    _port = CONFIG["server"]["port"]
+    if getattr(sys, "frozen", False) and _already_running(_host, _port):
+        if "--background" in sys.argv:
+            log.info("shyyctl is already running on %s:%d - nothing to do for a "
+                     "silent autostart launch.", _host, _port)
+        else:
+            log.info("shyyctl is already running on %s:%d - opening it in a browser "
+                     "instead of starting a second instance.", _host, _port)
+            webbrowser.open(f"http://{_host}:{_port}/")
+        sys.exit(0)
+    uvicorn.run(app, host=_host, port=_port)

@@ -1,0 +1,79 @@
+name: Build Windows installer
+
+# Builds the real shyyctl-setup-<version>.exe release asset. Runs on
+# windows-latest specifically because PyInstaller cannot cross-compile -
+# confirmed directly in this project's own dev environment: building a
+# trivial script with PyInstaller on Linux produces a Linux ELF binary,
+# never a Windows PE .exe, regardless of any target-platform flag. A real
+# Windows machine (or runner) is the only way to produce shyyctl.exe.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for this build (e.g. 1.0.0). Used in the installer filename and Add/Remove Programs entry."
+        required: false
+        default: "0.0.0-manual"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Fetch/build vendored binaries (ffmpeg, OpenRGB, SensorHelper)
+        run: python tools/setup_vendor.py
+
+      - name: Build shyyctl.exe (PyInstaller, --onedir)
+        run: pyinstaller --noconfirm tools/build_installer/shyyctl.spec
+
+      - name: Build installer (NSIS)
+        shell: cmd
+        # windows-latest ships NSIS (makensis) preinstalled - no separate
+        # setup step needed. Paths are relative to
+        # tools/build_installer/ (where installer.nsi's own defaults
+        # assume it's run from), matching this working-directory.
+        run: |
+          makensis -DVERSION=${{ steps.version.outputs.version }} -DDIST_DIR=..\..\dist\shyyctl -DVENDOR_DIR=..\..\vendor installer.nsi
+        working-directory: tools/build_installer
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shyyctl-setup-${{ steps.version.outputs.version }}
+          path: tools/build_installer/shyyctl-setup-${{ steps.version.outputs.version }}.exe
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tools/build_installer/shyyctl-setup-${{ steps.version.outputs.version }}.exe
+          generate_release_notes: true
