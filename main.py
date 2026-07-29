@@ -1884,11 +1884,16 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             def get_twinkle_brightness(led_index):
                 offset = (led_index % 256) * 0.618 % 1.0
                 t = (phase[0] + offset) % 1.0
-                # Smooth brightness envelope: ramp up 0->1, then down 1->0
-                if t < 0.5:
-                    return t * 2  # 0 to 1
-                else:
-                    return 2 * (1 - t)  # 1 to 0
+                triangle = t * 2 if t < 0.5 else 2 * (1 - t)  # 0->1->0 per cycle
+                # Direct user feedback: the plain triangle above spends as
+                # much time near full brightness as it does near zero, so
+                # a whole strip of LEDs reads as "everyone dimly lit" at
+                # any instant instead of "mostly dark, a few sharp
+                # twinkles" - raising it to a power pushes the low/mid
+                # values toward zero while leaving the peak (1**5 == 1)
+                # untouched, without changing the offset spacing or cycle
+                # timing at all.
+                return triangle ** 5
 
             colors_out = [
                 tuple(round(c * get_twinkle_brightness(led["index"])) for c in base_color)

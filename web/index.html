@@ -63,45 +63,36 @@
   .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
   .stack{display:flex;flex-direction:column;gap:10px}
 
-  .carousel{display:flex;align-items:center;gap:10px}
   .carousel-arrow{width:36px;height:36px;border-radius:50%;border:1px solid var(--rule);background:var(--panel);
-    color:var(--ink);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:none}
+    color:var(--ink);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:none;z-index:200}
   .carousel-arrow:hover{background:var(--panel-2)}
   .carousel-arrow svg{width:16px;height:16px}
-  .carousel-track{display:flex;gap:14px;overflow-x:auto;scroll-behavior:smooth;padding:6px 2px;
-    flex:1;min-width:0;scrollbar-width:none}
-  .carousel-track::-webkit-scrollbar{display:none}
-  .gallery-tile{position:relative;flex:0 0 220px;aspect-ratio:16/9;border-radius:var(--radius);
-    overflow:hidden;background:var(--panel-2);cursor:pointer;border:2px solid transparent;
-    transition:transform .15s,border-color .15s}
-  .gallery-tile:hover{transform:translateY(-3px)}
-  .gallery-tile.active{border-color:var(--accent)}
-  .gallery-thumb{width:100%;height:100%;object-fit:cover;display:block}
-  .gallery-tile-overlay{position:absolute;left:0;right:0;top:0;padding:10px 12px;
-    background:linear-gradient(to bottom,rgba(0,0,0,.65),transparent);
-    display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:#fff}
-  .gallery-tile-dot{width:8px;height:8px;border-radius:50%;border:1.5px solid #fff;flex:none}
-  .gallery-tile.active .gallery-tile-dot{background:var(--accent);border-color:var(--accent)}
-  .gallery-tile-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .gallery-tile-delete{position:absolute;right:8px;bottom:8px;width:26px;height:26px;border-radius:50%;
-    background:rgba(0,0,0,.6);color:#fff;border:none;cursor:pointer;font-size:15px;line-height:1;
-    display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
-  .gallery-tile:hover .gallery-tile-delete{opacity:1}
-  .gallery-tile-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:50px;height:50px;
-    border-radius:50%;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;
-    color:#fff;font-size:24px}
 
-  .gallery-viewer{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.95);
-    z-index:10000;align-items:center;justify-content:center;flex-direction:column;gap:16px;padding:20px}
-  .gallery-viewer.active{display:flex}
-  .gallery-viewer-close{position:absolute;top:16px;right:16px;width:40px;height:40px;background:rgba(255,255,255,.1);
-    border:none;border-radius:50%;color:#fff;font-size:24px;cursor:pointer;display:flex;align-items:center;
-    justify-content:center;transition:background .2s}
-  .gallery-viewer-close:hover{background:rgba(255,255,255,.2)}
-  .gallery-viewer-content{max-width:90vw;max-height:80vh;display:flex;align-items:center;justify-content:center}
-  .gallery-viewer-img{max-width:100%;max-height:100%;border-radius:var(--radius)}
-  .gallery-viewer-video{max-width:100%;max-height:100%;border-radius:var(--radius)}
-  .gallery-viewer-info{text-align:center;color:#fff;font-size:14px}
+  /* KANALI-style stacked carousel: one focused centre card, neighbours
+     fading/shrinking away on either side, all absolutely positioned in
+     one shared track and moved by translateX/scale/opacity per card
+     rather than native scroll - a real "3D stack", not a scrolling
+     strip. */
+  .kanali-carousel{display:flex;align-items:center;gap:6px}
+  .kanali-track{position:relative;flex:1;min-width:0;height:230px}
+  .kanali-card{position:absolute;left:50%;top:50%;width:260px;aspect-ratio:16/10;border-radius:var(--radius);
+    overflow:hidden;background:var(--panel-2);cursor:pointer;border:2px solid transparent;
+    transition:transform .3s cubic-bezier(.2,.7,.3,1),opacity .3s ease,border-color .2s;
+    box-shadow:0 12px 28px rgba(0,0,0,.35)}
+  .kanali-card.center{border-color:var(--accent)}
+  .kanali-card img, .kanali-card video{width:100%;height:100%;object-fit:cover;display:block}
+  .kanali-card-overlay{position:absolute;left:0;right:0;top:0;padding:9px 11px;
+    background:linear-gradient(to bottom,rgba(0,0,0,.7),transparent);
+    display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;color:#fff;pointer-events:none;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .kanali-card-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+  .kanali-card-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:42px;height:42px;
+    border-radius:50%;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:18px;pointer-events:none;transition:opacity .15s}
+  .kanali-card:hover .kanali-card-play{opacity:0}
+  .kanali-card-actions{position:absolute;left:0;right:0;bottom:0;padding:9px;display:flex;gap:6px;
+    background:linear-gradient(to top,rgba(0,0,0,.78),transparent);opacity:0;transition:opacity .15s}
+  .kanali-card.center:hover .kanali-card-actions{opacity:1}
 
   .btn{font-family:var(--body);font-size:12.5px;font-weight:600;padding:9px 16px;border:none;
     border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
@@ -362,7 +353,7 @@
         <div class="section-head">
           <button class="btn sec sm" onclick="showPage('rgb')">&larr; RGB</button>
           <h2 style="margin-left:12px">Advanced</h2><div class="rule"></div>
-          <span class="note">click, or click-drag across several dots, to select LEDs &middot; shift to add to selection</span>
+          <span class="note">click or drag to select LEDs &middot; shift to add</span>
         </div>
         <div class="setup-grid">
           <div>
@@ -371,7 +362,7 @@
               onpointerdown="advPointerDown(event)" onpointermove="advPointerMove(event)"
               onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)"></svg></div>
           </div>
-          <div id="advancedLedProps"><div class="note">Click, or click-drag across several dots, to select LEDs.</div></div>
+          <div id="advancedLedProps"><div class="note">Click or drag to select LEDs.</div></div>
         </div>
       </section>
 
@@ -472,23 +463,21 @@
 
       <section>
         <div class="section-head"><h2>Gallery</h2><div class="rule"></div>
-          <span class="note">click a tile to apply it</span></div>
-        <div class="card">
-          <div class="row">
-            <input type="file" id="galleryUploadFile" accept="image/*,video/*">
-            <button class="btn sm" onclick="uploadToGallery()">Add to gallery</button>
-          </div>
-        </div>
-        <div class="carousel" style="margin-top:14px">
-          <button class="carousel-arrow" onclick="scrollGallery(-1)" aria-label="Scroll left">
+          <span class="note">hover to preview &middot; click a card to browse</span></div>
+        <div class="kanali-carousel">
+          <button class="carousel-arrow" onclick="shiftGallery(-1)" aria-label="Previous">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
           </button>
-          <div class="carousel-track" id="galleryGrid"></div>
-          <button class="carousel-arrow" onclick="scrollGallery(1)" aria-label="Scroll right">
+          <div class="kanali-track" id="galleryGrid"></div>
+          <button class="carousel-arrow" onclick="shiftGallery(1)" aria-label="Next">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
           </button>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <input type="file" id="galleryUploadFile" accept="image/*,video/*">
+          <button class="btn sm" onclick="uploadToGallery()">Add media</button>
         </div>
       </section>
 
@@ -529,14 +518,10 @@
           <div class="section-head"><h2>Background services</h2><div class="rule"></div>
             <span class="note" id="servicesStatusNote"></span></div>
           <div class="card">
-            <p class="note" style="margin:0 0 12px">Only OpenRGB is needed for RGB effects; only SensorHelper
-              is needed for fan curves and the Status page's temperatures. Fans themselves and the display
-              don't need either.</p>
             <div class="row">
-              <button class="btn sec sm" data-mode="all" onclick="setServiceMode('all')">All enabled</button>
-              <button class="btn sec sm" data-mode="effects" onclick="setServiceMode('effects')">Effects only</button>
-              <button class="btn sec sm" data-mode="fans_display" onclick="setServiceMode('fans_display')">Fans &amp; display only</button>
-              <button class="btn sec sm" data-mode="stop" onclick="setServiceMode('stop')">Stop all</button>
+              <button class="btn sec sm" data-mode="stop" onclick="setServiceMode('stop')">All off</button>
+              <button class="btn sec sm" data-mode="effects" onclick="setServiceMode('effects')">Effects, display &amp; fans</button>
+              <button class="btn sec sm" data-mode="all" onclick="setServiceMode('all')">All on</button>
             </div>
             <div class="row" style="margin-top:14px">
               <button class="btn hot sm" onclick="quitShyyctl()">Quit shyyctl completely</button>
@@ -557,19 +542,12 @@
               <input type="checkbox" id="autostartToggle" onchange="setAutostart(this.checked)">
               Start shyyctl automatically when Windows logs in
             </label>
-            <p class="note" style="margin:10px 0 0">Runs silently in the background - opening shyyctl from
-              the Start Menu just opens this page against it, it won't start a second copy.</p>
           </div>
         </section>
         <section id="liteExportSection">
-          <div class="section-head"><h2>Portable background service</h2><div class="rule"></div></div>
+          <div class="section-head"><h2>Portable background service</h2><div class="rule"></div>
+            <span class="note">for <code>shyyctl.exe --lite</code> on another install</span></div>
           <div class="card">
-            <p class="note" style="margin:0 0 12px">Exports config.yaml, fan curves, LED layout, saved RGB
-              effect/colours, and the Panorama display's last-applied media as a zip. Copy its contents into
-              another shyyctl install on the same machine (e.g. a dual-boot gaming OS) and run
-              <code>shyyctl.exe --lite</code> there - RGB effects, fan curves, and the display keep running
-              with no web server, no browser tab, and no gallery overhead, only launching SensorHelper at all
-              if a saved curve actually reads a CPU/motherboard temperature.</p>
             <div class="row">
               <button class="btn sec sm" onclick="exportConfig()">Export config</button>
             </div>
@@ -657,12 +635,6 @@
       <button class="btn sec sm" onclick="dismissConflictModal()">Dismiss</button>
     </div>
   </div>
-</div>
-
-<div id="galleryViewer" class="gallery-viewer" onclick="if(event.target.id==='galleryViewer') closeGalleryViewer()">
-  <button class="gallery-viewer-close" onclick="closeGalleryViewer()">&times;</button>
-  <div class="gallery-viewer-content" id="galleryViewerContent" onclick="event.stopPropagation()"></div>
-  <div class="gallery-viewer-info" id="galleryViewerInfo"></div>
 </div>
 
 <div id="log"></div>
@@ -1471,7 +1443,7 @@ function renderAdvancedLedProps(){
   if(!box) return;
   updateEffectSelectionUi();
   if(selectedLeds.size === 0){
-    box.innerHTML = `<div class="note">Click, or click-drag across several dots, to select LEDs.</div>
+    box.innerHTML = `<div class="note">Click or drag to select LEDs.</div>
       <div class="adv-props-actions"><button class="btn sec sm" onclick="selectAllLeds()">Select all</button></div>`;
     return;
   }
@@ -1836,12 +1808,16 @@ function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, m
     return samplePalette(palette, colors, pos - sweepPhase, cyclic);
   }
   if(shape === "sparkle"){
-    // Random LED twinkling - use LED index as seed for consistent randomness
+    // Twinkling - LED index as a consistent pseudo-random seed (mirrors
+    // main.py's get_twinkle_brightness exactly, including the **5 - see
+    // its docstring for why a plain triangle wave read as "everyone
+    // dimly lit" instead of "mostly dark, a few sharp twinkles").
     const baseColor = samplePalette(palette, colors, 0, false);
-    const idx = l.index % 256;  // Use LED index as consistent random seed
-    const offset = ((idx * 0.618) % 1);  // Golden ratio for pseudo-random
+    const idx = l.index % 256;
+    const offset = ((idx * 0.618) % 1);
     const t = (phase + offset) % 1;
-    const brightness = t < 0.5 ? t * 2 : 2 * (1 - t);
+    const triangle = t < 0.5 ? t * 2 : 2 * (1 - t);
+    const brightness = Math.pow(triangle, 5);
     return [Math.round(baseColor[0]*brightness), Math.round(baseColor[1]*brightness), Math.round(baseColor[2]*brightness)];
   }
   // Default wave behavior
@@ -2042,18 +2018,21 @@ async function setPanoBrightness(){
   }catch(e){ say(e.message,"error"); }
 }
 
-/* ---------- panorama gallery ----------
+/* ---------- panorama gallery (KANALI-style carousel) ----------
    A local cache of everything ever uploaded (see main.py's gallery
    endpoints) - the device itself can't hand back a thumbnail or the
    original file for something already on it, so re-showing what's been
-   uploaded before means keeping our own copy. Uploading only caches;
-   clicking a tile is what actually pushes it to the panel, KANALI-preset
-   style - no separate Apply button to hunt for.
+   uploaded before means keeping our own copy.
 
-   Boot image deliberately has no UI entry point yet - the backend route
-   (main.py's gallery_set_boot) exists but hasn't been confirmed working
-   against real hardware, and shipping a button for something that might
-   silently do nothing is worse than not shipping it yet.
+   galleryCenterIndex is which item is currently front-and-centre;
+   renderGallery() positions every other card by its offset from that
+   index (translateX/scale/opacity), stacked-carousel style, rather than
+   a native horizontal scroll strip. Clicking a side card re-centres on
+   it; the arrows step the centre by one. Hovering a card (any card, not
+   just the centre one) swaps its static thumbnail for the real video
+   inline and plays it - see galleryCardHoverStart/End - so browsing the
+   carousel previews motion the same way KANALI's own preset carousel
+   does, without needing a separate full-screen viewer to click into.
 
    There's no live readback of which media is actually on screen right
    now (same reasoning as panoStatus.last_applied) - lastGalleryId is
@@ -2061,48 +2040,100 @@ async function setPanoBrightness(){
    persisted in localStorage so the active-tile highlight survives a
    reload instead of resetting to "nothing selected" every time. */
 let galleryItems = [];
+let galleryCenterIndex = 0;
 let lastGalleryId = localStorage.getItem("shyyctl-gallery-active") || null;
 
 async function loadGallery(){
   try{ galleryItems = await api("/api/panorama/gallery"); }
   catch(e){ galleryItems = []; }
+  if(lastGalleryId){
+    const idx = galleryItems.findIndex(i=>i.id===lastGalleryId);
+    if(idx >= 0) galleryCenterIndex = idx;
+  }
 }
 
 const VIDEO_SUFFIXES = ['.mp4', '.webm', '.mov', '.avi'];
 function isVideoItem(item){ return !!(item.suffix && VIDEO_SUFFIXES.includes(item.suffix.toLowerCase())); }
-// Mirrors main.py's gallery_original() media_type mapping exactly, so the
-// <source type> the browser sees matches what the response actually sends.
-function videoMimeType(suffix){
-  const s = (suffix || "").toLowerCase();
-  if(s === ".mp4") return "video/mp4";
-  if(s === ".webm") return "video/webm";
-  if(s === ".mov") return "video/quicktime";
-  if(s === ".avi") return "video/x-msvideo";
-  return "video/mp4";
-}
+
+const GALLERY_CARD_SPACING = 165;
+const GALLERY_CARD_VISIBLE = 3; // offsets beyond this are culled from the DOM entirely
 
 function renderGallery(){
   const box = document.getElementById("galleryGrid");
   if(!box) return;
   if(!galleryItems.length){ box.innerHTML = `<div class="note">No media uploaded yet.</div>`; return; }
-  const isVideo = isVideoItem;
-  box.innerHTML = galleryItems.slice().reverse().map(item=>`
-    <div class="gallery-tile${item.id===lastGalleryId?" active":""}" onclick="applyGalleryItem('${item.id}'); event.stopPropagation();" style="cursor:pointer">
+  if(galleryCenterIndex >= galleryItems.length) galleryCenterIndex = galleryItems.length - 1;
+  if(galleryCenterIndex < 0) galleryCenterIndex = 0;
+  box.innerHTML = galleryItems.map((item, idx) => {
+    const offset = idx - galleryCenterIndex;
+    if(Math.abs(offset) > GALLERY_CARD_VISIBLE) return "";
+    const isCenter = offset === 0;
+    const dist = Math.abs(offset);
+    const scale = isCenter ? 1 : Math.max(0.55, 1 - dist * 0.18);
+    const opacity = isCenter ? 1 : Math.max(0.28, 1 - dist * 0.28);
+    const z = 100 - dist;
+    const x = offset * GALLERY_CARD_SPACING;
+    return `
+    <div class="kanali-card${isCenter?" center":""}" data-item-id="${item.id}"
+      style="transform:translate(calc(-50% + ${x}px), -50%) scale(${scale});opacity:${opacity};z-index:${z}"
+      onclick="focusGalleryCard('${item.id}')"
+      onmouseenter="galleryCardHoverStart(this,'${item.id}')" onmouseleave="galleryCardHoverEnd(this,'${item.id}')">
       ${item.has_thumb
         ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${item.name}">`
         : ``}
-      ${isVideo(item) ? `<div class="gallery-tile-play">▶</div>` : ''}
-      <div class="gallery-tile-overlay">
-        <span class="gallery-tile-dot"></span><span class="gallery-tile-name">${item.name}</span>
+      ${isVideoItem(item) ? `<div class="kanali-card-play">&#9654;</div>` : ""}
+      <div class="kanali-card-overlay">
+        ${item.id===lastGalleryId ? `<span class="kanali-card-dot"></span>` : ``}<span>${item.name}</span>
       </div>
-      <button class="gallery-tile-delete" title="Delete"
-        onclick="event.stopPropagation(); deleteGalleryItem('${item.id}')">&times;</button>
-    </div>`).join("");
+      ${isCenter ? `<div class="kanali-card-actions">
+        <button class="btn sm" onclick="event.stopPropagation(); doApplyGalleryItem('${item.id}')">Apply</button>
+        <button class="btn sec sm" onclick="event.stopPropagation(); deleteGalleryItem('${item.id}')">Delete</button>
+      </div>` : ``}
+    </div>`;
+  }).join("");
 }
 
-function scrollGallery(dir){
-  const track = document.getElementById("galleryGrid");
-  if(track) track.scrollBy({left: dir * 240, behavior: "smooth"});
+function shiftGallery(dir){
+  if(!galleryItems.length) return;
+  galleryCenterIndex = Math.max(0, Math.min(galleryItems.length - 1, galleryCenterIndex + dir));
+  renderGallery();
+}
+
+function focusGalleryCard(id){
+  const idx = galleryItems.findIndex(i=>i.id===id);
+  if(idx < 0) return;
+  if(idx === galleryCenterIndex) return; // already centred - the click was on the Apply/Delete row, ignore
+  galleryCenterIndex = idx;
+  renderGallery();
+}
+
+// Lazy-loaded on hover rather than every card carrying its own <video>
+// from render time - N gallery items would otherwise mean N videos
+// fetched/decoding at once for a carousel that only ever shows a
+// handful of cards, most of them small and none of them focused.
+function galleryCardHoverStart(el, id){
+  const item = galleryItems.find(i=>i.id===id);
+  if(!item || !isVideoItem(item)) return;
+  const img = el.querySelector("img");
+  if(!img) return;
+  const video = document.createElement("video");
+  video.className = "gallery-thumb";
+  video.src = `/api/panorama/gallery/${id}/original`;
+  video.muted = true; video.loop = true; video.playsInline = true; video.autoplay = true;
+  img.replaceWith(video);
+  video.play().catch(()=>{});
+}
+
+function galleryCardHoverEnd(el, id){
+  const item = galleryItems.find(i=>i.id===id);
+  if(!item || !isVideoItem(item)) return;
+  const video = el.querySelector("video");
+  if(!video) return;
+  const img = document.createElement("img");
+  img.className = "gallery-thumb";
+  img.src = `/api/panorama/gallery/${id}/thumb`;
+  img.alt = item.name;
+  video.replaceWith(img);
 }
 
 async function uploadToGallery(){
@@ -2115,31 +2146,10 @@ async function uploadToGallery(){
     await api("/api/panorama/gallery",{method:"POST", body:form});
     input.value = "";
     say("Added to gallery.");
-    await loadGallery(); renderGallery();
+    await loadGallery();
+    galleryCenterIndex = galleryItems.length - 1; // focus the newly added item
+    renderGallery();
   }catch(e){ say(e.message,"error"); }
-}
-
-function openGalleryViewer(id){
-  const item = galleryItems.find(i => i.id === id);
-  if(!item) return;
-  const viewer = document.getElementById("galleryViewer");
-  const content = document.getElementById("galleryViewerContent");
-  const info = document.getElementById("galleryViewerInfo");
-
-  if(isVideoItem(item)){
-    content.innerHTML = `<video class="gallery-viewer-video" controls autoplay><source src="/api/panorama/gallery/${item.id}/original" type="${videoMimeType(item.suffix)}"></video>`;
-  }else{
-    content.innerHTML = `<img class="gallery-viewer-img" src="/api/panorama/gallery/${item.id}/original" alt="${item.name}">`;
-  }
-
-  info.innerHTML = `<div style="font-weight:600">${item.name}</div><button class="btn sm" style="margin-top:8px" onclick="doApplyGalleryItem('${id}')">Apply to panel</button>`;
-  viewer.classList.add("active");
-}
-
-function closeGalleryViewer(){
-  const viewer = document.getElementById("galleryViewer");
-  viewer.classList.remove("active");
-  document.getElementById("galleryViewerContent").innerHTML = "";
 }
 
 async function doApplyGalleryItem(id){
@@ -2149,14 +2159,9 @@ async function doApplyGalleryItem(id){
     say("Applied.");
     lastGalleryId = id;
     try{ localStorage.setItem("shyyctl-gallery-active", id); }catch(e){}
-    closeGalleryViewer();
     renderGallery();
     await loadPanorama(); renderPanorama();
   }catch(e){ say(e.message,"error"); }
-}
-
-function applyGalleryItem(id){
-  openGalleryViewer(id);
 }
 
 async function deleteGalleryItem(id){
