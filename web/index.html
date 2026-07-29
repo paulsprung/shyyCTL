@@ -199,10 +199,6 @@
     <section>
       <div class="section-head"><h2>Fan speed</h2><div class="rule"></div>
         <span class="note" id="fansNote"></span></div>
-      <p class="intro">
-        Duty applies immediately and stays in the hub after this app closes. On a
-        single-frame unit one PWM line drives every fan in the frame.
-      </p>
       <div class="card" id="fansList"></div>
     </section>
   </div>
@@ -223,9 +219,6 @@
         </div>
         <div class="card">
           <div class="card-title">RAM</div>
-          <div class="note" style="line-height:1.6;margin:0 0 10px">
-            Each stick is its own device - set independently.
-          </div>
           <div id="ramSticksList"><div class="note">Loading&hellip;</div></div>
         </div>
       </div>
@@ -240,11 +233,6 @@
     <section>
       <div class="section-head"><h2>Advanced</h2><div class="rule"></div></div>
       <div class="card">
-        <p class="note" style="line-height:1.6;margin:0 0 10px">
-          Every controllable LED - fans, motherboard, RAM - at its real
-          physical position, plus layout-aware and standalone animations.
-          Its own view, not a redirect to Setup.
-        </p>
         <button class="btn" onclick="showPage('advanced')">Open Advanced &rarr;</button>
       </div>
     </section>
@@ -258,11 +246,6 @@
         <h2 style="margin-left:12px">Advanced</h2><div class="rule"></div>
         <span class="note">click an LED to select it</span>
       </div>
-      <p class="intro">
-        Every controllable LED shown at its real physical position from
-        Setup - not a flat list, the actual shape. Click one to set its
-        colour directly.
-      </p>
       <div class="setup-grid">
         <div>
           <div class="canvas"><svg id="advancedCase" viewBox="0 0 900 600"
@@ -276,15 +259,6 @@
       <div class="section-head"><h2>Effect</h2><div class="rule"></div>
         <span class="note" id="effectStatusNote"></span></div>
       <div class="card">
-        <p class="note" style="line-height:1.6;margin:0 0 10px">
-          Every effect is driven by each LED's real position from Setup -
-          not a flat per-channel colour cycle. Preview plays right here in
-          the layout above without touching the hardware; Apply starts the
-          real thing on every fan channel, RAM stick and the motherboard
-          that's actually been placed. Starting one stops whatever was
-          running before it automatically.
-        </p>
-
         <div class="prop"><label>Direction</label>
           <div class="seg" id="effectDirSeg">
             <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
@@ -329,10 +303,6 @@
     <section>
       <div class="section-head"><h2>Standalone animation</h2><div class="rule"></div></div>
       <div class="card">
-        <p class="note" style="line-height:1.6;margin:0 0 10px">
-          The hub's own firmware modes - rainbow-style effects the hub
-          drives on its own, no host connection needed once set.
-        </p>
         <div class="row">
           <select id="hubModeSelect"><option>loading&hellip;</option></select>
           <button class="btn sm" onclick="applyHubMode()">Apply</button>
@@ -374,9 +344,6 @@
       <div class="split">
         <div class="card">
           <div class="card-title">Apply now</div>
-          <p class="note" style="line-height:1.6;margin:0 0 10px">
-            Image, GIF, or video &mdash; encoded to H.264 and shown immediately.
-          </p>
           <input type="file" id="panoApplyFile" accept="image/*,video/*">
           <div class="row" style="margin-top:10px">
             <button class="btn sm" onclick="uploadPanoMedia(false)">Upload &amp; apply</button>
@@ -384,10 +351,6 @@
         </div>
         <div class="card">
           <div class="card-title">Set as boot image</div>
-          <p class="note" style="line-height:1.6;margin:0 0 10px">
-            Shown from the moment the PSU powers on, independent of whatever else
-            is currently applied.
-          </p>
           <input type="file" id="panoBootFile" accept="image/*,video/*">
           <div class="row" style="margin-top:10px">
             <button class="btn sm" onclick="uploadPanoMedia(true)">Upload &amp; set as boot</button>
@@ -402,19 +365,6 @@
     <section>
       <div class="section-head"><h2>Scan</h2><div class="rule"></div>
         <span class="note" id="scanNote"></span></div>
-      <p class="intro">
-        Checks motherboard/RAM lighting first (before touching any fan, so a
-        broken OpenRGB setup fails fast rather than after two minutes of
-        spinning fans - see the skip option below). Full/quick then spin
-        each fan channel up, read its tachometer, and read the hub's
-        per-channel accessory ID to identify the fan model (and with it, the
-        real LED count) where possible - a channel that never answers a
-        tachometer probe at all is left out of the results entirely, not
-        listed as empty. Silent skips the fan spin-up entirely - it only
-        reads accessory IDs, so it can't confirm anything via speed, just
-        quieter and faster. All three resize the matching OpenRGB hub zones
-        afterwards, so RGB control on the RGB page works right after.
-      </p>
       <div class="card">
         <div class="row">
           <button class="btn" id="scanBtn" onclick="startScan('full')">Run full scan</button>
@@ -424,8 +374,6 @@
         </div>
         <label class="inline" style="margin-top:10px;display:block">
           <input type="checkbox" id="scanSkipRgb"> Skip motherboard &amp; RAM check
-          (only if it hangs/fails on this system - the hub's own fan LED
-          channels still get sized either way)
         </label>
         <div class="bar"><i id="scanBar" style="width:0%"></i></div>
         <div class="note" id="scanStep">Not run yet.</div>
@@ -444,12 +392,6 @@
     <section>
       <div class="section-head"><h2>Placement</h2><div class="rule"></div>
         <span class="note">drag a unit to place it</span></div>
-      <p class="intro">
-        Where each unit physically sits, so effects that care about position
-        (a wave running top to bottom, for example) know which LED is where.
-        Purely cosmetic on its own - only Identify below actually touches the
-        hardware.
-      </p>
       <div class="card">
         <div class="row">
           <button class="btn" onclick="adoptLayout()">Adopt from last scan</button>
@@ -482,12 +424,6 @@
     <section>
       <div class="section-head"><h2>Hub channel sizes</h2><div class="rule"></div>
         <span class="note">from the last scan</span></div>
-      <p class="intro">
-        OpenRGB's hub zones default to 0 LEDs and do nothing until sized to
-        the real count - a scan does this automatically for every channel it
-        identifies with certainty. Only change this by hand for a channel a
-        scan left unsized, or to redo one without a full rescan.
-      </p>
       <div id="hubSizesList"></div>
     </section>
     <section>
@@ -509,16 +445,8 @@
 <div id="conflictModal" class="modal-overlay" style="display:none">
   <div class="modal-box">
     <div class="card-title" style="color:var(--warn)">Other lighting/fan software running</div>
-    <p class="note" style="line-height:1.6;margin:10px 0">
-      shyyctl and another controller can't both hold the same hardware at
-      once - whichever one grabbed a device last usually wins, and the
-      other's changes silently don't apply. Detected:
-    </p>
+    <p class="note" style="line-height:1.6;margin:10px 0">Close these first to avoid conflicts:</p>
     <ul id="conflictList" style="margin:0 0 14px 20px;padding:0"></ul>
-    <p class="note" style="line-height:1.6;margin:0 0 14px">
-      Close the program(s) above before controlling anything from shyyctl,
-      or expect the two to intermittently fight over fans/RGB.
-    </p>
     <div class="row" style="justify-content:flex-end">
       <button class="btn sec sm" onclick="dismissConflictModal()">Dismiss</button>
     </div>
@@ -1494,24 +1422,9 @@ function renderUnitProps(){
       </div></div>
     <div class="prop"><label>LED offset</label>
       <input type="number" step="1" value="${u.led_offset||0}"
-        onchange="editUnit('led_offset', parseInt(this.value)||0)">
-      <div class="note" style="line-height:1.6;margin-top:6px">
-        Shifts which physical LED index 0 maps to, without changing the
-        shape - use this if the LED order test below (or Advanced's
-        per-LED colour) highlights the wrong LED, e.g. a "right side" LED
-        that lights up in the middle of a long side on the 360mm unit.
-      </div></div>
+        onchange="editUnit('led_offset', parseInt(this.value)||0)"></div>
     ${u.kind === "fan" && u.led_channel ? `
     <div class="prop"><label>Test LED order</label>
-      <div class="note" style="line-height:1.6;margin-bottom:8px">
-        Split first sets the first half of the strip red and the second
-        half blue, on the fan and on the dots above - a quick check that
-        the overall direction/rotation lines up before worrying about
-        exact indices. Chase then runs a slow moving light (LED 0 on, 1
-        on, 2 on, 3 on, then LED 0 off as 4 turns on, around the strip)
-        for fine-tuning the exact order. Adjust LED offset above until
-        whichever test you're running matches on both sides.
-      </div>
       <div class="row">
         <button class="btn sec sm" onclick="startSplitTest('${u.id}')">Split (red/blue)</button>
       </div>
@@ -1527,11 +1440,6 @@ function renderUnitProps(){
       </div></div>
     ${u.kind !== "display" ? `
     <div class="card-title" style="margin-top:16px">Which one is this?</div>
-    <p class="note" style="line-height:1.6;margin:0 0 10px">
-      ${u.kind==="fan"
-        ? "Turns this channel red and blacks out every other known fan channel."
-        : "Flashes this device red."}
-    </p>
     <button class="btn hot sm" style="width:100%" onclick="identifyUnit('${u.id}')">Identify</button>` : ""}`;
 }
 
