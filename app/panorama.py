@@ -567,6 +567,30 @@ class _PanoramaBase:
             out.append(entries)
         return out
 
+    def _drain_stray_reply(self, timeout_s: float = 0.3):
+        """One short, low-timeout read that discards whatever comes back -
+        called right before starting a multi-step exchange (currently
+        just upload_media's announce/data/finalize sequence below).
+
+        Confirmed necessary against two real uploads: the keepalive
+        loop's periodic ping (main.py's _keepalive_loop) can have its own
+        write already in flight when a slower operation starts, and if
+        the device's "Hey!" reply for that ping arrives a moment late -
+        after our own ping() call already gave up waiting for it - it
+        sits there for whatever the NEXT read happens to be, regardless
+        of which logical step issued it. Confirmed directly: two separate
+        real upload attempts each showed the ping's literal "Hey!" reply
+        content displacing a different one of the three real acks
+        (announce ack the first time, data ack the second) - not a fixed
+        position, exactly what a stray leftover reply landing wherever
+        the timing happens to put it would look like. A short timeout
+        here is deliberate - if nothing stray is pending, this should
+        return almost immediately empty-handed."""
+        raw = self._read_message(timeout_s)
+        if raw:
+            log.info("upload_media: drained a stray reply before starting: %r (raw=%s)",
+                     decode_pb(raw), raw.hex())
+
     def handshake(self, timeout_s: float = 4.0) -> dict | None:
         """timeout_s bumped from 2.0: confirmed against a real run that
         product/model/firmware/serial (from f500) came back fine while
@@ -734,26 +758,28 @@ class _PanoramaBase:
         log.info("upload_media: %s, container=%d bytes (h264=%d bytes, frames=%d, content_type=%d)",
                  remote_name, len(container), len(h264), frame_count, content_type)
 
+        self._drain_stray_reply()
+
         self._write(build_media_announce_frame(session_id, remote_name, len(container)))
-        ack = self.read_message(timeout_s=timeout_s)
-        if ack is None:
+        raw = self._read_message(timeout_s)
+        if not raw:
             log.warning("upload_media: no response to announce frame")
             return None
-        log.info("upload_media: announce ack = %r", ack)
+        log.info("upload_media: announce ack = %r (raw=%s)", decode_pb(raw), raw.hex())
 
         self._write(build_media_data_frame(session_id, container))
-        ack = self.read_message(timeout_s=timeout_s)
-        if ack is None:
+        raw = self._read_message(timeout_s)
+        if not raw:
             log.warning("upload_media: no response to data frame")
             return None
-        log.info("upload_media: data ack = %r", ack)
+        log.info("upload_media: data ack = %r (raw=%s)", decode_pb(raw), raw.hex())
 
         self._write(build_media_finalize_frame(session_id))
-        ack = self.read_message(timeout_s=timeout_s)
-        if ack is None:
+        raw = self._read_message(timeout_s)
+        if not raw:
             log.warning("upload_media: no response to finalize frame")
             return None
-        log.info("upload_media: finalize ack = %r", ack)
+        log.info("upload_media: finalize ack = %r (raw=%s)", decode_pb(raw), raw.hex())
 
         return remote_name
 
