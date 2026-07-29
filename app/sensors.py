@@ -77,15 +77,35 @@ def gpu() -> dict:
         return empty
 
 
+_cpu_temp_warned: set[str] = set()
+
+
 def cpu_temp(url: str, match: str) -> float | None:
     """Walks LibreHardwareMonitor's data.json sensor tree for the first
     leaf whose Text contains `match` (case-insensitive) and has a °C
     value - the tree's shape is an arbitrary-depth "Children" list, not a
-    fixed schema, so this recurses rather than assuming a path."""
+    fixed schema, so this recurses rather than assuming a path.
+
+    Logs (once per distinct reason, not every poll - this gets called
+    every few seconds) whether the failure was "couldn't even reach the
+    server" (LHM not running, or not running with Options > Remote Web
+    Server enabled, or on a different port than configured) versus "got a
+    real response but nothing in it matched `match`" (LHM is running
+    fine, but this exact machine's sensor tree names its CPU package
+    reading something other than the configured cpu_sensor_match) - two
+    different fixes, and silently returning None for both left a human
+    with no way to tell which one they actually have."""
     try:
         with urllib.request.urlopen(url, timeout=2) as resp:
             data = json.loads(resp.read())
-    except Exception:
+    except Exception as exc:
+        key = f"connect:{url}"
+        if key not in _cpu_temp_warned:
+            _cpu_temp_warned.add(key)
+            log.warning(
+                "could not reach LibreHardwareMonitor at %s (%s) - CPU temperature will "
+                "show as unavailable until it's running with Options > Remote Web Server "
+                "enabled on this port. This is only logged once.", url, exc)
         return None
 
     def walk(node):
@@ -105,10 +125,20 @@ def cpu_temp(url: str, match: str) -> float | None:
         return None
 
     try:
-        return walk(data)
+        result = walk(data)
     except Exception as exc:
         log.warning("could not parse LibreHardwareMonitor data: %s", exc)
         return None
+    if result is None:
+        key = f"nomatch:{url}:{match}"
+        if key not in _cpu_temp_warned:
+            _cpu_temp_warned.add(key)
+            log.warning(
+                "LibreHardwareMonitor at %s responded, but no sensor whose name contains "
+                "%r had a temperature reading - check what your CPU's package sensor is "
+                "actually named in LHM's own UI and update config.yaml's "
+                "sensors.cpu_sensor_match to match. This is only logged once.", url, match)
+    return result
 
 
 def snapshot(config: dict) -> dict:

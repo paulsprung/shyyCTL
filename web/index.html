@@ -149,6 +149,17 @@
     font-family:var(--mono);font-size:11px;cursor:pointer}
   .seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
 
+  .curve-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,260px));gap:14px}
+  .curve-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:14px}
+  .curve-card-top{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+  .curve-name-input{font-size:12px;font-weight:600;flex:1;min-width:0;padding:5px 7px}
+  .curve-del{width:24px;height:24px;flex:none;padding:0;font-size:13px;line-height:1;
+    display:flex;align-items:center;justify-content:center}
+  .curve-seg{margin-bottom:8px}
+  .curve-seg button{padding:5px;font-size:9.5px}
+  .curve-status{font-size:10.5px;color:var(--ink-soft);margin-bottom:6px;display:block}
+  .curve-channels{font-size:10.5px;margin-top:6px}
+
   .subnav{display:flex;gap:2px;background:var(--panel-2);border-radius:9px;padding:3px;margin-bottom:20px;
     width:fit-content}
   .subnav button{padding:8px 16px;background:none;border:none;border-radius:7px;color:var(--ink-soft);
@@ -252,7 +263,7 @@
       <section>
         <div class="section-head"><h2>Fan curves</h2><div class="rule"></div>
           <span class="note">assign a fan's group from its card above</span></div>
-        <div class="stack" id="curveList"></div>
+        <div class="curve-grid" id="curveList"></div>
         <div class="row" style="margin-top:12px">
           <button class="btn sec sm" onclick="addCurve()">+ Add curve</button>
         </div>
@@ -807,7 +818,7 @@ async function setDuty(channel, value){
 let curveProfiles = [];
 let curveStatusData = {curves: []};
 let curveDragState = null;
-const CURVE_W = 420, CURVE_H = 200, CURVE_PAD = 30;
+const CURVE_W = 230, CURVE_H = 120, CURVE_PAD = 20;
 const CURVE_PLOT_W = CURVE_W - CURVE_PAD * 2, CURVE_PLOT_H = CURVE_H - CURVE_PAD * 2;
 function curveSvgX(temp){ return CURVE_PAD + (temp / 100) * CURVE_PLOT_W; }
 function curveSvgY(duty){ return CURVE_PAD + CURVE_PLOT_H - (duty / 100) * CURVE_PLOT_H; }
@@ -835,18 +846,18 @@ function curveDiagramSvg(curve){
   curve.points.sort((a, b) => a[0] - b[0]);
   const pts = curve.points;
   let grid = "";
-  for(let g = 0; g <= 100; g += 20){
+  for(let g = 0; g <= 100; g += 25){
     grid += `<line x1="${curveSvgX(g)}" y1="${CURVE_PAD}" x2="${curveSvgX(g)}" y2="${CURVE_PAD + CURVE_PLOT_H}"
       stroke="var(--rule)" stroke-width="1"/>
-      <text x="${curveSvgX(g)}" y="${CURVE_H - 8}" font-size="9" fill="var(--ink-soft)"
+      <text x="${curveSvgX(g)}" y="${CURVE_H - 5}" font-size="6.5" fill="var(--ink-soft)"
         text-anchor="middle" font-family="monospace">${g}&deg;</text>
       <line x1="${CURVE_PAD}" y1="${curveSvgY(g)}" x2="${CURVE_PAD + CURVE_PLOT_W}" y2="${curveSvgY(g)}"
         stroke="var(--rule)" stroke-width="1"/>
-      <text x="6" y="${curveSvgY(g) + 3}" font-size="9" fill="var(--ink-soft)" font-family="monospace">${g}</text>`;
+      <text x="3" y="${curveSvgY(g) + 2.5}" font-size="6.5" fill="var(--ink-soft)" font-family="monospace">${g}</text>`;
   }
   const line = pts.map(p => `${curveSvgX(p[0])},${curveSvgY(p[1])}`).join(" ");
-  const dots = pts.map((p, i) => `<circle cx="${curveSvgX(p[0])}" cy="${curveSvgY(p[1])}" r="6"
-    fill="var(--accent)" stroke="var(--panel)" stroke-width="2" style="cursor:grab"
+  const dots = pts.map((p, i) => `<circle cx="${curveSvgX(p[0])}" cy="${curveSvgY(p[1])}" r="4"
+    fill="var(--accent)" stroke="var(--panel)" stroke-width="1.5" style="cursor:grab"
     onpointerdown="startCurveDrag(event,'${curve.id}',${i})"
     ondblclick="event.stopPropagation(); removeCurvePoint('${curve.id}',${i})"/>`).join("");
   return `<rect x="${CURVE_PAD}" y="${CURVE_PAD}" width="${CURVE_PLOT_W}" height="${CURVE_PLOT_H}"
@@ -867,24 +878,22 @@ function renderCurveList(){
     const status = (curveStatusData.curves || []).find(s => s.id === curve.id);
     const statusText = status && status.temp_c != null
       ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%` : "waiting on temperature&hellip;";
-    return `<div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
-        <input type="text" value="${curve.name}" style="font-weight:600;flex:1"
+    return `<div class="curve-card">
+      <div class="curve-card-top">
+        <input type="text" class="curve-name-input" value="${curve.name}"
           onchange="renameCurve('${curve.id}', this.value)">
-        <button class="btn sec sm" onclick="deleteCurve('${curve.id}')">Delete</button>
+        <button class="btn sec sm curve-del" onclick="deleteCurve('${curve.id}')" title="Delete">&times;</button>
       </div>
-      <div class="row" style="margin-bottom:10px;justify-content:space-between">
-        <div class="seg" style="width:220px">
-          <button aria-pressed="${curve.source==='cpu'}" onclick="setCurveSource('${curve.id}','cpu')">CPU</button>
-          <button aria-pressed="${curve.source==='gpu'}" onclick="setCurveSource('${curve.id}','gpu')">GPU</button>
-          <button aria-pressed="${curve.source==='cpu_gpu'}" onclick="setCurveSource('${curve.id}','cpu_gpu')">CPU+GPU</button>
-        </div>
-        <span class="note">${statusText}</span>
+      <div class="seg curve-seg">
+        <button aria-pressed="${curve.source==='cpu'}" onclick="setCurveSource('${curve.id}','cpu')">CPU</button>
+        <button aria-pressed="${curve.source==='gpu'}" onclick="setCurveSource('${curve.id}','gpu')">GPU</button>
+        <button aria-pressed="${curve.source==='cpu_gpu'}" onclick="setCurveSource('${curve.id}','cpu_gpu')">CPU+GPU</button>
       </div>
+      <span class="curve-status">${statusText}</span>
       <svg class="curve-diagram" data-id="${curve.id}" viewBox="0 0 ${CURVE_W} ${CURVE_H}"
         style="width:100%;display:block;touch-action:none;background:var(--panel-2);border-radius:8px"
         ondblclick="addCurvePointAt(event,'${curve.id}')">${curveDiagramSvg(curve)}</svg>
-      <div class="note" style="margin-top:8px">${curve.channels.length ? curve.channels.join(", ")
+      <div class="curve-channels">${curve.channels.length ? curve.channels.join(", ")
         : "no fans assigned - pick this group on a fan card above"}</div>
     </div>`;
   }).join("");
