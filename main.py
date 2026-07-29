@@ -20,16 +20,18 @@ import json
 import logging
 import math
 import re
+import shutil
 import subprocess
-import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -38,8 +40,9 @@ from app.hub import Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
-from app.panorama import find_print_panel, find_usb_panel
+from app.panorama import find_print_panel, find_usb_panel, generate_thumbnail
 from app.scan import Scan
+from app import sensors as sensors_mod
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
@@ -47,6 +50,9 @@ WEB_DIR = ROOT / "web"
 CURVE_FILE = ROOT / "curve.json"
 LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
+EFFECT_STATE_FILE = ROOT / "effect_state.json"
+GALLERY_DIR = ROOT / "media_gallery"
+GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
 log = logging.getLogger("shyyctl")
@@ -60,6 +66,8 @@ _panorama = None
 _panorama_info: dict | None = None
 _panorama_lock = asyncio.Lock()
 _keepalive_task: asyncio.Task | None = None
+_curve_task: asyncio.Task | None = None
+_curve_status: dict = {"enabled": False, "temp_c": None, "duty": None}
 
 # Host-driven, position-aware hub effects (Advanced RGB view) - see
 # _run_position_effect below. A plain threading.Event rather than an asyncio
@@ -106,6 +114,50 @@ def _save_panorama_state(media: str | None, brightness: int | None):
     default every time a fresh connection object is created."""
     PANORAMA_STATE_FILE.write_text(
         json.dumps({"media": media, "brightness": brightness}), encoding="utf-8")
+
+
+def _save_effect_state(body: "PositionEffectRequest"):
+    """A position effect (unlike a native hub firmware mode, or a static
+    colour applied with persistent=True) is host-driven - main.py's own
+    Python loop is what's actually pushing colours to the hardware, so it
+    goes dark the instant this process stops, and nothing brings it back
+    on the next launch without this. Only the effect's *config* is saved,
+    not started_at - a resumed effect gets a fresh start time (see
+    lifespan below), same as clicking Apply again would."""
+    EFFECT_STATE_FILE.write_text(body.model_dump_json(), encoding="utf-8")
+
+
+def _clear_effect_state():
+    """Called whenever a position effect stops being the thing actually
+    driving the hardware - an explicit Stop, a chase/LED-order test
+    overriding it, or a native hub mode taking over - so a later restart
+    doesn't surprise a human by resuming something they deliberately
+    turned off or replaced."""
+    EFFECT_STATE_FILE.unlink(missing_ok=True)
+
+
+def _load_gallery() -> list[dict]:
+    if GALLERY_MANIFEST.is_file():
+        try:
+            return json.loads(GALLERY_MANIFEST.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _save_gallery(items: list[dict]):
+    GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+    GALLERY_MANIFEST.write_text(json.dumps(items), encoding="utf-8")
+
+
+def _load_effect_state() -> "PositionEffectRequest | None":
+    if not EFFECT_STATE_FILE.is_file():
+        return None
+    try:
+        return PositionEffectRequest.model_validate_json(EFFECT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("could not load saved effect state: %s", exc)
+        return None
 
 
 async def get_panorama():
@@ -245,7 +297,7 @@ def _launch_vendor_openrgb() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _keepalive_task
+    global _keepalive_task, _curve_task
     if not await asyncio.to_thread(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
     if not await asyncio.to_thread(openrgb.connect):
@@ -265,6 +317,7 @@ async def lifespan(app: FastAPI):
                            openrgb.last_error)
     await get_panorama()
     _keepalive_task = asyncio.create_task(_keepalive_loop())
+    _curve_task = asyncio.create_task(_curve_loop())
 
     # Auto-discover on every launch rather than waiting for a human to open
     # Scan and click a button - "quick" spins each fan just long enough to
@@ -277,6 +330,20 @@ async def lifespan(app: FastAPI):
     if hub.connected or openrgb.connected:
         scan.start("quick")
 
+    # Resume whatever position effect was running when this process last
+    # stopped - see _save_effect_state's docstring: it's host-driven, so
+    # it goes dark on process exit with nothing to bring it back unless
+    # this does. persist=False - don't touch the saved file just for
+    # replaying it, and don't wipe it if this particular attempt fails
+    # (a device that isn't connected *yet* this early shouldn't cost a
+    # human their saved effect for every future launch).
+    saved_effect = _load_effect_state()
+    if saved_effect is not None:
+        try:
+            await _do_start_position_effect(saved_effect, persist=False)
+        except Exception as exc:
+            log.warning("Could not resume saved effect: %s", exc)
+
     if CONFIG.get("server", {}).get("open_browser"):
         url = f"http://{CONFIG['server']['host']}:{CONFIG['server']['port']}"
         webbrowser.open(url)
@@ -286,6 +353,9 @@ async def lifespan(app: FastAPI):
     _keepalive_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await _keepalive_task
+    _curve_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await _curve_task
     await _stop_effect()
     hub.disconnect()
     if _panorama is not None:
@@ -318,6 +388,14 @@ async def status():
         "openrgb": {"connected": openrgb.connected, "error": openrgb.last_error},
         "panorama": {"connected": panel is not None and panel.connected},
     }
+
+
+@app.get("/api/sensors")
+async def sensors():
+    """CPU/RAM load, GPU load/mem/temp, CPU temperature - see
+    app/sensors.py for exactly where each one comes from and why each
+    degrades to None independently rather than failing the whole call."""
+    return await asyncio.to_thread(sensors_mod.snapshot, CONFIG)
 
 
 @app.get("/api/conflicts")
@@ -390,23 +468,89 @@ async def set_fan_duty(channel: str, body: DutyRequest):
     return {"channel": channel, "duty": applied}
 
 
-# -- fan curve (storage only for now - no automatic control loop yet) -----
+# -- fan curve --------------------------------------------------------
 
 class CurveRequest(BaseModel):
     points: list[list[int]]  # [[temp_c, duty_pct], ...]
+    enabled: bool = False
 
 
 @app.get("/api/curve")
 async def get_curve():
     if CURVE_FILE.is_file():
-        return json.loads(CURVE_FILE.read_text(encoding="utf-8"))
-    return {"points": CONFIG["curve"]["default"]}
+        data = json.loads(CURVE_FILE.read_text(encoding="utf-8"))
+        data.setdefault("enabled", False)
+        return data
+    return {"points": CONFIG["curve"]["default"], "enabled": False}
 
 
 @app.post("/api/curve")
 async def set_curve(body: CurveRequest):
-    CURVE_FILE.write_text(json.dumps({"points": body.points}), encoding="utf-8")
+    CURVE_FILE.write_text(json.dumps({"points": body.points, "enabled": body.enabled}), encoding="utf-8")
     return {"ok": True}
+
+
+@app.get("/api/curve/status")
+async def curve_status():
+    """What _curve_loop is actually doing right now - separate from the
+    stored config above, same GET-config/GET-status split as scan and the
+    RGB effects (/api/scan/status, /api/rgb/effects/status)."""
+    return _curve_status
+
+
+def _curve_duty_for_temp(points: list[list[int]], min_duty: int, temp_c: float) -> int:
+    """Linear interpolation between the two curve points bracketing
+    temp_c, clamped below by min_duty - a fan stalling near 0% is worse
+    than running a little faster than the curve technically asked for."""
+    pts = sorted(points)
+    if not pts:
+        return min_duty
+    if temp_c <= pts[0][0]:
+        return max(min_duty, pts[0][1])
+    if temp_c >= pts[-1][0]:
+        return max(min_duty, pts[-1][1])
+    for (t0, d0), (t1, d1) in zip(pts, pts[1:]):
+        if t0 <= temp_c <= t1:
+            frac = (temp_c - t0) / (t1 - t0) if t1 != t0 else 0
+            return max(min_duty, round(d0 + (d1 - d0) * frac))
+    return max(min_duty, pts[-1][1])
+
+
+async def _curve_loop():
+    """Polls every few seconds rather than reacting to a temp change
+    event - there isn't one to react to (CPU temp is only ever read by
+    polling LibreHardwareMonitor's own snapshot endpoint, see
+    app/sensors.py), and a fan curve doesn't need sub-second response
+    time anyway. Reads curve.json fresh each cycle instead of caching it
+    in memory, so a change from Settings takes effect on the very next
+    tick without needing to signal this loop directly."""
+    global _curve_status
+    while True:
+        try:
+            state = json.loads(CURVE_FILE.read_text(encoding="utf-8")) if CURVE_FILE.is_file() else {}
+        except Exception:
+            state = {}
+        points = state.get("points") or CONFIG["curve"]["default"]
+        enabled = bool(state.get("enabled"))
+        temp_c = None
+        duty = None
+        if enabled and hub.connected:
+            sensors_cfg = CONFIG.get("sensors", {})
+            temp_c = await asyncio.to_thread(
+                sensors_mod.cpu_temp,
+                sensors_cfg.get("librehardwaremonitor_url", ""),
+                sensors_cfg.get("cpu_sensor_match", "CPU Package"),
+            )
+            if temp_c is not None:
+                duty = _curve_duty_for_temp(points, CONFIG["curve"].get("min_duty", 20), temp_c)
+                channels = [c for c in hub.channels.get("fan", []) if c not in scan.absent]
+                for channel in channels:
+                    try:
+                        await asyncio.to_thread(hub.set_fan, channel, duty)
+                    except Exception as exc:
+                        log.warning("curve: could not set %s to %s%%: %s", channel, duty, exc)
+        _curve_status = {"enabled": enabled, "temp_c": temp_c, "duty": duty}
+        await asyncio.sleep(4)
 
 
 # -- RGB: motherboard / RAM / hub -------------------------------------------
@@ -720,6 +864,7 @@ async def set_hub_mode(body: HubModeRequest):
     effect first if one is active, so the two don't fight over the zone's
     active mode."""
     await _stop_effect()
+    _clear_effect_state()
 
     def _do():
         with _open_hub_raw() as raw:
@@ -1026,6 +1171,7 @@ async def start_chase_effect(channel: str, body: ChaseEffectRequest):
     round trip for no benefit."""
     global _effect_task, _effect_status
     await _stop_effect()
+    _clear_effect_state()
     _effect_stop.clear()
     _effect_status = {"running": True, "kind": "chase", "channel": channel, "error": None}
     _effect_task = asyncio.create_task(
@@ -1041,10 +1187,15 @@ class PositionEffectRequest(BaseModel):
     moving: bool = True
 
 
-@app.post("/api/rgb/effects/position/start")
-async def start_position_effect(body: PositionEffectRequest):
-    """See start_chase_effect's docstring re: always stopping whatever
-    was running first instead of rejecting the request."""
+async def _do_start_position_effect(body: PositionEffectRequest, persist: bool = True):
+    """Shared by the route below and lifespan's on-launch resume - both
+    need to validate, stop whatever's running, and kick off the same
+    background loop. persist=False on the resume path: the state file
+    we're resuming *from* shouldn't be immediately rewritten with the
+    same content, and definitely shouldn't be cleared if something in
+    here fails part way (the saved config should survive a resume
+    attempt that didn't pan out, in case the failure is transient - a
+    hub that isn't connected yet this early in startup, say)."""
     global _effect_task, _effect_status
     if body.direction not in DIRECTIONS:
         raise HTTPException(400, f"unknown direction {body.direction!r} - must be one of {DIRECTIONS}")
@@ -1068,12 +1219,22 @@ async def start_position_effect(body: PositionEffectRequest):
     _effect_task = asyncio.create_task(
         asyncio.to_thread(_run_position_effect, body.direction, body.palette,
                           rgb_colors, period_s, body.moving))
+    if persist:
+        _save_effect_state(body)
+
+
+@app.post("/api/rgb/effects/position/start")
+async def start_position_effect(body: PositionEffectRequest):
+    """See start_chase_effect's docstring re: always stopping whatever
+    was running first instead of rejecting the request."""
+    await _do_start_position_effect(body)
     return {"ok": True}
 
 
 @app.post("/api/rgb/effects/stop")
 async def stop_effect_endpoint():
     await _stop_effect()
+    _clear_effect_state()
     return {"ok": True}
 
 
@@ -1233,38 +1394,94 @@ async def panorama_brightness(body: BrightnessRequest):
     return {"ok": ok}
 
 
-async def _handle_media_upload(file: UploadFile, apply_as_boot: bool) -> dict:
+# -- panorama gallery ---------------------------------------------------
+# A local cache of everything ever uploaded through shyyctl, replacing the
+# old one-shot "pick a file, apply it, forget it" flow. The device itself
+# can't hand back a thumbnail or the original file for something already
+# on it - list_media() only reports path/suffix/size (app/panorama.py) -
+# so re-showing what's been uploaded before means keeping our own copy,
+# not trying to pull one back off the panel. Each entry keeps the exact
+# original file (so Apply/Set boot can re-run the real upload path
+# without asking for the file a second time) plus a small ffmpeg-
+# generated thumbnail for the grid. Uploading only ever caches - it does
+# not touch the panel by itself; Apply/Set boot are separate, explicit
+# actions on a gallery tile, same as they were as separate buttons
+# before, just scoped to one cached item instead of one ad-hoc upload.
+
+@app.get("/api/panorama/gallery")
+async def gallery_list():
+    return _load_gallery()
+
+
+@app.post("/api/panorama/gallery")
+async def gallery_upload(file: UploadFile = File(...)):
+    GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+    item_id = uuid.uuid4().hex[:12]
+    item_dir = GALLERY_DIR / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "upload").suffix or ".png"
+    original_path = item_dir / f"original{suffix}"
+    original_path.write_bytes(await file.read())
+    has_thumb = await asyncio.to_thread(
+        generate_thumbnail, str(original_path), str(item_dir / "thumb.jpg"))
+    entry = {
+        "id": item_id, "name": file.filename or item_id, "suffix": suffix,
+        "has_thumb": has_thumb, "uploaded_at": time.time(),
+    }
+    items = _load_gallery()
+    items.append(entry)
+    _save_gallery(items)
+    return entry
+
+
+@app.get("/api/panorama/gallery/{item_id}/thumb")
+async def gallery_thumb(item_id: str):
+    thumb_path = GALLERY_DIR / item_id / "thumb.jpg"
+    if not thumb_path.is_file():
+        raise HTTPException(404, "no thumbnail")
+    return FileResponse(thumb_path, media_type="image/jpeg")
+
+
+async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
+    item_dir = GALLERY_DIR / item_id
+    original = next(item_dir.glob("original.*"), None) if item_dir.is_dir() else None
+    if original is None:
+        raise HTTPException(404, "no such gallery item")
     panel = await get_panorama()
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
-    suffix = Path(file.filename or "upload").suffix or ".png"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-    try:
-        async with _panorama_lock:
-            remote_name = await asyncio.to_thread(panel.upload_media, tmp_path)
-            if remote_name is None:
-                raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
-            if apply_as_boot:
-                ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
-            else:
-                ok = await asyncio.to_thread(panel.set_media, remote_name)
-                if ok:
-                    _save_panorama_state(panel.last_media, panel.last_brightness)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+    async with _panorama_lock:
+        remote_name = await asyncio.to_thread(panel.upload_media, str(original))
+        if remote_name is None:
+            raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
+        if as_boot:
+            ok = await asyncio.to_thread(panel.set_boot_media, remote_name)
+        else:
+            ok = await asyncio.to_thread(panel.set_media, remote_name)
+            if ok:
+                _save_panorama_state(panel.last_media, panel.last_brightness)
     return {"filename": remote_name, "applied": ok}
 
 
-@app.post("/api/panorama/media")
-async def panorama_upload_media(file: UploadFile = File(...)):
-    return await _handle_media_upload(file, apply_as_boot=False)
+@app.post("/api/panorama/gallery/{item_id}/apply")
+async def gallery_apply(item_id: str):
+    return await _apply_gallery_item(item_id, as_boot=False)
 
 
-@app.post("/api/panorama/boot-image")
-async def panorama_upload_boot_image(file: UploadFile = File(...)):
-    return await _handle_media_upload(file, apply_as_boot=True)
+@app.post("/api/panorama/gallery/{item_id}/boot")
+async def gallery_set_boot(item_id: str):
+    return await _apply_gallery_item(item_id, as_boot=True)
+
+
+@app.delete("/api/panorama/gallery/{item_id}")
+async def gallery_delete(item_id: str):
+    items = _load_gallery()
+    remaining = [i for i in items if i["id"] != item_id]
+    if len(remaining) == len(items):
+        raise HTTPException(404, "no such gallery item")
+    _save_gallery(remaining)
+    shutil.rmtree(GALLERY_DIR / item_id, ignore_errors=True)
+    return {"ok": True}
 
 
 # -- frontend ---------------------------------------------------------------

@@ -8,3 +8,5 @@ settings.json
 vendor/
 curve.json
 panorama_state.json
+effect_state.json
+media_gallery/

@@ -396,6 +396,37 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
     return result.stdout
 
 
+def generate_thumbnail(local_path: str, out_path: str, size: int = 240,
+                        ffmpeg_path: str | None = None) -> bool:
+    """A small JPEG preview for the Display page's gallery. One frame is
+    enough for a gallery tile regardless of source type - ffmpeg grabs it
+    the same way for an image, a gif, or a video (-vframes 1 just means
+    "stop after the first output frame"), so this doesn't need to branch
+    on file type the way encode_to_h264 does for looping a still image.
+    Returns False (logging why) rather than raising - a missing thumbnail
+    shouldn't block the upload it belongs to."""
+    if ffmpeg_path is None:
+        ffmpeg_path = resolve_ffmpeg_path()
+    cmd = [
+        ffmpeg_path, "-y", "-i", local_path,
+        "-vf", f"scale={size}:-1", "-vframes", "1", "-q:v", "4",
+        out_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=20)
+    except FileNotFoundError:
+        log.error("ffmpeg not found - cannot generate thumbnail for %s", local_path)
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("ffmpeg timed out generating thumbnail for %s", local_path)
+        return False
+    if result.returncode != 0:
+        log.error("ffmpeg failed generating thumbnail for %s: %s", local_path,
+                  result.stderr.decode(errors="replace")[-400:])
+        return False
+    return True
+
+
 def default_media_name(local_path: str) -> str:
     """Matches the naming pattern seen in real KANALI uploads exactly:
     a millisecond-precision timestamp, a '.png' middle extension
@@ -496,6 +527,16 @@ class _PanoramaBase:
             if res_field is not None:
                 result["width"] = pb_get(res_field, 1)
                 result["height"] = pb_get(res_field, 2)
+        # f502 still comes back empty on some real units even at this
+        # bumped timeout (see this method's docstring), and pb_get returns
+        # an explicit None rather than omitting the key when that happens -
+        # setdefault alone wouldn't catch that. Rather than show "? x ?"
+        # for a value that's never actually in doubt, fall back to
+        # MEDIA_WIDTH/MEDIA_HEIGHT: every upload already gets encoded to
+        # exactly that resolution (encode_to_h264's own defaults), so it's
+        # not a guess, it's what this code already assumes elsewhere.
+        result["width"] = result.get("width") or MEDIA_WIDTH
+        result["height"] = result.get("height") or MEDIA_HEIGHT
         return result
 
     def ping(self, timeout_s: float = 2.0) -> bool:

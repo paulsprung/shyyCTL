@@ -10,3 +10,4 @@ liquidctl
 openrgb-python
 pyusb
 libusb-package
+psutil
