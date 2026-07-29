@@ -1,11 +1,12 @@
 """Downloads the portable Windows binaries this project needs but doesn't
-want to force a separate install for: ffmpeg (Panorama media encoding) and
-OpenRGB (RGB control backend, with its SDK server this project talks to).
-Neither gets committed to git - both are sizeable (tens to a couple
-hundred MB) and don't belong in source control; this script fetches them
-into vendor/, which is gitignored. main.py looks there first before
-falling back to PATH (see app/panorama.py's ffmpeg lookup and this
-module's find_openrgb_exe()).
+want to force a separate install for: ffmpeg (Panorama media encoding),
+OpenRGB (RGB control backend, with its SDK server this project talks to),
+and LibreHardwareMonitor (CPU/motherboard/RAM temperature - see
+app/sensors.py). None of these get committed to git - all sizeable (tens
+to a couple hundred MB) and don't belong in source control; this script
+fetches them into vendor/, which is gitignored. main.py looks there first
+before falling back to PATH (see app/panorama.py's ffmpeg lookup, this
+module's find_openrgb_exe(), and _launch_vendor_librehardwaremonitor()).
 
 ffmpeg's URL is confirmed working (run against the real internet on the
 target Windows machine this session - downloads and extracts cleanly).
@@ -28,6 +29,25 @@ the actual target Windows machine) - the API shape itself is standard
 Forgejo/Gitea, not a guess, but the exact asset-name filtering below
 hasn't been proven against a live response.
 
+LibreHardwareMonitor: same situation as OpenRGB above - this sandbox's
+network policy blocks direct GitHub API access outside this project's
+own repo, so the exact asset filename below is NOT confirmed against a
+live response either. GitHub's releases API shape
+(GET /repos/{owner}/{repo}/releases) is standard and stable, so the
+lookup logic itself isn't a guess, just unverified end-to-end here.
+Matching by "librehardwaremonitor" + ".zip" in the asset name rather
+than a hardcoded version string, for the same reason OpenRGB's filter
+avoids one - release asset names change across versions.
+
+Deliberately does NOT attempt to pre-configure LibreHardwareMonitor's
+Remote Web Server (Options > Remote Web Server > Run, port 8085) - its
+settings do persist in a LibreHardwareMonitor.config file next to the
+exe once portable, so this only needs doing once by hand, but there is
+no confirmed, documented way to write that setting into the config file
+directly without risking a malformed file that stops the app from
+starting at all. One manual toggle the first time beats a guessed file
+that might silently break every launch after.
+
 Usage:
     python tools/setup_vendor.py
 """
@@ -44,6 +64,7 @@ VENDOR = ROOT / "vendor"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 OPENRGB_RELEASES_API = "https://codeberg.org/api/v1/repos/OpenRGB/OpenRGB/releases?limit=10"
+LHM_RELEASES_API = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases?per_page=10"
 
 
 def _download(url: str, dest: Path):
@@ -143,7 +164,62 @@ def setup_openrgb():
     print(f"Done: {target_dir}")
 
 
+def setup_librehardwaremonitor():
+    target_dir = VENDOR / "LibreHardwareMonitor"
+    if target_dir.exists() and any(target_dir.rglob("LibreHardwareMonitor.exe")):
+        print("LibreHardwareMonitor already present, skipping.")
+        return
+    VENDOR.mkdir(parents=True, exist_ok=True)
+    print("Looking up the latest LibreHardwareMonitor release via the GitHub API ...")
+    asset_url = None
+    asset_name = None
+    try:
+        req = urllib.request.Request(LHM_RELEASES_API, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            releases = json.load(resp)
+        for release in releases:
+            for asset in release.get("assets", []):
+                name = asset.get("name", "")
+                lowered = name.lower()
+                if "librehardwaremonitor" in lowered and lowered.endswith(".zip"):
+                    asset_url = asset.get("browser_download_url")
+                    asset_name = name
+                    break
+            if asset_url:
+                break
+    except Exception as exc:
+        print(f"GitHub API request failed: {exc}")
+    if asset_url is None:
+        print("Could not find a release asset via the GitHub API - download manually "
+              "from https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases "
+              "(the portable zip, e.g. 'LibreHardwareMonitor-net472.zip') and extract it to "
+              "vendor/LibreHardwareMonitor/ yourself (so that "
+              "vendor/LibreHardwareMonitor/LibreHardwareMonitor.exe exists).")
+        sys.exit(1)
+    print(f"Found: {asset_name}")
+    zip_path = VENDOR / "_lhm_download.zip"
+    try:
+        _download(asset_url, zip_path)
+        print("Extracting LibreHardwareMonitor ...")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(target_dir)
+    finally:
+        zip_path.unlink(missing_ok=True)
+    if not any(target_dir.rglob("LibreHardwareMonitor.exe")):
+        print("Extracted, but no LibreHardwareMonitor.exe found anywhere inside - the "
+              "release archive's layout may not match what this script expects. "
+              "Check vendor/LibreHardwareMonitor/ manually.")
+        sys.exit(1)
+    print(f"Done: {target_dir}")
+    print("One-time manual step still needed: launch it once, go to "
+          "Options > Remote Web Server > Run (port 8085), then close it. "
+          "That setting persists in LibreHardwareMonitor.config next to the exe, "
+          "so every future auto-launch by shyyctl will already have it running.")
+
+
 if __name__ == "__main__":
     setup_ffmpeg()
     setup_openrgb()
-    print("\nDone. vendor/ffmpeg.exe and vendor/OpenRGB/ ready.")
+    setup_librehardwaremonitor()
+    print("\nDone. vendor/ffmpeg.exe, vendor/OpenRGB/, and vendor/LibreHardwareMonitor/ ready.")

@@ -717,10 +717,26 @@ function renderSensorTiles(){
   if(!temps || !sys) return;
   const cpuTemp = sensorsData ? sensorsData.cpu_temp_c : null;
   const gpu = (sensorsData && sensorsData.gpu) || {};
-  temps.innerHTML = [
+  const tempTiles = [
     ["CPU Temperature", cpuTemp!=null ? Math.round(cpuTemp) : "--", "°C"],
     ["GPU Temperature", gpu.temp_c!=null ? Math.round(gpu.temp_c) : "--", "°C"],
-  ].map(([l,v,u])=>`
+  ];
+  // Motherboard/RAM temperature tiles only appear once configured
+  // (sensors.mobo_sensor_match/ram_sensor_match in config.yaml) - the
+  // key itself is absent from the response otherwise (see
+  // app/sensors.py's snapshot()), distinct from present-but-null (which
+  // means "configured, but LHM couldn't find a match" - see its
+  // diagnostic log). Unconfigured stays out of the UI entirely rather
+  // than showing a tile that can only ever say "--".
+  if(sensorsData && "mobo_temp_c" in sensorsData){
+    tempTiles.push(["Motherboard Temperature",
+      sensorsData.mobo_temp_c!=null ? Math.round(sensorsData.mobo_temp_c) : "--", "°C"]);
+  }
+  if(sensorsData && "ram_temp_c" in sensorsData){
+    tempTiles.push(["RAM Temperature",
+      sensorsData.ram_temp_c!=null ? Math.round(sensorsData.ram_temp_c) : "--", "°C"]);
+  }
+  temps.innerHTML = tempTiles.map(([l,v,u])=>`
     <div class="stat lg"><div class="stat-label">${l}</div>
       <div class="stat-value">${v}<span class="u">${u}</span></div></div>`).join("");
   const gpuMemGb = gpu.mem_used_mb!=null ? Math.round(gpu.mem_used_mb/1024*10)/10 : null;
