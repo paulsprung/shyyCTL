@@ -42,6 +42,8 @@ import logging
 import subprocess
 import urllib.request
 
+from app.procflags import NO_WINDOW
+
 log = logging.getLogger("sensors")
 
 try:
@@ -76,7 +78,7 @@ def gpu() -> dict:
             ["nvidia-smi",
              "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=3, creationflags=NO_WINDOW,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return empty

@@ -78,6 +78,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from app.procflags import NO_WINDOW
+
 log = logging.getLogger("panorama")
 
 MEDIA_PATH = "/sdcard/pcMedia/"
@@ -480,7 +482,7 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
         "-f", "h264", "-",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
     except FileNotFoundError:
         log.error("ffmpeg not found (checked vendor/ffmpeg.exe and PATH) - "
                   "run tools/setup_vendor.py or install ffmpeg manually")
@@ -512,7 +514,7 @@ def generate_thumbnail(local_path: str, out_path: str, size: int = 240,
         out_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, timeout=20, creationflags=NO_WINDOW)
     except FileNotFoundError:
         log.error("ffmpeg not found - cannot generate thumbnail for %s", local_path)
         return False
@@ -1511,7 +1513,7 @@ class Media:
     def _run(self, *args: str) -> str | None:
         try:
             result = subprocess.run([self.adb_path, *args], capture_output=True,
-                                     text=True, timeout=30)
+                                     text=True, timeout=30, creationflags=NO_WINDOW)
         except FileNotFoundError:
             log.error("adb not found on PATH")
             return None

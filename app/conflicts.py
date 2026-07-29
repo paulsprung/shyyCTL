@@ -21,6 +21,8 @@ nothing is running, just that this list doesn't know its process name yet.
 import logging
 import subprocess
 
+from app.procflags import NO_WINDOW
+
 log = logging.getLogger("conflicts")
 
 # (needle to match case-insensitively in `tasklist` output, display label).
@@ -52,7 +54,8 @@ def running_conflicts() -> list[str]:
     best-effort warning banner, not something that should ever be able
     to break /api/status."""
     try:
-        result = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=5,
+                                 creationflags=NO_WINDOW)
     except Exception as exc:
         log.debug("could not list running processes (tasklist unavailable?): %s", exc)
         return []

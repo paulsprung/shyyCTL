@@ -31,6 +31,8 @@ import re
 import subprocess
 import time
 
+from app.procflags import NO_WINDOW
+
 log = logging.getLogger("hub")
 
 FIRMWARE_MODES = ("off", "fixed", "fading", "spectrum-wave",
@@ -192,7 +194,8 @@ class Hub:
                 # box-drawing character, which then breaks every
                 # downstream regex silently.
                 result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                                         errors="replace", timeout=30, env=_ENV)
+                                         errors="replace", timeout=30, env=_ENV,
+                                         creationflags=NO_WINDOW)
             except FileNotFoundError:
                 log.error("liquidctl not found on PATH")
                 return None
