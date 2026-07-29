@@ -538,11 +538,12 @@
         <section id="liteExportSection">
           <div class="section-head"><h2>Portable background service</h2><div class="rule"></div></div>
           <div class="card">
-            <p class="note" style="margin:0 0 12px">Exports config.yaml, fan curves, LED layout, and the saved
-              RGB effect/colours as a zip. Copy its contents into another shyyctl install (e.g. a dual-boot
-              gaming OS) and run <code>shyyctl.exe --lite</code> there - RGB effects and fan curves keep
-              running with no web server, no browser tab, and no display/gallery overhead, only launching
-              SensorHelper at all if a saved curve actually reads a CPU/motherboard temperature.</p>
+            <p class="note" style="margin:0 0 12px">Exports config.yaml, fan curves, LED layout, saved RGB
+              effect/colours, and the Panorama display's last-applied media as a zip. Copy its contents into
+              another shyyctl install on the same machine (e.g. a dual-boot gaming OS) and run
+              <code>shyyctl.exe --lite</code> there - RGB effects, fan curves, and the display keep running
+              with no web server, no browser tab, and no gallery overhead, only launching SensorHelper at all
+              if a saved curve actually reads a CPU/motherboard temperature.</p>
             <div class="row">
               <button class="btn sec sm" onclick="exportConfig()">Export config</button>
             </div>

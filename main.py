@@ -841,25 +841,32 @@ async def lifespan(app: FastAPI):
 
 async def _lite_service_main():
     """Entry point for `--lite` (see the __main__ block below) - RGB
-    effects and fan curves only, with no web server ever bound, no
-    browser tab, and no Panorama display/gallery involvement at all.
-    Built for the direct user request of running shyyctl on a second,
+    effects, fan curves, and the Panorama display, with no web server
+    ever bound, no browser tab, and no gallery involvement at all. Built
+    for the direct user request of running shyyctl on a second,
     leaned-down Windows install (a dual-boot "gaming" OS) purely as a
     background helper: the CPU/RAM lifespan() normally spends on
-    FastAPI/uvicorn's own request-handling stack, the Panorama keepalive
-    ping loop, and the startup quick-scan is exactly what a machine like
-    that has no use for, on top of what OpenRGB/SensorHelper themselves
-    already cost.
+    FastAPI/uvicorn's own request-handling stack and the startup
+    quick-scan is exactly what a machine like that has no use for, on top
+    of what OpenRGB/SensorHelper themselves already cost. The Panorama
+    keepalive ping is kept, not dropped alongside those - it's one small
+    USB message every ~2s (see _keepalive_loop's own docstring for why it
+    can't be skipped: the panel silently reverts to its own default
+    content a few seconds after the last message it sees), nowhere near
+    what OpenRGB/SensorHelper/uvicorn cost, and dropping it would mean a
+    display that goes dark within seconds of --lite starting.
 
     Reuses every real hardware/state function lifespan() itself uses
     (same hub/openrgb connect calls, same _reapply_rgb_state/
-    _resume_effect_after_scan resume logic, same _curve_loop) rather than
-    reimplementing any of it - this is a trimmed-down startup order, not
-    a second implementation of RGB effects or fan curves. Config for it
-    is whatever's already sitting next to the exe (config.yaml,
-    curve.json, layout.json, rgb_state.json, effect_state.json) - see the
-    Settings page's "Export config" button (/api/system/export-config),
-    which bundles exactly those files for copying into another install.
+    _resume_effect_after_scan resume logic, same get_panorama/
+    _keepalive_loop, same _curve_loop) rather than reimplementing any of
+    it - this is a trimmed-down startup order, not a second
+    implementation of RGB effects, fan curves, or the display. Config for
+    it is whatever's already sitting next to the exe (config.yaml,
+    curve.json, layout.json, rgb_state.json, effect_state.json,
+    panorama_state.json) - see the Settings page's "Export config" button
+    (/api/system/export-config), which bundles exactly those files for
+    copying into another install.
 
     OpenRGB is only launched if there's actually an effect or a saved
     static colour to show - no point paying for a Qt GUI app to sit idle
@@ -867,9 +874,12 @@ async def _lite_service_main():
     curve both has a channel assigned AND reads a cpu/cpu_gpu
     temperature - a GPU-only curve needs nothing from it (nvidia-smi
     alone covers GPU temp), and an unassigned curve isn't driving
-    anything regardless of its source."""
-    global _curve_task
-    log.info("Starting in --lite mode: RGB effects + fan curves only, no web UI.")
+    anything regardless of its source. The Panorama panel, unlike those
+    two, isn't a launched process at all (get_panorama() just opens a USB
+    handle directly), so there's no equivalent "only if needed" gate for
+    it - connecting costs nothing extra to skip checking for."""
+    global _curve_task, _keepalive_task
+    log.info("Starting in --lite mode: RGB effects + fan curves + Panorama display, no web UI.")
 
     if not await asyncio.to_thread(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
@@ -910,14 +920,26 @@ async def _lite_service_main():
     if saved_effect is not None:
         asyncio.create_task(_resume_effect_after_scan(saved_effect))
 
+    # get_panorama() connects, handshakes, and reapplies the last saved
+    # media/brightness in one call - same as lifespan's own startup, and
+    # same reasoning as everything above: no readback exists, so the only
+    # option is unconditionally reapplying whatever was last saved.
+    await get_panorama()
+    _keepalive_task = asyncio.create_task(_keepalive_loop())
+
     _curve_task = asyncio.create_task(_curve_loop())
     try:
         await _curve_task
     except asyncio.CancelledError:
         pass
     finally:
+        _keepalive_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _keepalive_task
         await _stop_effect()
         hub.disconnect()
+        if _panorama is not None:
+            _panorama.disconnect()
 
 
 app = FastAPI(title="shyyctl", lifespan=lifespan)
@@ -1073,12 +1095,13 @@ async def quit_shyyctl():
 
 
 # Every ROOT-relative state file a `--lite` instance (see _lite_service_main
-# below) reads on its own - deliberately everything RGB-effect/fan-curve
-# related and nothing display/gallery related, since --lite never touches
-# either. config.yaml first since it's the one file that's mandatory (hub/
-# openrgb host/port); the rest are included only if they actually exist -
-# a fresh Setup with no saved effect yet shouldn't make this endpoint 404,
-# it should just export a smaller zip.
+# below) reads on its own - RGB effects, fan curves, and the Panorama
+# display's last-applied media, deliberately nothing gallery-related since
+# --lite never touches the gallery itself (only whatever media was already
+# applied before export). config.yaml first since it's the one file that's
+# mandatory (hub/openrgb host/port); the rest are included only if they
+# actually exist - a fresh Setup with nothing saved yet shouldn't make this
+# endpoint 404, it should just export a smaller zip.
 _LITE_EXPORT_FILES: list[tuple[str, "Path"]] = [
     ("config.yaml", _CONFIG_FILE),
     ("curve.json", CURVE_FILE),
@@ -1086,6 +1109,7 @@ _LITE_EXPORT_FILES: list[tuple[str, "Path"]] = [
     ("rgb_state.json", RGB_STATE_FILE),
     ("effect_state.json", EFFECT_STATE_FILE),
     ("effect_presets.json", EFFECT_PRESETS_FILE),
+    ("panorama_state.json", PANORAMA_STATE_FILE),
 ]
 
 
@@ -1094,11 +1118,17 @@ async def export_config():
     """Zips up everything a `--lite` instance needs (see
     _LITE_EXPORT_FILES/_lite_service_main) so it can be copied straight
     into another shyyctl install's folder - e.g. a leaned-down dual-boot
-    gaming Windows where the point is running RGB effects and fan curves
-    for the least possible CPU/RAM, not opening the web UI there at all.
-    Built in memory (io.BytesIO) rather than a temp file - these are all
-    small JSON/YAML files, nothing here is big enough to justify touching
-    disk twice."""
+    gaming Windows where the point is running RGB effects, fan curves,
+    and the Panorama display for the least possible CPU/RAM, not opening
+    the web UI there at all. panorama_state.json only references the
+    media by the name already uploaded onto the panel's own flash storage
+    (see _apply_gallery_item - shyyctl never re-uploads it from this
+    zip), which is exactly why this works for the dual-boot case: it's
+    the same physical panel either way, just driven from a different OS
+    install, so a name it already has on-device is still good. Built in
+    memory (io.BytesIO) rather than a temp file - these are all small
+    JSON/YAML files, nothing here is big enough to justify touching disk
+    twice."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for arcname, path in _LITE_EXPORT_FILES:
