@@ -1412,13 +1412,28 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
 
                 if ctrl is not None:
                     for u in fan_units:
-                        zone = raw.zone_for_channel(ctrl, u["led_channel"])
-                        if zone is None or zone.leds_count == 0:
-                            continue
-                        unit_leds, frame = frame_colors(u)
-                        if len(unit_leds) != zone.leds_count:
-                            continue
-                        raw.set_zone_colors(ctrl.index, zone.index, frame)
+                        try:
+                            zone = raw.zone_for_channel(ctrl, u["led_channel"])
+                            if zone is None or zone.leds_count == 0:
+                                continue
+                            unit_leds, frame = frame_colors(u)
+                            if len(unit_leds) != zone.leds_count:
+                                continue
+                            raw.set_zone_colors(ctrl.index, zone.index, frame)
+                        except Exception as exc:
+                            # A single bad write here (e.g. a transient
+                            # socket hiccup talking to OpenRGB) used to
+                            # propagate up to the outer try/except below
+                            # and kill the WHOLE effect - RAM and mobo
+                            # already only skip the one write that failed
+                            # and keep going (see below); fan channels
+                            # didn't, so one glitch here froze every LED
+                            # (fans, RAM, mobo alike) until a human
+                            # noticed and manually restarted it. Matches
+                            # a real report: "effect hanging" after an
+                            # unrelated USB hiccup elsewhere on the same
+                            # machine.
+                            log.debug("effect: hub write failed for %s: %s", u["id"], exc)
 
                 for u, device in ram_targets:
                     _, frame = frame_colors(u)
