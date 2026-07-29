@@ -67,7 +67,7 @@ _panorama_info: dict | None = None
 _panorama_lock = asyncio.Lock()
 _keepalive_task: asyncio.Task | None = None
 _curve_task: asyncio.Task | None = None
-_curve_status: dict = {"enabled": False, "temp_c": None, "duty": None}
+_curve_status: dict = {"curves": []}
 
 # Host-driven, position-aware hub effects (Advanced RGB view) - see
 # _run_position_effect below. A plain threading.Event rather than an asyncio
@@ -469,32 +469,66 @@ async def set_fan_duty(channel: str, body: DutyRequest):
 
 
 # -- fan curve --------------------------------------------------------
+# A fan is either "Fixed" (plain manual duty, /api/fans/{channel}/duty)
+# or a member of exactly one named curve profile - CPU, GPU, and CPU/GPU
+# combined ship as defaults (matching the three sources a human would
+# actually want to react to), and a human can add more of their own.
+# Membership lives on the curve, not the fan (curve.channels), so "which
+# group is this fan in" is just "which curve's channels list contains
+# it" - a fan absent from every curve's list is Fixed by definition,
+# nothing extra to track.
 
-class CurveRequest(BaseModel):
+CURVE_SOURCES = ("cpu", "gpu", "cpu_gpu")
+
+
+class Curve(BaseModel):
+    id: str
+    name: str
+    source: str  # "cpu" | "gpu" | "cpu_gpu"
     points: list[list[int]]  # [[temp_c, duty_pct], ...]
-    enabled: bool = False
+    channels: list[str] = []
+
+
+class CurvesRequest(BaseModel):
+    curves: list[Curve]
+
+
+def _default_curves() -> list[dict]:
+    points = CONFIG["curve"]["default"]
+    return [
+        {"id": "cpu", "name": "CPU", "source": "cpu", "points": points, "channels": []},
+        {"id": "gpu", "name": "GPU", "source": "gpu", "points": points, "channels": []},
+        {"id": "cpu_gpu", "name": "CPU / GPU", "source": "cpu_gpu", "points": points, "channels": []},
+    ]
 
 
 @app.get("/api/curve")
 async def get_curve():
     if CURVE_FILE.is_file():
-        data = json.loads(CURVE_FILE.read_text(encoding="utf-8"))
-        data.setdefault("enabled", False)
-        return data
-    return {"points": CONFIG["curve"]["default"], "enabled": False}
+        try:
+            data = json.loads(CURVE_FILE.read_text(encoding="utf-8"))
+            if data.get("curves"):
+                return data
+        except Exception:
+            pass
+    return {"curves": _default_curves()}
 
 
 @app.post("/api/curve")
-async def set_curve(body: CurveRequest):
-    CURVE_FILE.write_text(json.dumps({"points": body.points, "enabled": body.enabled}), encoding="utf-8")
+async def set_curve(body: CurvesRequest):
+    for curve in body.curves:
+        if curve.source not in CURVE_SOURCES:
+            raise HTTPException(400, f"unknown curve source {curve.source!r} - must be one of {CURVE_SOURCES}")
+    CURVE_FILE.write_text(
+        json.dumps({"curves": [c.model_dump() for c in body.curves]}), encoding="utf-8")
     return {"ok": True}
 
 
 @app.get("/api/curve/status")
 async def curve_status():
-    """What _curve_loop is actually doing right now - separate from the
-    stored config above, same GET-config/GET-status split as scan and the
-    RGB effects (/api/scan/status, /api/rgb/effects/status)."""
+    """What _curve_loop is actually doing right now, per curve - separate
+    from the stored config above, same GET-config/GET-status split as
+    scan and the RGB effects (/api/scan/status, /api/rgb/effects/status)."""
     return _curve_status
 
 
@@ -516,40 +550,62 @@ def _curve_duty_for_temp(points: list[list[int]], min_duty: int, temp_c: float) 
     return max(min_duty, pts[-1][1])
 
 
+def _combine_temp(cpu_t: float | None, gpu_t: float | None) -> float | None:
+    """The "CPU / GPU" combined source: whichever component is hotter
+    drives the fan, the same reasoning AIO pumps/case fans usually use a
+    combined curve for - being generous to the louder answer is the
+    whole point, not an average that could mask one side running hot."""
+    vals = [t for t in (cpu_t, gpu_t) if t is not None]
+    return max(vals) if vals else None
+
+
 async def _curve_loop():
     """Polls every few seconds rather than reacting to a temp change
-    event - there isn't one to react to (CPU temp is only ever read by
-    polling LibreHardwareMonitor's own snapshot endpoint, see
-    app/sensors.py), and a fan curve doesn't need sub-second response
-    time anyway. Reads curve.json fresh each cycle instead of caching it
-    in memory, so a change from Settings takes effect on the very next
-    tick without needing to signal this loop directly."""
+    event - there isn't one to react to (CPU/GPU temp are only ever read
+    by polling, see app/sensors.py), and a fan curve doesn't need
+    sub-second response time anyway. Reads curve.json fresh each cycle
+    instead of caching it in memory, so a change from the Fans page takes
+    effect on the very next tick without needing to signal this loop
+    directly. Every curve is evaluated every cycle (not just ones with
+    channels assigned) so /api/curve/status can always show what a curve
+    *would* apply, useful feedback while still deciding what to assign
+    it - only a curve with at least one assigned channel actually writes
+    to the hub."""
     global _curve_status
     while True:
         try:
             state = json.loads(CURVE_FILE.read_text(encoding="utf-8")) if CURVE_FILE.is_file() else {}
         except Exception:
             state = {}
-        points = state.get("points") or CONFIG["curve"]["default"]
-        enabled = bool(state.get("enabled"))
-        temp_c = None
-        duty = None
-        if enabled and hub.connected:
+        curves = state.get("curves") or _default_curves()
+        statuses = []
+        if hub.connected:
             sensors_cfg = CONFIG.get("sensors", {})
-            temp_c = await asyncio.to_thread(
+            cpu_t = await asyncio.to_thread(
                 sensors_mod.cpu_temp,
                 sensors_cfg.get("librehardwaremonitor_url", ""),
                 sensors_cfg.get("cpu_sensor_match", "CPU Package"),
             )
-            if temp_c is not None:
-                duty = _curve_duty_for_temp(points, CONFIG["curve"].get("min_duty", 20), temp_c)
-                channels = [c for c in hub.channels.get("fan", []) if c not in scan.absent]
-                for channel in channels:
-                    try:
-                        await asyncio.to_thread(hub.set_fan, channel, duty)
-                    except Exception as exc:
-                        log.warning("curve: could not set %s to %s%%: %s", channel, duty, exc)
-        _curve_status = {"enabled": enabled, "temp_c": temp_c, "duty": duty}
+            gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
+            temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
+            fan_channels = hub.channels.get("fan", [])
+            for curve in curves:
+                temp_c = temps.get(curve.get("source"))
+                channels = [c for c in curve.get("channels", []) if c in fan_channels and c not in scan.absent]
+                duty = None
+                if temp_c is not None and channels:
+                    duty = _curve_duty_for_temp(
+                        curve.get("points") or [], CONFIG["curve"].get("min_duty", 20), temp_c)
+                    for channel in channels:
+                        try:
+                            await asyncio.to_thread(hub.set_fan, channel, duty)
+                        except Exception as exc:
+                            log.warning("curve %s: could not set %s to %s%%: %s",
+                                       curve.get("id"), channel, duty, exc)
+                statuses.append({"id": curve.get("id"), "temp_c": temp_c, "duty": duty})
+        else:
+            statuses = [{"id": c.get("id"), "temp_c": None, "duty": None} for c in curves]
+        _curve_status = {"curves": statuses}
         await asyncio.sleep(4)
 
 

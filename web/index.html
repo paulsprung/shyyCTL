@@ -63,13 +63,30 @@
   .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
   .stack{display:flex;flex-direction:column;gap:10px}
 
-  .gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}
-  .gallery-tile{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);overflow:hidden}
-  .gallery-thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:var(--panel-2);display:block}
-  .gallery-tile-body{padding:10px}
-  .gallery-tile-name{font-size:12px;font-weight:600;margin-bottom:8px;white-space:nowrap;
-    overflow:hidden;text-overflow:ellipsis}
-  .gallery-tile-actions{display:flex;gap:4px;flex-wrap:wrap}
+  .carousel{display:flex;align-items:center;gap:10px}
+  .carousel-arrow{width:36px;height:36px;border-radius:50%;border:1px solid var(--rule);background:var(--panel);
+    color:var(--ink);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:none}
+  .carousel-arrow:hover{background:var(--panel-2)}
+  .carousel-arrow svg{width:16px;height:16px}
+  .carousel-track{display:flex;gap:14px;overflow-x:auto;scroll-behavior:smooth;padding:6px 2px;
+    flex:1;min-width:0;scrollbar-width:none}
+  .carousel-track::-webkit-scrollbar{display:none}
+  .gallery-tile{position:relative;flex:0 0 220px;aspect-ratio:16/9;border-radius:var(--radius);
+    overflow:hidden;background:var(--panel-2);cursor:pointer;border:2px solid transparent;
+    transition:transform .15s,border-color .15s}
+  .gallery-tile:hover{transform:translateY(-3px)}
+  .gallery-tile.active{border-color:var(--accent)}
+  .gallery-thumb{width:100%;height:100%;object-fit:cover;display:block}
+  .gallery-tile-overlay{position:absolute;left:0;right:0;top:0;padding:10px 12px;
+    background:linear-gradient(to bottom,rgba(0,0,0,.65),transparent);
+    display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:#fff}
+  .gallery-tile-dot{width:8px;height:8px;border-radius:50%;border:1.5px solid #fff;flex:none}
+  .gallery-tile.active .gallery-tile-dot{background:var(--accent);border-color:var(--accent)}
+  .gallery-tile-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gallery-tile-delete{position:absolute;right:8px;bottom:8px;width:26px;height:26px;border-radius:50%;
+    background:rgba(0,0,0,.6);color:#fff;border:none;cursor:pointer;font-size:15px;line-height:1;
+    display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
+  .gallery-tile:hover .gallery-tile-delete{opacity:1}
 
   .btn{font-family:var(--body);font-size:12.5px;font-weight:600;padding:9px 16px;border:none;
     border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
@@ -222,13 +239,6 @@
         <div class="stat-grid" id="statusStats"></div>
         <div class="note" id="statusEmpty" style="margin-top:14px"></div>
       </section>
-      <section>
-        <div class="section-head"><h2>Preview</h2><div class="rule"></div>
-          <span class="note">last colours shyyctl applied</span></div>
-        <div class="card">
-          <svg id="statusPreview" viewBox="0 0 900 600" style="width:100%;display:block"></svg>
-        </div>
-      </section>
     </div>
 
     <!-- ================= FANS ================= -->
@@ -236,24 +246,15 @@
       <section>
         <div class="section-head"><h2>Fan speed</h2><div class="rule"></div>
           <span class="note" id="fansNote"></span></div>
-        <div class="row" style="margin-bottom:14px">
-          <div class="seg" id="fanModeSeg" style="width:200px">
-            <button data-v="fixed" aria-pressed="true">Fixed</button>
-            <button data-v="curve">Curve</button>
-          </div>
-          <span class="note" id="curveStatusNote"></span>
-        </div>
         <div class="fan-grid" id="fansList"></div>
       </section>
 
-      <section id="curveSection" style="display:none">
-        <div class="section-head"><h2>Fan curve</h2><div class="rule"></div>
-          <span class="note">CPU temperature &rarr; duty, applied to every fan channel</span></div>
-        <div class="card">
-          <div id="curvePoints"></div>
-          <div class="row" style="margin-top:12px">
-            <button class="btn sm" onclick="saveCurve()">Save curve</button>
-          </div>
+      <section>
+        <div class="section-head"><h2>Fan curves</h2><div class="rule"></div>
+          <span class="note">assign a fan's group from its card above</span></div>
+        <div class="stack" id="curveList"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn sec sm" onclick="addCurve()">+ Add curve</button>
         </div>
       </section>
     </div>
@@ -389,14 +390,24 @@
 
       <section>
         <div class="section-head"><h2>Gallery</h2><div class="rule"></div>
-          <span class="note">apply a tile or set it as the boot image</span></div>
+          <span class="note">click a tile to apply it</span></div>
         <div class="card">
           <div class="row">
             <input type="file" id="galleryUploadFile" accept="image/*,video/*">
             <button class="btn sm" onclick="uploadToGallery()">Add to gallery</button>
           </div>
         </div>
-        <div class="gallery-grid" id="galleryGrid" style="margin-top:14px"></div>
+        <div class="carousel" style="margin-top:14px">
+          <button class="carousel-arrow" onclick="scrollGallery(-1)" aria-label="Scroll left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <div class="carousel-track" id="galleryGrid"></div>
+          <button class="carousel-arrow" onclick="scrollGallery(1)" aria-label="Scroll right">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
       </section>
 
       <section>
@@ -647,7 +658,6 @@ function renderStatus(){
   document.getElementById("statusEmpty").textContent =
     status_.hub.connected ? "" : "Hub not connected — check Settings.";
   renderSensorTiles();
-  drawStatusPreview();
 }
 
 /* ---------- status: system sensors -----------
@@ -687,53 +697,6 @@ function renderSensorTiles(){
   sys.innerHTML = rows.map(([l,v,u])=>`
     <div class="stat"><div class="stat-label">${l}</div>
       <div class="stat-value" style="${String(v).length>5?'font-size:17px':''}">${v}<span class="u">${u}</span></div></div>`).join("");
-}
-
-/* ---------- status: preview -----------
-   Not a live hardware read - there's no way to ask the hub/OpenRGB "what
-   colour is this zone right now" any more than there's a way to ask the
-   Panorama what's currently on screen (see main.py's
-   _save_panorama_state). This just remembers what shyyctl itself last
-   applied through the RGB page's controls, persisted in localStorage so
-   it survives a reload, and renders it on the same layout canvas Setup
-   uses. If something else changed a colour out of band, this goes stale
-   until shyyctl applies something again. */
-
-let lastAppliedColors = {};
-try{ lastAppliedColors = JSON.parse(localStorage.getItem("shyyctl-colors") || "{}"); }catch(e){}
-
-function rememberColor(key, hex){
-  lastAppliedColors[key] = hex;
-  try{ localStorage.setItem("shyyctl-colors", JSON.stringify(lastAppliedColors)); }catch(e){}
-  drawStatusPreview();
-}
-
-function unitColorKey(u){
-  if(u.kind === "mobo") return "mobo";
-  if(u.kind === "ram") return "ram";
-  if(u.kind === "fan") return u.led_channel;
-  return null;
-}
-
-function drawStatusPreview(){
-  const svg = document.getElementById("statusPreview");
-  if(!svg) return;
-  if(!layoutData || !layoutData.units.length){
-    svg.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
-      fill="var(--ink-soft)">No layout yet - place units in Settings &gt; Placement.</text>`;
-    return;
-  }
-  let out = `<rect x="${CANVAS_PAD-16}" y="${CANVAS_PAD-16}" width="${CANVAS_W-(CANVAS_PAD-16)*2}"
-    height="${CANVAS_H-(CANVAS_PAD-16)*2}" fill="none"
-    stroke="var(--ink-soft)" stroke-width="1.2" opacity=".4" rx="3"/>`;
-  for(const u of layoutData.units){
-    if(u.kind === "display") continue;
-    const key = unitColorKey(u);
-    const color = key && lastAppliedColors[key] ? lastAppliedColors[key] : "var(--rule)";
-    const pts = layoutData.leds.filter(l=>l.unit===u.id).map(l=>[shapeX(u,l), shapeY(u,l)]);
-    out += pts.map(([x,y])=>`<circle cx="${x}" cy="${y}" r="3" fill="${color}"/>`).join("");
-  }
-  svg.innerHTML = out;
 }
 
 /* ---------- fans ---------- */
@@ -776,6 +739,9 @@ function renderFans(){
     const dutyVal = useOverride ? override.value : (duty ? Math.round(duty.value) : 0);
     const dutyKnown = useOverride || !!duty;
     const spinning = rpm && rpm.value > 0;
+    const groupId = fanGroupOf(ch);
+    const curve = groupId ? curveProfiles.find(c => c.id === groupId) : null;
+    const curveEntryStatus = curve ? (curveStatusData.curves || []).find(s => s.id === curve.id) : null;
     return `<div class="fan-card">
       <div class="fan-card-top">
         <div class="fan-icon${spinning?" spin":""}"><svg viewBox="0 0 24 24" stroke-width="1.5">
@@ -789,10 +755,10 @@ function renderFans(){
           <div class="fan-card-rpm">${rpm ? rpm.value : "--"}<span class="u">rpm</span></div>
         </div>
       </div>
-      ${fanMode === "curve" ? `
-      <div class="note">${curveStatusData && curveStatusData.temp_c!=null
-          ? `following curve · ${Math.round(curveStatusData.temp_c)}°C &rarr; ${curveStatusData.duty}%`
-          : "waiting on CPU temperature&hellip;"}</div>
+      ${curve ? `
+      <div class="note">${curveEntryStatus && curveEntryStatus.temp_c!=null
+          ? `${curve.name} · ${Math.round(curveEntryStatus.temp_c)}°C &rarr; ${curveEntryStatus.duty}%`
+          : `${curve.name} · waiting on temperature&hellip;`}</div>
       ` : `
       <div class="fan-card-duty">
         <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}"
@@ -802,6 +768,10 @@ function renderFans(){
         <span class="fan-duty-val" id="dutyval-${ch}">${dutyKnown ? dutyVal+" %" : "-- %"}</span>
       </div>
       `}
+      <select class="fan-group-select" style="width:100%;margin-top:10px" onchange="setFanGroup('${ch}', this.value)">
+        <option value="" ${!groupId?"selected":""}>Fixed</option>
+        ${curveProfiles.map(c=>`<option value="${c.id}" ${groupId===c.id?"selected":""}>${c.name}</option>`).join("")}
+      </select>
     </div>`;
   }).join("");
 }
@@ -814,72 +784,199 @@ async function setDuty(channel, value){
   }catch(e){ say(e.message,"error"); }
 }
 
-/* ---------- fan curve ----------
-   CPU temperature -> duty, applied to every fan channel by main.py's own
-   _curve_loop (a background asyncio task, not something this page drives
-   itself) - Fixed/Curve here just flips curve.json's "enabled" flag and
-   reflects what the loop reports back via /api/curve/status. Switching
-   to Curve replaces each fan card's slider with a read-only readout,
-   since the loop would just override a manual duty change within a few
-   seconds anyway - better to make that obvious than let a slider drag
-   silently get overwritten. */
-let curveState = {points: [[30,30],[40,50],[60,75],[80,100]], enabled: false};
-let curveStatusData = null;
-let fanMode = "fixed";
+/* ---------- fan curves ----------
+   A fan is either "Fixed" (the plain manual slider above) or a member of
+   exactly one named curve profile - membership lives on the curve
+   (curve.channels), not the fan, so "which group is this fan in" is just
+   "which curve's channels list contains it"; nothing extra to track, and
+   a fan absent from every curve is Fixed by definition. main.py's own
+   background loop (_curve_loop) is what actually applies a curve's duty
+   to its assigned channels - this page only edits the profiles and
+   reflects /api/curve/status back, same host-driven-effect split as the
+   Advanced RGB page's position effects.
+
+   The diagram is a plain SVG line graph (0-100°C x, 0-100% duty y) -
+   drag a point to move it (same pointer-capture drag pattern as the
+   Placement canvas), double-click empty space to add a point, double-
+   click a point to remove it (minimum 2). Point indices are taken from
+   points sorted by temperature each render, so dragging one point's
+   temperature past a neighbour's can retarget the drag mid-gesture in
+   the rare case someone does that - an accepted quirk, not worth the
+   extra bookkeeping a stable point identity would need for something
+   this low-stakes. */
+let curveProfiles = [];
+let curveStatusData = {curves: []};
+let curveDragState = null;
+const CURVE_W = 420, CURVE_H = 200, CURVE_PAD = 30;
+const CURVE_PLOT_W = CURVE_W - CURVE_PAD * 2, CURVE_PLOT_H = CURVE_H - CURVE_PAD * 2;
+function curveSvgX(temp){ return CURVE_PAD + (temp / 100) * CURVE_PLOT_W; }
+function curveSvgY(duty){ return CURVE_PAD + CURVE_PLOT_H - (duty / 100) * CURVE_PLOT_H; }
+function curveInvX(sx){ return Math.max(0, Math.min(100, Math.round((sx - CURVE_PAD) / CURVE_PLOT_W * 100))); }
+function curveInvY(sy){ return Math.max(0, Math.min(100, Math.round((CURVE_PLOT_H - (sy - CURVE_PAD)) / CURVE_PLOT_H * 100))); }
 
 async function loadCurve(){
-  try{ curveState = await api("/api/curve"); }catch(e){}
-  fanMode = curveState.enabled ? "curve" : "fixed";
+  try{ curveProfiles = (await api("/api/curve")).curves || []; }catch(e){ curveProfiles = []; }
 }
 
-function initFanModeControls(){
-  document.getElementById("fanModeSeg").addEventListener("click", e=>{
-    const btn = e.target.closest("button"); if(!btn) return;
-    setFanMode(btn.dataset.v);
-  });
-  setPressed("fanModeSeg", fanMode);
-  document.getElementById("curveSection").style.display = fanMode === "curve" ? "block" : "none";
-  renderCurvePoints();
+function fanGroupOf(channel){
+  const curve = curveProfiles.find(c => c.channels.includes(channel));
+  return curve ? curve.id : "";
 }
 
-async function setFanMode(mode){
-  fanMode = mode;
-  setPressed("fanModeSeg", mode);
-  document.getElementById("curveSection").style.display = mode === "curve" ? "block" : "none";
-  curveState.enabled = mode === "curve";
-  try{ await api("/api/curve",{method:"POST",body:JSON.stringify(curveState)}); }
-  catch(e){ say(e.message,"error"); }
+async function setFanGroup(channel, curveId){
+  curveProfiles.forEach(c => { c.channels = c.channels.filter(ch => ch !== channel); });
+  const target = curveId && curveProfiles.find(c => c.id === curveId);
+  if(target) target.channels.push(channel);
+  renderFans(); renderCurveList();
+  await saveCurves();
+}
+
+function curveDiagramSvg(curve){
+  curve.points.sort((a, b) => a[0] - b[0]);
+  const pts = curve.points;
+  let grid = "";
+  for(let g = 0; g <= 100; g += 20){
+    grid += `<line x1="${curveSvgX(g)}" y1="${CURVE_PAD}" x2="${curveSvgX(g)}" y2="${CURVE_PAD + CURVE_PLOT_H}"
+      stroke="var(--rule)" stroke-width="1"/>
+      <text x="${curveSvgX(g)}" y="${CURVE_H - 8}" font-size="9" fill="var(--ink-soft)"
+        text-anchor="middle" font-family="monospace">${g}&deg;</text>
+      <line x1="${CURVE_PAD}" y1="${curveSvgY(g)}" x2="${CURVE_PAD + CURVE_PLOT_W}" y2="${curveSvgY(g)}"
+        stroke="var(--rule)" stroke-width="1"/>
+      <text x="6" y="${curveSvgY(g) + 3}" font-size="9" fill="var(--ink-soft)" font-family="monospace">${g}</text>`;
+  }
+  const line = pts.map(p => `${curveSvgX(p[0])},${curveSvgY(p[1])}`).join(" ");
+  const dots = pts.map((p, i) => `<circle cx="${curveSvgX(p[0])}" cy="${curveSvgY(p[1])}" r="6"
+    fill="var(--accent)" stroke="var(--panel)" stroke-width="2" style="cursor:grab"
+    onpointerdown="startCurveDrag(event,'${curve.id}',${i})"
+    ondblclick="event.stopPropagation(); removeCurvePoint('${curve.id}',${i})"/>`).join("");
+  return `<rect x="${CURVE_PAD}" y="${CURVE_PAD}" width="${CURVE_PLOT_W}" height="${CURVE_PLOT_H}"
+    fill="none" stroke="var(--rule)"/>${grid}
+    <polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>${dots}`;
+}
+
+function renderCurveDiagramOnly(curveId){
+  const svg = document.querySelector(`svg.curve-diagram[data-id="${curveId}"]`);
+  const curve = curveProfiles.find(c => c.id === curveId);
+  if(svg && curve) svg.innerHTML = curveDiagramSvg(curve);
+}
+
+function renderCurveList(){
+  const box = document.getElementById("curveList");
+  if(!box) return;
+  box.innerHTML = curveProfiles.map(curve => {
+    const status = (curveStatusData.curves || []).find(s => s.id === curve.id);
+    const statusText = status && status.temp_c != null
+      ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%` : "waiting on temperature&hellip;";
+    return `<div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+        <input type="text" value="${curve.name}" style="font-weight:600;flex:1"
+          onchange="renameCurve('${curve.id}', this.value)">
+        <button class="btn sec sm" onclick="deleteCurve('${curve.id}')">Delete</button>
+      </div>
+      <div class="row" style="margin-bottom:10px;justify-content:space-between">
+        <div class="seg" style="width:220px">
+          <button aria-pressed="${curve.source==='cpu'}" onclick="setCurveSource('${curve.id}','cpu')">CPU</button>
+          <button aria-pressed="${curve.source==='gpu'}" onclick="setCurveSource('${curve.id}','gpu')">GPU</button>
+          <button aria-pressed="${curve.source==='cpu_gpu'}" onclick="setCurveSource('${curve.id}','cpu_gpu')">CPU+GPU</button>
+        </div>
+        <span class="note">${statusText}</span>
+      </div>
+      <svg class="curve-diagram" data-id="${curve.id}" viewBox="0 0 ${CURVE_W} ${CURVE_H}"
+        style="width:100%;display:block;touch-action:none;background:var(--panel-2);border-radius:8px"
+        ondblclick="addCurvePointAt(event,'${curve.id}')">${curveDiagramSvg(curve)}</svg>
+      <div class="note" style="margin-top:8px">${curve.channels.length ? curve.channels.join(", ")
+        : "no fans assigned - pick this group on a fan card above"}</div>
+    </div>`;
+  }).join("");
+}
+
+function startCurveDrag(evt, curveId, index){
+  evt.stopPropagation();
+  const svg = evt.currentTarget.ownerSVGElement;
+  curveDragState = {curveId, index, svg, pt: svg.createSVGPoint()};
+  window.addEventListener("pointermove", onCurveDrag);
+  window.addEventListener("pointerup", stopCurveDrag, {once: true});
+  evt.preventDefault();
+}
+function onCurveDrag(evt){
+  if(!curveDragState) return;
+  const {svg, pt, curveId, index} = curveDragState;
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const curve = curveProfiles.find(c => c.id === curveId);
+  if(!curve || !curve.points[index]) return;
+  curve.points[index] = [curveInvX(loc.x), curveInvY(loc.y)];
+  renderCurveDiagramOnly(curveId);
+}
+async function stopCurveDrag(){
+  window.removeEventListener("pointermove", onCurveDrag);
+  const dragged = curveDragState;
+  curveDragState = null;
+  if(dragged) await saveCurves();
+}
+
+function addCurvePointAt(evt, curveId){
+  const svg = evt.currentTarget;
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  const loc = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const curve = curveProfiles.find(c => c.id === curveId);
+  if(!curve) return;
+  curve.points.push([curveInvX(loc.x), curveInvY(loc.y)]);
+  renderCurveDiagramOnly(curveId);
+  saveCurves();
+}
+
+function removeCurvePoint(curveId, index){
+  const curve = curveProfiles.find(c => c.id === curveId);
+  if(!curve) return;
+  if(curve.points.length <= 2){ say("A curve needs at least 2 points.", "error"); return; }
+  curve.points.splice(index, 1);
+  renderCurveDiagramOnly(curveId);
+  saveCurves();
+}
+
+function setCurveSource(id, source){
+  const curve = curveProfiles.find(c => c.id === id);
+  if(!curve) return;
+  curve.source = source;
+  renderCurveList();
+  saveCurves();
+}
+
+function renameCurve(id, name){
+  const curve = curveProfiles.find(c => c.id === id);
+  if(!curve) return;
+  curve.name = name || curve.name;
+  saveCurves();
   renderFans();
 }
 
-function renderCurvePoints(){
-  const box = document.getElementById("curvePoints");
-  if(!box) return;
-  box.innerHTML = curveState.points.map((p,i)=>`
-    <div class="row" style="margin-bottom:8px">
-      <label class="inline">temp <input type="number" value="${p[0]}" style="width:70px"
-        onchange="curveState.points[${i}][0]=parseInt(this.value)||0"> &deg;C</label>
-      <label class="inline">duty <input type="number" value="${p[1]}" min="0" max="100" style="width:70px"
-        onchange="curveState.points[${i}][1]=parseInt(this.value)||0"> %</label>
-    </div>`).join("");
+async function addCurve(){
+  const name = prompt("Curve name?", "New curve");
+  if(!name) return;
+  curveProfiles.push({
+    id: "curve-" + Date.now().toString(36), name, source: "cpu",
+    points: [[30, 30], [80, 100]], channels: [],
+  });
+  renderCurveList();
+  await saveCurves();
 }
 
-async function saveCurve(){
-  try{
-    await api("/api/curve",{method:"POST",body:JSON.stringify(curveState)});
-    say("Curve saved.");
-  }catch(e){ say(e.message,"error"); }
+async function deleteCurve(id){
+  curveProfiles = curveProfiles.filter(c => c.id !== id);
+  renderCurveList(); renderFans();
+  await saveCurves();
+}
+
+async function saveCurves(){
+  try{ await api("/api/curve", {method: "POST", body: JSON.stringify({curves: curveProfiles})}); }
+  catch(e){ say(e.message, "error"); }
 }
 
 async function pollCurveStatus(){
-  try{ curveStatusData = await api("/api/curve/status"); }catch(e){ curveStatusData = null; }
-  const note = document.getElementById("curveStatusNote");
-  if(note){
-    note.textContent = fanMode !== "curve" ? "" : (curveStatusData && curveStatusData.temp_c!=null
-      ? `${Math.round(curveStatusData.temp_c)}°C &rarr; ${curveStatusData.duty}%`.replace("&rarr;","→")
-      : "CPU temperature unavailable - is LibreHardwareMonitor's web server running?");
-  }
-  if(document.getElementById("page-fans").classList.contains("active")) renderFans();
+  try{ curveStatusData = await api("/api/curve/status"); }catch(e){ curveStatusData = {curves: []}; }
+  if(document.getElementById("page-fans").classList.contains("active")){ renderFans(); renderCurveList(); }
   setTimeout(pollCurveStatus, 4000);
 }
 
@@ -898,7 +995,6 @@ async function setMoboColor(){
   try{
     await api("/api/rgb/mobo/color",{method:"POST",body:JSON.stringify(
       {color:hex, persistent:document.getElementById("moboPersist").checked})});
-    rememberColor("mobo", hex);
     say("Motherboard colour applied.");
   }catch(e){ say(e.message,"error"); }
 }
@@ -936,7 +1032,6 @@ async function setRamStickColor(index){
   try{
     await api(`/api/rgb/ram/stick/${index}/color`,{method:"POST",body:JSON.stringify(
       {color:hex, persistent:true})});
-    rememberColor("ram", hex);
     say(`RAM stick ${index} set.`);
   }catch(e){ say(e.message,"error"); }
 }
@@ -972,7 +1067,6 @@ async function setHubColor(channel){
       color: hex,
       persistent: document.getElementById(`persist-${channel}`).checked,
     })});
-    rememberColor(channel, hex);
     say(`${channel} colour applied.`);
   }catch(e){ say(e.message,"error"); }
 }
@@ -1100,15 +1194,12 @@ async function applyLedColor(){
   try{
     if(info.kind === "fan"){
       await api(`/api/rgb/hub/${info.channel}/leds`,{method:"POST", body:JSON.stringify({colors})});
-      rememberColor(info.channel, hex);
     } else if(info.kind === "mobo"){
       await api(`/api/rgb/mobo/led/${selectedLed.index}/color`,{method:"POST",
         body:JSON.stringify({color:hex, persistent:true})});
-      rememberColor("mobo", hex);
     } else if(info.kind === "ram"){
       await api(`/api/rgb/ram/stick/${info.stick}/led/${selectedLed.index}/color`,{method:"POST",
         body:JSON.stringify({color:hex, persistent:true})});
-      rememberColor("ram", hex);
     }
     say(`LED ${selectedLed.index} on ${u.name} set.`);
     drawAdvancedCase();
@@ -1411,9 +1502,21 @@ async function setPanoBrightness(){
    endpoints) - the device itself can't hand back a thumbnail or the
    original file for something already on it, so re-showing what's been
    uploaded before means keeping our own copy. Uploading only caches;
-   Apply/Set boot are separate actions on a tile, each re-running the
-   real upload-to-panel path against the cached original file. */
+   clicking a tile is what actually pushes it to the panel, KANALI-preset
+   style - no separate Apply button to hunt for.
+
+   Boot image deliberately has no UI entry point yet - the backend route
+   (main.py's gallery_set_boot) exists but hasn't been confirmed working
+   against real hardware, and shipping a button for something that might
+   silently do nothing is worse than not shipping it yet.
+
+   There's no live readback of which media is actually on screen right
+   now (same reasoning as panoStatus.last_applied) - lastGalleryId is
+   this page's own record of the last tile *it* successfully applied,
+   persisted in localStorage so the active-tile highlight survives a
+   reload instead of resetting to "nothing selected" every time. */
 let galleryItems = [];
+let lastGalleryId = localStorage.getItem("shyyctl-gallery-active") || null;
 
 async function loadGallery(){
   try{ galleryItems = await api("/api/panorama/gallery"); }
@@ -1425,19 +1528,21 @@ function renderGallery(){
   if(!box) return;
   if(!galleryItems.length){ box.innerHTML = `<div class="note">No media uploaded yet.</div>`; return; }
   box.innerHTML = galleryItems.slice().reverse().map(item=>`
-    <div class="gallery-tile">
+    <div class="gallery-tile${item.id===lastGalleryId?" active":""}" onclick="applyGalleryItem('${item.id}')">
       ${item.has_thumb
         ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${item.name}">`
-        : `<div class="gallery-thumb"></div>`}
-      <div class="gallery-tile-body">
-        <div class="gallery-tile-name" title="${item.name}">${item.name}</div>
-        <div class="gallery-tile-actions">
-          <button class="btn sm" onclick="applyGalleryItem('${item.id}')">Apply</button>
-          <button class="btn sec sm" onclick="setGalleryBoot('${item.id}')">Set boot</button>
-          <button class="btn sec sm" onclick="deleteGalleryItem('${item.id}')">Delete</button>
-        </div>
+        : ``}
+      <div class="gallery-tile-overlay">
+        <span class="gallery-tile-dot"></span><span class="gallery-tile-name">${item.name}</span>
       </div>
+      <button class="gallery-tile-delete" title="Delete"
+        onclick="event.stopPropagation(); deleteGalleryItem('${item.id}')">&times;</button>
     </div>`).join("");
+}
+
+function scrollGallery(dir){
+  const track = document.getElementById("galleryGrid");
+  if(track) track.scrollBy({left: dir * 240, behavior: "smooth"});
 }
 
 async function uploadToGallery(){
@@ -1459,21 +1564,20 @@ async function applyGalleryItem(id){
   try{
     await api(`/api/panorama/gallery/${id}/apply`,{method:"POST"});
     say("Applied.");
+    lastGalleryId = id;
+    try{ localStorage.setItem("shyyctl-gallery-active", id); }catch(e){}
+    renderGallery();
     await loadPanorama(); renderPanorama();
-  }catch(e){ say(e.message,"error"); }
-}
-
-async function setGalleryBoot(id){
-  say("Encoding and uploading to the panel…");
-  try{
-    await api(`/api/panorama/gallery/${id}/boot`,{method:"POST"});
-    say("Set as boot image.");
   }catch(e){ say(e.message,"error"); }
 }
 
 async function deleteGalleryItem(id){
   try{
     await api(`/api/panorama/gallery/${id}`,{method:"DELETE"});
+    if(id === lastGalleryId){
+      lastGalleryId = null;
+      try{ localStorage.removeItem("shyyctl-gallery-active"); }catch(e){}
+    }
     await loadGallery(); renderGallery();
   }catch(e){ say(e.message,"error"); }
 }
@@ -1598,7 +1702,6 @@ function renderSetup(){
     </div>`).join("") : `<div class="note">No units yet - adopt from the last scan.</div>`;
 
   renderUnitProps();
-  drawStatusPreview();
   drawAdvancedCase();
 }
 
@@ -1901,8 +2004,7 @@ async function refresh(){
   try{ await loadLayout(); renderSetup(); }catch(e){}
   try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
   try{ await loadGallery(); renderGallery(); }catch(e){}
-  try{ await loadCurve(); }catch(e){}
-  initFanModeControls();
+  try{ await loadCurve(); renderCurveList(); renderFans(); }catch(e){}
   pollCurveStatus();
   initEffectControls();
   loadHubModes();
