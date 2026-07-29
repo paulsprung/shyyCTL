@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1483,12 +1484,13 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
 DIRECTIONS = ("top_to_bottom", "bottom_to_top", "left_to_right", "right_to_left", "outward", "inward")
 PALETTES = ("solid", "two_color", "multicolor", "rainbow")
 # "wave" is the original behaviour (colour sampled by each LED's own
-# position along `direction`, unchanged). "breathing" is a new shape
-# added alongside removing the broken standalone hub-mode feature - one
-# uniform colour across every driven LED, with `moving` now controlling
-# brightness pulsing (sine 0..1..0) instead of a travelling gradient;
-# `direction` is meaningless for it and ignored.
-SHAPES = ("wave", "breathing")
+# position along `direction`, unchanged). "breathing" is a uniform colour
+# across every driven LED with brightness pulsing (sine 0..1..0).
+# "strobe" is rapid flashing between full brightness and off (ignore direction).
+# "pulse" is brightness pulsing while cycling through palette colors.
+# "sweep" is like wave but faster movement (2x speed). "sparkle" is random
+# LED twinkling with a base color (ignore direction).
+SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle")
 
 
 def _resolve_effect_targets():
@@ -1653,11 +1655,13 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     }
 
     phase = [0.0]  # mutable cell frame_colors closes over
+    sparkle_states = {}  # track per-LED random values for sparkle effect
 
     cyclic = moving or palette == "rainbow"
 
     def frame_colors(u):
         unit_leds = sorted(leds_by_unit.get(u["id"], []), key=lambda l: l["index"])
+
         if shape == "breathing":
             if moving:
                 color = _sample_palette(palette, colors, phase[0], True)
@@ -1666,6 +1670,61 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             else:
                 final = _sample_palette(palette, colors, 0.0, False)
             return unit_leds, [final] * len(unit_leds)
+
+        if shape == "strobe":
+            # Rapid flashing: full brightness / off, alternates based on phase
+            strobe_freq = 4.0  # flashes per period
+            is_on = (phase[0] * strobe_freq) % 1.0 < 0.5
+            base_color = _sample_palette(palette, colors, 0.0, False)
+            if is_on:
+                final = base_color
+            else:
+                final = (0, 0, 0)
+            return unit_leds, [final] * len(unit_leds)
+
+        if shape == "pulse":
+            # Brightness pulsing while cycling through palette
+            brightness = (1 - math.cos(phase[0] * 2 * math.pi)) / 2
+            color = _sample_palette(palette, colors, phase[0], True)
+            final = tuple(round(c * brightness) for c in color)
+            return unit_leds, [final] * len(unit_leds)
+
+        if shape == "sweep":
+            # Like wave but 2x speed
+            sweep_phase = (phase[0] * 2.0) % 1.0
+            return unit_leds, [
+                _sample_palette(palette, colors,
+                                _position_value(direction, led, bounds) - sweep_phase, cyclic)
+                for led in unit_leds
+            ]
+
+        if shape == "sparkle":
+            # Random LED twinkling with base color
+            base_color = _sample_palette(palette, colors, 0.0, False)
+            uid = u["id"]
+            if uid not in sparkle_states:
+                sparkle_states[uid] = {led["index"]: random.random() for led in unit_leds}
+
+            def get_twinkle_brightness(led_index):
+                # Each LED has its own random twinkle offset
+                state_key = led_index
+                if state_key not in sparkle_states[uid]:
+                    sparkle_states[uid][state_key] = random.random()
+                offset = sparkle_states[uid][state_key]
+                # Phase through brightness based on offset
+                t = (phase[0] + offset) % 1.0
+                # Smooth brightness envelope: ramp up 0->1, then down 1->0
+                if t < 0.5:
+                    return t * 2  # 0 to 1
+                else:
+                    return 2 * (1 - t)  # 1 to 0
+
+            return unit_leds, [
+                tuple(round(c * get_twinkle_brightness(led["index"])) for c in base_color)
+                for led in unit_leds
+            ]
+
+        # Default wave behavior
         return unit_leds, [
             _sample_palette(palette, colors,
                             _position_value(direction, led, bounds) - phase[0], cyclic)
@@ -2144,6 +2203,19 @@ async def gallery_thumb(item_id: str):
     if not thumb_path.is_file():
         raise HTTPException(404, "no thumbnail")
     return FileResponse(thumb_path, media_type="image/jpeg")
+
+
+@app.get("/api/panorama/gallery/{item_id}/original")
+async def gallery_original(item_id: str):
+    item_dir = GALLERY_DIR / item_id
+    if not item_dir.is_dir():
+        raise HTTPException(404, "no such item")
+    original = next(item_dir.glob("original.*"), None)
+    if original is None:
+        raise HTTPException(404, "no original file")
+    suffix = original.suffix.lower()
+    media_type = "video/mp4" if suffix == ".mp4" else "video/webm" if suffix == ".webm" else "video/quicktime" if suffix == ".mov" else "video/x-msvideo" if suffix == ".avi" else "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "application/octet-stream"
+    return FileResponse(original, media_type=media_type)
 
 
 async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:

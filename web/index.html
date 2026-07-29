@@ -87,6 +87,21 @@
     background:rgba(0,0,0,.6);color:#fff;border:none;cursor:pointer;font-size:15px;line-height:1;
     display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
   .gallery-tile:hover .gallery-tile-delete{opacity:1}
+  .gallery-tile-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:50px;height:50px;
+    border-radius:50%;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:24px}
+
+  .gallery-viewer{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.95);
+    z-index:10000;align-items:center;justify-content:center;flex-direction:column;gap:16px;padding:20px}
+  .gallery-viewer.active{display:flex}
+  .gallery-viewer-close{position:absolute;top:16px;right:16px;width:40px;height:40px;background:rgba(255,255,255,.1);
+    border:none;border-radius:50%;color:#fff;font-size:24px;cursor:pointer;display:flex;align-items:center;
+    justify-content:center;transition:background .2s}
+  .gallery-viewer-close:hover{background:rgba(255,255,255,.2)}
+  .gallery-viewer-content{max-width:90vw;max-height:80vh;display:flex;align-items:center;justify-content:center}
+  .gallery-viewer-img{max-width:100%;max-height:100%;border-radius:var(--radius)}
+  .gallery-viewer-video{max-width:100%;max-height:100%;border-radius:var(--radius)}
+  .gallery-viewer-info{text-align:center;color:#fff;font-size:14px}
 
   .btn{font-family:var(--body);font-size:12.5px;font-weight:600;padding:9px 16px;border:none;
     border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
@@ -355,6 +370,10 @@
             <div class="seg" id="effectShapeSeg">
               <button data-v="wave" aria-pressed="true">Wave</button>
               <button data-v="breathing">Breathing</button>
+              <button data-v="strobe">Strobe</button>
+              <button data-v="pulse">Pulse</button>
+              <button data-v="sweep">Sweep</button>
+              <button data-v="sparkle">Sparkle</button>
             </div>
           </div>
 
@@ -591,6 +610,12 @@
       <button class="btn sec sm" onclick="dismissConflictModal()">Dismiss</button>
     </div>
   </div>
+</div>
+
+<div id="galleryViewer" class="gallery-viewer" onclick="if(event.target.id==='galleryViewer') closeGalleryViewer()">
+  <button class="gallery-viewer-close" onclick="closeGalleryViewer()">&times;</button>
+  <div class="gallery-viewer-content" id="galleryViewerContent" onclick="event.stopPropagation()"></div>
+  <div class="gallery-viewer-info" id="galleryViewerInfo"></div>
 </div>
 
 <div id="log"></div>
@@ -1479,14 +1504,14 @@ function initEffectControls(){
 }
 
 function updateEffectShapeUi(){
-  // Direction only means anything for the "wave" shape - "breathing"
-  // shows the same colour on every LED, so greying it out (rather than
-  // hiding it) makes clear it's not being ignored by accident.
+  // Direction only applies to wave and sweep. Other shapes show the same
+  // colour on every LED or use random twinkling, so grey out direction
+  // to make clear it's not being used.
   const dirProp = document.getElementById("effectDirProp");
   if(!dirProp) return;
-  const isBreathing = effectShape === "breathing";
-  dirProp.style.opacity = isBreathing ? "0.4" : "1";
-  dirProp.style.pointerEvents = isBreathing ? "none" : "auto";
+  const usesDirection = effectShape === "wave" || effectShape === "sweep";
+  dirProp.style.opacity = usesDirection ? "1" : "0.4";
+  dirProp.style.pointerEvents = usesDirection ? "auto" : "none";
 }
 
 function setPressed(segId, value){
@@ -1571,13 +1596,7 @@ function samplePalette(palette, colors, t, cyclic){
 
 function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, moving, cyclic){
   // Mirrors main.py's _run_position_effect.frame_colors exactly, so
-  // Preview/the synced canvas both show precisely what Apply would put
-  // on real hardware. "breathing": every LED gets the same colour - it
-  // cycles through the palette via phase just like the wave shape's
-  // gradient does, with brightness pulsing through a sine envelope once
-  // per period while moving, or held at full brightness when static
-  // (a frozen mid-pulse brightness would look like an arbitrary dim
-  // colour rather than the effect actually being "off").
+  // Preview/the synced canvas both show precisely what Apply would put on hardware.
   if(shape === "breathing"){
     if(moving){
       const [r,g,b] = samplePalette(palette, colors, phase, true);
@@ -1586,6 +1605,35 @@ function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, m
     }
     return samplePalette(palette, colors, 0, false);
   }
+  if(shape === "strobe"){
+    // Rapid flashing: full brightness / off
+    const strobeFreq = 4.0;
+    const isOn = ((phase * strobeFreq) % 1) < 0.5;
+    if(isOn) return samplePalette(palette, colors, 0, false);
+    return [0, 0, 0];
+  }
+  if(shape === "pulse"){
+    // Brightness pulsing while cycling through palette
+    const brightness = (1 - Math.cos(phase * 2 * Math.PI)) / 2;
+    const [r,g,b] = samplePalette(palette, colors, phase, true);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+  }
+  if(shape === "sweep"){
+    // Like wave but 2x speed
+    const sweepPhase = (phase * 2) % 1;
+    const pos = positionValue(direction, l, bounds);
+    return samplePalette(palette, colors, pos - sweepPhase, cyclic);
+  }
+  if(shape === "sparkle"){
+    // Random LED twinkling - use LED index as seed for consistent randomness
+    const baseColor = samplePalette(palette, colors, 0, false);
+    const idx = l.index % 256;  // Use LED index as consistent random seed
+    const offset = ((idx * 0.618) % 1);  // Golden ratio for pseudo-random
+    const t = (phase + offset) % 1;
+    const brightness = t < 0.5 ? t * 2 : 2 * (1 - t);
+    return [Math.round(baseColor[0]*brightness), Math.round(baseColor[1]*brightness), Math.round(baseColor[2]*brightness)];
+  }
+  // Default wave behavior
   const pos = positionValue(direction, l, bounds);
   return samplePalette(palette, colors, pos - phase, cyclic);
 }
@@ -1772,11 +1820,13 @@ function renderGallery(){
   const box = document.getElementById("galleryGrid");
   if(!box) return;
   if(!galleryItems.length){ box.innerHTML = `<div class="note">No media uploaded yet.</div>`; return; }
+  const isVideo = item => item.suffix && ['.mp4', '.webm', '.mov', '.avi'].includes(item.suffix.toLowerCase());
   box.innerHTML = galleryItems.slice().reverse().map(item=>`
-    <div class="gallery-tile${item.id===lastGalleryId?" active":""}" onclick="applyGalleryItem('${item.id}')">
+    <div class="gallery-tile${item.id===lastGalleryId?" active":""}" onclick="applyGalleryItem('${item.id}'); event.stopPropagation();" style="cursor:pointer">
       ${item.has_thumb
         ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${item.name}">`
         : ``}
+      ${isVideo(item) ? `<div class="gallery-tile-play">▶</div>` : ''}
       <div class="gallery-tile-overlay">
         <span class="gallery-tile-dot"></span><span class="gallery-tile-name">${item.name}</span>
       </div>
@@ -1804,16 +1854,45 @@ async function uploadToGallery(){
   }catch(e){ say(e.message,"error"); }
 }
 
-async function applyGalleryItem(id){
+function openGalleryViewer(id){
+  const item = galleryItems.find(i => i.id === id);
+  if(!item) return;
+  const isVideo = item.suffix && ['.mp4', '.webm', '.mov', '.avi'].includes(item.suffix.toLowerCase());
+  const viewer = document.getElementById("galleryViewer");
+  const content = document.getElementById("galleryViewerContent");
+  const info = document.getElementById("galleryViewerInfo");
+
+  if(isVideo){
+    content.innerHTML = `<video class="gallery-viewer-video" controls autoplay><source src="/api/panorama/gallery/${item.id}/original" type="video/${item.suffix.replace('.', '')}"</source></video>`;
+  }else{
+    content.innerHTML = `<img class="gallery-viewer-img" src="/api/panorama/gallery/${item.id}/original" alt="${item.name}">`;
+  }
+
+  info.innerHTML = `<div style="font-weight:600">${item.name}</div><button class="btn sm" style="margin-top:8px" onclick="doApplyGalleryItem('${id}')">Apply to panel</button>`;
+  viewer.classList.add("active");
+}
+
+function closeGalleryViewer(){
+  const viewer = document.getElementById("galleryViewer");
+  viewer.classList.remove("active");
+  document.getElementById("galleryViewerContent").innerHTML = "";
+}
+
+async function doApplyGalleryItem(id){
   say("Encoding and uploading to the panel…");
   try{
     await api(`/api/panorama/gallery/${id}/apply`,{method:"POST"});
     say("Applied.");
     lastGalleryId = id;
     try{ localStorage.setItem("shyyctl-gallery-active", id); }catch(e){}
+    closeGalleryViewer();
     renderGallery();
     await loadPanorama(); renderPanorama();
   }catch(e){ say(e.message,"error"); }
+}
+
+function applyGalleryItem(id){
+  openGalleryViewer(id);
 }
 
 async function deleteGalleryItem(id){
