@@ -205,6 +205,23 @@
   .setup-grid > div{background:var(--panel);padding:16px;border:1px solid var(--rule);border-radius:var(--radius)}
   .setup-grid > .canvas{padding:0;border:1px solid var(--rule)}
 
+  /* Advanced RGB canvas: a faint dot grid instead of a flat panel reads
+     less like a placeholder and more like an actual layout surface, and
+     gives the eye a size/position reference while dragging a selection
+     across it. */
+  .adv-canvas{
+    background-image:radial-gradient(var(--rule) 1px, transparent 1px);
+    background-size:22px 22px; background-position:-11px -11px;
+    cursor:crosshair;
+  }
+  #advancedCase circle.led-dot{transition:r .12s ease, stroke-width .12s ease, filter .12s ease}
+  #advancedCase circle.led-dot.led-selected{filter:drop-shadow(0 0 5px var(--accent))}
+  #advancedCase circle.led-dot:not(.led-selected):hover{stroke-width:2}
+
+  .adv-selection-summary{font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);
+    line-height:1.6;margin:0 0 12px;max-height:90px;overflow-y:auto}
+  .adv-props-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+
   .unit-row{display:flex;align-items:center;gap:10px;padding:9px 0;
     border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:12px;cursor:pointer}
   .unit-row:first-child{border-top:none}
@@ -345,14 +362,16 @@
         <div class="section-head">
           <button class="btn sec sm" onclick="showPage('rgb')">&larr; RGB</button>
           <h2 style="margin-left:12px">Advanced</h2><div class="rule"></div>
-          <span class="note">click an LED to select it</span>
+          <span class="note">click, or click-drag across several dots, to select LEDs &middot; shift to add to selection</span>
         </div>
         <div class="setup-grid">
           <div>
-            <div class="canvas"><svg id="advancedCase" viewBox="0 0 900 600"
-              style="width:100%;display:block"></svg></div>
+            <div class="canvas adv-canvas"><svg id="advancedCase" viewBox="0 0 900 600"
+              style="width:100%;display:block;touch-action:none"
+              onpointerdown="advPointerDown(event)" onpointermove="advPointerMove(event)"
+              onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)"></svg></div>
           </div>
-          <div id="advancedLedProps"><div class="note">Select an LED.</div></div>
+          <div id="advancedLedProps"><div class="note">Click, or click-drag across several dots, to select LEDs.</div></div>
         </div>
       </section>
 
@@ -410,6 +429,13 @@
               <button data-v="moving" aria-pressed="true">Moving</button>
               <button data-v="static">Static</button>
             </div>
+          </div>
+
+          <div class="row" id="effectSelectionRow" style="margin-top:14px;display:none">
+            <label class="inline">
+              <input type="checkbox" id="effectRestrictToggle" onchange="setEffectRestrictToSelection(this.checked)">
+              <span id="effectSelectionLabel">Restrict to selected LEDs</span>
+            </label>
           </div>
 
           <div class="row" style="margin-top:14px">
@@ -1288,9 +1314,15 @@ async function setHubColor(channel){
    nothing else) and per stick for RAM (ramLedColorsByStick); mobo shares
    moboLedColors with the Detail section above so the two views agree. */
 
-let selectedLed = null; // {unit, index}
+// selectedLeds holds "unit:index" keys - a Set rather than a single
+// {unit,index} so the canvas can select one LED with a click or many at
+// once with a click-drag, and the properties panel/apply below treat
+// both the same way (a 1-item selection is just the N=1 case).
+let selectedLeds = new Set();
 let advancedLedColors = {};
 let ramLedColorsByStick = {};
+
+function ledKey(unit, index){ return `${unit}:${index}`; }
 
 function channelLedColors(channel, count){
   if(!advancedLedColors[channel] || advancedLedColors[channel].length !== count){
@@ -1347,19 +1379,89 @@ function drawAdvancedCase(){
       font-family="monospace" font-size="10" fill="var(--ink-soft)">${u.name}</text>`;
     leds.forEach(l=>{
       const x = shapeX(u,l), y = shapeY(u,l);
-      const sel = selectedLed && selectedLed.unit===u.id && selectedLed.index===l.index;
+      const sel = selectedLeds.has(ledKey(u.id, l.index));
       const fill = colors ? colors[l.index] : "var(--rule)";
-      out += `<circle id="advLed-${u.id}-${l.index}" cx="${x}" cy="${y}" r="${sel?7:5}" fill="${fill}"
+      out += `<circle id="advLed-${u.id}-${l.index}" class="led-dot${sel?' led-selected':''}"
+        cx="${x}" cy="${y}" r="${sel?7:5}" fill="${fill}"
         stroke="${sel?'var(--accent)':'var(--panel)'}" stroke-width="${sel?2:1}"
-        style="cursor:${info?'pointer':'default'}"
-        ${info?`onclick="selectLed('${u.id}',${l.index})"`:''}/>`;
+        style="cursor:${info?'pointer':'default'}" data-unit="${u.id}" data-index="${l.index}"
+        data-x="${x}" data-y="${y}" data-selectable="${info?1:0}"/>`;
     });
   }
   svg.innerHTML = out;
 }
 
-function selectLed(unit, index){
-  selectedLed = {unit, index};
+/* ---------- Advanced canvas: click / click-drag LED selection ----------
+   "slide across several dots to select them" - a click-drag paint-select,
+   the same interaction a lot of drawing/spreadsheet UIs use, chosen over
+   a rubber-band rectangle because it reads directly off pointer position
+   against each LED's known (x,y) rather than needing rectangle/circle
+   intersection math, and it's the one gesture that generalises cleanly
+   to a curved/non-grid LED layout like a fan ring or a RAM stick's
+   diagonal run. Hit-tested by distance-to-centre against every
+   selectable LED's cx/cy (stashed as data-x/data-y on each circle by
+   drawAdvancedCase) rather than elementFromPoint, so a fast drag that
+   skips past a dot between two pointermove events still picks it up. */
+let advDragging = false;
+let advDragAdditive = false;
+
+function advSvgPoint(svg, evt){
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  const ctm = svg.getScreenCTM();
+  if(!ctm) return {x:0, y:0};
+  const loc = pt.matrixTransform(ctm.inverse());
+  return {x: loc.x, y: loc.y};
+}
+
+function advLedsNear(point, radius){
+  const svg = document.getElementById("advancedCase");
+  if(!svg) return [];
+  const hits = [];
+  svg.querySelectorAll('circle.led-dot[data-selectable="1"]').forEach(el=>{
+    const x = parseFloat(el.dataset.x), y = parseFloat(el.dataset.y);
+    if(Math.hypot(x - point.x, y - point.y) <= radius){
+      hits.push({unit: el.dataset.unit, index: parseInt(el.dataset.index, 10)});
+    }
+  });
+  return hits;
+}
+
+function advPointerDown(evt){
+  if(!layoutData) return;
+  const svg = document.getElementById("advancedCase");
+  advDragging = true;
+  advDragAdditive = evt.shiftKey;
+  if(!advDragAdditive) selectedLeds.clear();
+  try{ svg.setPointerCapture(evt.pointerId); }catch(e){}
+  advPointerMove(evt);
+}
+
+function advPointerMove(evt){
+  if(!advDragging) return;
+  const svg = document.getElementById("advancedCase");
+  const point = advSvgPoint(svg, evt);
+  for(const hit of advLedsNear(point, 11)) selectedLeds.add(ledKey(hit.unit, hit.index));
+  renderAdvancedLedProps();
+  drawAdvancedCase();
+}
+
+function advPointerUp(){
+  advDragging = false;
+}
+
+function clearLedSelection(){
+  selectedLeds.clear();
+  renderAdvancedLedProps();
+  drawAdvancedCase();
+}
+
+function selectAllLeds(){
+  if(!layoutData) return;
+  for(const u of layoutData.units){
+    if(u.kind === "display" || !ledEndpointInfo(u)) continue;
+    for(const l of layoutData.leds.filter(x=>x.unit===u.id)) selectedLeds.add(ledKey(u.id, l.index));
+  }
   renderAdvancedLedProps();
   drawAdvancedCase();
 }
@@ -1367,40 +1469,91 @@ function selectLed(unit, index){
 function renderAdvancedLedProps(){
   const box = document.getElementById("advancedLedProps");
   if(!box) return;
-  if(!selectedLed){ box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
-  const u = layoutData.units.find(x=>x.id===selectedLed.unit);
-  const info = u ? ledEndpointInfo(u) : null;
-  if(!u || !info){ box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
-  const colors = ledColorArray(u, info);
+  updateEffectSelectionUi();
+  if(selectedLeds.size === 0){
+    box.innerHTML = `<div class="note">Click, or click-drag across several dots, to select LEDs.</div>
+      <div class="adv-props-actions"><button class="btn sec sm" onclick="selectAllLeds()">Select all</button></div>`;
+    return;
+  }
+  if(selectedLeds.size === 1){
+    const [key] = selectedLeds;
+    const [unit, indexStr] = key.split(":");
+    const index = parseInt(indexStr, 10);
+    const u = layoutData.units.find(x=>x.id===unit);
+    const info = u ? ledEndpointInfo(u) : null;
+    if(!u || !info){ selectedLeds.clear(); box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
+    const colors = ledColorArray(u, info);
+    box.innerHTML = `
+      <div class="card-title">${u.name} &middot; LED ${index}</div>
+      <div class="prop"><label>Colour</label>
+        <input type="color" id="ledColorInput" value="${colors[index]}"></div>
+      <div class="adv-props-actions">
+        <button class="btn sm" onclick="applyLedColor()">Apply</button>
+        <button class="btn sec sm" onclick="selectAllLeds()">Select all</button>
+        <button class="btn sec sm" onclick="clearLedSelection()">Clear</button>
+      </div>`;
+    return;
+  }
+  const byUnit = {};
+  for(const key of selectedLeds){
+    const unit = key.split(":")[0];
+    byUnit[unit] = (byUnit[unit] || 0) + 1;
+  }
+  const summary = Object.entries(byUnit).map(([uid, n])=>{
+    const u = layoutData.units.find(x=>x.id===uid);
+    return `${u ? u.name : uid}: ${n}`;
+  }).join(" &middot; ");
   box.innerHTML = `
-    <div class="card-title">${u.name} &middot; LED ${selectedLed.index}</div>
+    <div class="card-title">${selectedLeds.size} LEDs selected</div>
+    <div class="adv-selection-summary">${summary}</div>
     <div class="prop"><label>Colour</label>
-      <input type="color" id="ledColorInput" value="${colors[selectedLed.index]}"></div>
-    <button class="btn sm" style="margin-top:10px" onclick="applyLedColor()">Apply</button>
-  `;
+      <input type="color" id="ledColorInput" value="#4c79ff"></div>
+    <div class="adv-props-actions">
+      <button class="btn sm" onclick="applyLedColor()">Apply to ${selectedLeds.size}</button>
+      <button class="btn sec sm" onclick="selectAllLeds()">Select all</button>
+      <button class="btn sec sm" onclick="clearLedSelection()">Clear</button>
+    </div>`;
 }
 
 async function applyLedColor(){
-  if(!selectedLed) return;
-  const u = layoutData.units.find(x=>x.id===selectedLed.unit);
-  const info = u ? ledEndpointInfo(u) : null;
-  if(!u || !info) return;
+  if(selectedLeds.size === 0) return;
   const hex = document.getElementById("ledColorInput").value;
-  const colors = ledColorArray(u, info);
-  colors[selectedLed.index] = hex;
-  try{
-    if(info.kind === "fan"){
-      await api(`/api/rgb/hub/${info.channel}/leds`,{method:"POST", body:JSON.stringify({colors})});
-    } else if(info.kind === "mobo"){
-      await api(`/api/rgb/mobo/led/${selectedLed.index}/color`,{method:"POST",
-        body:JSON.stringify({color:hex, persistent:true})});
-    } else if(info.kind === "ram"){
-      await api(`/api/rgb/ram/stick/${info.stick}/led/${selectedLed.index}/color`,{method:"POST",
-        body:JSON.stringify({color:hex, persistent:true})});
-    }
-    say(`LED ${selectedLed.index} on ${u.name} set.`);
-    drawAdvancedCase();
-  }catch(e){ say(e.message,"error"); }
+  // Group by unit first: a fan channel's write is always the whole
+  // channel array in one call (see the docstring above), so several
+  // selected LEDs on the same fan collapse into one API call instead of
+  // one per LED - mobo/RAM have real per-LED endpoints and don't need
+  // grouping the same way, but grouping first keeps this one loop
+  // uniform for all three kinds either way.
+  const byUnit = groupSelectedLedsByUnit();
+  let okCount = 0, errCount = 0;
+  for(const [unitId, indices] of Object.entries(byUnit)){
+    const u = layoutData.units.find(x=>x.id===unitId);
+    const info = u ? ledEndpointInfo(u) : null;
+    if(!u || !info) continue;
+    const colors = ledColorArray(u, info);
+    for(const idx of indices) colors[idx] = hex;
+    try{
+      if(info.kind === "fan"){
+        await api(`/api/rgb/hub/${info.channel}/leds`,{method:"POST", body:JSON.stringify({colors})});
+        okCount += indices.length;
+      } else if(info.kind === "mobo"){
+        for(const idx of indices){
+          await api(`/api/rgb/mobo/led/${idx}/color`,{method:"POST",
+            body:JSON.stringify({color:hex, persistent:true})});
+          okCount++;
+        }
+      } else if(info.kind === "ram"){
+        for(const idx of indices){
+          await api(`/api/rgb/ram/stick/${info.stick}/led/${idx}/color`,{method:"POST",
+            body:JSON.stringify({color:hex, persistent:true})});
+          okCount++;
+        }
+      }
+    }catch(e){ errCount += indices.length; }
+  }
+  say(errCount ? `Set ${okCount} LED(s), ${errCount} failed.` : `${okCount} LED(s) set.`,
+      errCount ? "error" : "info");
+  drawAdvancedCase();
 }
 
 /* ---------- position effects (Advanced) ----------
@@ -1420,7 +1573,44 @@ let effectPalette = "two_color";
 let effectColors = ["#4c79ff", "#ff7a30"];
 let effectMoving = true;
 let effectShape = "wave";
+let effectRestrictToSelection = false;
 let previewRaf = null;
+
+// Shared by applyLedColor's batch static-colour apply and the effect's
+// led_selection payload below - one grouping so both features read the
+// canvas selection the exact same way.
+function groupSelectedLedsByUnit(){
+  const byUnit = {};
+  for(const key of selectedLeds){
+    const [unit, indexStr] = key.split(":");
+    (byUnit[unit] = byUnit[unit] || []).push(parseInt(indexStr, 10));
+  }
+  return byUnit;
+}
+
+function setEffectRestrictToSelection(checked){
+  effectRestrictToSelection = checked;
+}
+
+// Called from renderAdvancedLedProps whenever the canvas selection
+// changes, and once on page load - keeps the Effect card's restrict
+// checkbox/count in sync with the canvas without the two needing to poll
+// each other.
+function updateEffectSelectionUi(){
+  const row = document.getElementById("effectSelectionRow");
+  const label = document.getElementById("effectSelectionLabel");
+  const toggle = document.getElementById("effectRestrictToggle");
+  if(!row || !label || !toggle) return;
+  if(selectedLeds.size === 0){
+    row.style.display = "none";
+    effectRestrictToSelection = false;
+    toggle.checked = false;
+    return;
+  }
+  row.style.display = "";
+  label.textContent = `Restrict to ${selectedLeds.size} selected LED${selectedLeds.size===1?"":"s"}`;
+  toggle.checked = effectRestrictToSelection;
+}
 
 /* Named, server-persisted snapshots of the effect controls below
    (direction/palette/colours/speed/moving) - same whole-list GET/POST
@@ -1668,6 +1858,19 @@ function effectBounds(leds){
   return {xMin, xSpan:(xMax-xMin)||1, yMin, ySpan:(yMax-yMin)||1, cx, cy, rMax};
 }
 
+// Backend equivalent: PositionEffectRequest.led_selection / _run_position_effect's
+// led_selection param. A dict of {unit: [index,...]} (the shape sent over the
+// wire and stored in _effect_status) turned into a Set of "unit:index" keys -
+// the same key format selectedLeds already uses, so both preview functions
+// below can test membership against either source identically.
+function ledSelectionAllowSet(selectionByUnit){
+  const set = new Set();
+  for(const [unit, idxs] of Object.entries(selectionByUnit || {})){
+    for(const idx of idxs) set.add(ledKey(unit, idx));
+  }
+  return set;
+}
+
 function previewPositionEffect(){
   manualPreviewActive = true;
   stopPreview();
@@ -1677,18 +1880,36 @@ function previewPositionEffect(){
     return u && u.kind !== "display";
   });
   if(!leds.length){ say("No units placed yet - see Settings > Placement.","error"); return; }
+
+  // Mirrors main.py's _run_position_effect exactly when a selection is
+  // active: position-based shapes sample bounds from the selection only,
+  // and every LED outside it goes to (0,0,0) rather than being left
+  // showing whatever it had before - see PositionEffectRequest's
+  // docstring for why (writes are always whole-zone, there's no way to
+  // leave a subset of a zone untouched).
+  const restrictActive = effectRestrictToSelection && selectedLeds.size > 0;
+  const allowSet = restrictActive ? selectedLeds : null;
+  const boundsLeds = allowSet ? leds.filter(l=>allowSet.has(ledKey(l.unit, l.index))) : leds;
+  if(restrictActive && !boundsLeds.length){
+    say("None of the selected LEDs are on a controllable unit.","error"); return;
+  }
   const colors = effectPalette === "rainbow" ? [] : effectColors.map(hexToRgb);
   const cyclic = effectMoving || effectPalette === "rainbow";
   const period = parseFloat(document.getElementById("effectPeriod").value) || 4;
-  const bounds = effectBounds(leds);
+  const bounds = effectBounds(boundsLeds);
   const start = performance.now();
   function frame(now){
     const phase = effectMoving ? ((now - start) / 1000 / period) % 1 : 0;
     for(const l of leds){
+      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
+      if(!el) continue;
+      if(allowSet && !allowSet.has(ledKey(l.unit, l.index))){
+        el.setAttribute("fill", "rgb(0,0,0)");
+        continue;
+      }
       const [r,g,b] = effectFrameColor(effectShape, effectDirection, effectPalette, colors,
         l, bounds, phase, effectMoving, cyclic);
-      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
-      if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
+      el.setAttribute("fill", `rgb(${r},${g},${b})`);
     }
     previewRaf = requestAnimationFrame(frame);
   }
@@ -1712,23 +1933,31 @@ let manualPreviewActive = false;
 function startSyncedPreview(status){
   if(!layoutData) return;
   stopPreview();
-  const {direction, palette, colors: colorsHex, period_s, moving, shape, started_at} = status;
+  const {direction, palette, colors: colorsHex, period_s, moving, shape, started_at, led_selection} = status;
   const leds = layoutData.leds.filter(l=>{
     const u = layoutData.units.find(x=>x.id===l.unit);
     return u && u.kind !== "display";
   });
   if(!leds.length) return;
+  const allowSet = led_selection ? ledSelectionAllowSet(led_selection) : null;
+  const boundsLeds = allowSet ? leds.filter(l=>allowSet.has(ledKey(l.unit, l.index))) : leds;
+  if(!boundsLeds.length) return;
   const colors = palette === "rainbow" ? [] : (colorsHex || []).map(hexToRgb);
   const cyclic = moving || palette === "rainbow";
-  const bounds = effectBounds(leds);
+  const bounds = effectBounds(boundsLeds);
   function frame(){
     const elapsed = (Date.now() / 1000) - started_at;
     const phase = moving ? (((elapsed / period_s) % 1) + 1) % 1 : 0;
     for(const l of leds){
+      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
+      if(!el) continue;
+      if(allowSet && !allowSet.has(ledKey(l.unit, l.index))){
+        el.setAttribute("fill", "rgb(0,0,0)");
+        continue;
+      }
       const [r,g,b] = effectFrameColor(shape || "wave", direction, palette, colors,
         l, bounds, phase, moving, cyclic);
-      const el = document.getElementById(`advLed-${l.unit}-${l.index}`);
-      if(el) el.setAttribute("fill", `rgb(${r},${g},${b})`);
+      el.setAttribute("fill", `rgb(${r},${g},${b})`);
     }
     previewRaf = requestAnimationFrame(frame);
   }
@@ -1742,16 +1971,18 @@ function stopPreview(){
 async function applyPositionEffect(){
   manualPreviewActive = false;
   stopPreview();
+  const payload = {
+    direction: effectDirection,
+    palette: effectPalette,
+    colors: effectPalette === "rainbow" ? [] : effectColors,
+    period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
+    moving: effectMoving,
+    shape: effectShape,
+  };
+  if(effectRestrictToSelection && selectedLeds.size > 0) payload.led_selection = groupSelectedLedsByUnit();
   try{
-    await api("/api/rgb/effects/position/start",{method:"POST",body:JSON.stringify({
-      direction: effectDirection,
-      palette: effectPalette,
-      colors: effectPalette === "rainbow" ? [] : effectColors,
-      period_s: parseFloat(document.getElementById("effectPeriod").value) || 4,
-      moving: effectMoving,
-      shape: effectShape,
-    })});
-    say("Effect applied to the PC.");
+    await api("/api/rgb/effects/position/start",{method:"POST",body:JSON.stringify(payload)});
+    say(payload.led_selection ? `Effect applied to ${selectedLeds.size} selected LED(s).` : "Effect applied to the PC.");
     pollEffectStatus();
   }catch(e){ say(e.message,"error"); }
 }
@@ -2060,6 +2291,7 @@ function renderSetup(){
 
   renderUnitProps();
   drawAdvancedCase();
+  renderAdvancedLedProps();
 }
 
 function drawSetupCase(){

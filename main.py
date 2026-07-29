@@ -1762,7 +1762,8 @@ def _sample_palette(palette: str, colors: list[tuple], t: float, cyclic: bool) -
 
 
 def _run_position_effect(direction: str, palette: str, colors: list[tuple],
-                         period_s: float, moving: bool, shape: str = "wave"):
+                         period_s: float, moving: bool, shape: str = "wave",
+                         led_selection: dict[str, set[int]] | None = None):
     """Runs until _effect_stop is set, on its own worker thread (via
     asyncio.to_thread) - one raw hub connection held for the whole effect
     rather than reopened per frame (see openrgb_raw.py's docstring on
@@ -1773,6 +1774,15 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     - a single generalised effect covering directional wipes, radial
     in/out, solid colour, multi-stop gradients and a moving rainbow,
     rather than one hardcoded top-to-bottom two-colour wave.
+
+    led_selection (unit id -> set of LED indices), when given, restricts
+    which LEDs actually show the effect - direction-based shapes also
+    compute their position bounds only from the selected LEDs, so e.g. a
+    wave across a five-LED selection in the middle of a 36-LED fan still
+    spans that selection's own full range rather than a sliver of the
+    whole fan's range. Every LED outside the selection still gets written
+    every frame forced to (0,0,0) - see PositionEffectRequest's docstring
+    for why there's no way to instead just leave it alone.
 
     shape="breathing" is a second effect added alongside removing the
     broken standalone hub-mode feature: every driven LED shows the same
@@ -1797,9 +1807,12 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     if mobo_target is not None:
         driven_ids.add(mobo_target[0]["id"])
     all_leds = [led for uid in driven_ids for led in leds_by_unit.get(uid, [])]
+    if led_selection is not None:
+        all_leds = [led for led in all_leds if led["index"] in led_selection.get(led["unit"], ())]
     if not all_leds:
         _effect_status = {"running": False, "kind": None,
-                           "error": "no units placed in Setup yet"}
+                           "error": "no LEDs selected" if led_selection is not None
+                           else "no units placed in Setup yet"}
         return
     xs = [l["x"] for l in all_leds]
     ys = [l["y"] for l in all_leds]
@@ -1827,36 +1840,33 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 final = tuple(round(c * brightness) for c in color)
             else:
                 final = _sample_palette(palette, colors, 0.0, False)
-            return unit_leds, [final] * len(unit_leds)
+            colors_out = [final] * len(unit_leds)
 
-        if shape == "strobe":
+        elif shape == "strobe":
             # Rapid flashing: full brightness / off, alternates based on phase
             strobe_freq = 4.0  # flashes per period
             is_on = (phase[0] * strobe_freq) % 1.0 < 0.5
             base_color = _sample_palette(palette, colors, 0.0, False)
-            if is_on:
-                final = base_color
-            else:
-                final = (0, 0, 0)
-            return unit_leds, [final] * len(unit_leds)
+            final = base_color if is_on else (0, 0, 0)
+            colors_out = [final] * len(unit_leds)
 
-        if shape == "pulse":
+        elif shape == "pulse":
             # Brightness pulsing while cycling through palette
             brightness = (1 - math.cos(phase[0] * 2 * math.pi)) / 2
             color = _sample_palette(palette, colors, phase[0], True)
             final = tuple(round(c * brightness) for c in color)
-            return unit_leds, [final] * len(unit_leds)
+            colors_out = [final] * len(unit_leds)
 
-        if shape == "sweep":
+        elif shape == "sweep":
             # Like wave but 2x speed
             sweep_phase = (phase[0] * 2.0) % 1.0
-            return unit_leds, [
+            colors_out = [
                 _sample_palette(palette, colors,
                                 _position_value(direction, led, bounds) - sweep_phase, cyclic)
                 for led in unit_leds
             ]
 
-        if shape == "sparkle":
+        elif shape == "sparkle":
             # Twinkling with a base colour - each LED's twinkle offset is a
             # deterministic function of its own index (golden-ratio
             # multiplication, a cheap standard trick for spreading integer
@@ -1880,17 +1890,25 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 else:
                     return 2 * (1 - t)  # 1 to 0
 
-            return unit_leds, [
+            colors_out = [
                 tuple(round(c * get_twinkle_brightness(led["index"])) for c in base_color)
                 for led in unit_leds
             ]
 
-        # Default wave behavior
-        return unit_leds, [
-            _sample_palette(palette, colors,
-                            _position_value(direction, led, bounds) - phase[0], cyclic)
-            for led in unit_leds
-        ]
+        else:
+            # Default wave behavior
+            colors_out = [
+                _sample_palette(palette, colors,
+                                _position_value(direction, led, bounds) - phase[0], cyclic)
+                for led in unit_leds
+            ]
+
+        if led_selection is not None:
+            allowed = led_selection.get(u["id"], ())
+            colors_out = [c if led["index"] in allowed else (0, 0, 0)
+                          for led, c in zip(unit_leds, colors_out)]
+
+        return unit_leds, colors_out
 
     for _, device in ram_targets:
         openrgb.select_mode(device, "direct")
@@ -2042,6 +2060,16 @@ class PositionEffectRequest(BaseModel):
     period_s: float = 4.0
     moving: bool = True
     shape: str = "wave"
+    # {unit_id: [led_index, ...]} - restricts the effect to only these
+    # LEDs (built from the Advanced canvas's click-drag multi-select, see
+    # web/index.html's selectedLeds), or None for "every placed unit" (the
+    # long-standing default). Every LED outside the selection still gets
+    # written every frame (writes are always whole-zone, see
+    # _run_position_effect - there's no way to leave a subset of a zone
+    # untouched), just forced to (0,0,0)/off instead of the effect's own
+    # colour, rather than left showing whatever static colour it had
+    # before Apply.
+    led_selection: dict[str, list[int]] | None = None
 
 
 async def _do_start_position_effect(body: PositionEffectRequest, persist: bool = True):
@@ -2064,6 +2092,8 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
     period_s = max(body.period_s, 0.5)
     await _stop_effect()
     _effect_stop.clear()
+    selection = ({uid: set(idxs) for uid, idxs in body.led_selection.items()}
+                 if body.led_selection else None)
     # started_at (wall-clock, not the loop's own time.monotonic() reference)
     # is what lets the browser reconstruct the *same* phase the backend is
     # currently showing - see startSyncedPreview() in the frontend - so the
@@ -2073,11 +2103,12 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
     _effect_status = {
         "running": True, "kind": "position", "direction": body.direction,
         "palette": body.palette, "colors": body.colors, "period_s": period_s,
-        "moving": body.moving, "shape": body.shape, "started_at": time.time(), "error": None,
+        "moving": body.moving, "shape": body.shape, "led_selection": body.led_selection,
+        "started_at": time.time(), "error": None,
     }
     _effect_task = asyncio.create_task(
         asyncio.to_thread(_run_position_effect, body.direction, body.palette,
-                          rgb_colors, period_s, body.moving, body.shape))
+                          rgb_colors, period_s, body.moving, body.shape, selection))
     if persist:
         _save_effect_state(body)
 
