@@ -72,8 +72,18 @@ jobs:
           path: tools/build_installer/shyyctl-setup-${{ steps.version.outputs.version }}.exe
 
       - name: Create GitHub release
-        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          # On a tag push, GITHUB_REF_NAME already is the tag - reuse it
+          # exactly rather than re-deriving "v" + version, since a
+          # manually-run workflow_dispatch build has no tag at all yet.
+          # softprops/action-gh-release creates the tag (pointed at the
+          # ref this run happened on) if it doesn't already exist, so
+          # a manual "v1.0.0" build works the same as pushing that tag
+          # would've - this exists specifically because this session's
+          # git remote is scoped to branch pushes only and can't push
+          # tags itself, so workflow_dispatch is the only way to cut a
+          # release without a human pushing the tag by hand.
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           files: tools/build_installer/shyyctl-setup-${{ steps.version.outputs.version }}.exe
           generate_release_notes: true
