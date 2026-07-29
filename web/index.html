@@ -11,6 +11,7 @@
     --ok:#1E7A4B; --field:#FFFFFF; --radius:10px;
     --body:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
     --mono:"Cascadia Mono","Consolas",ui-monospace,monospace;
+    --display:"Bahnschrift","DIN Alternate","Segoe UI",sans-serif;
   }
   [data-theme="dark"] {
     --bg:#101215; --sidebar:#15171B; --panel:#1B1E23; --panel-2:#22262C; --ink:#EDEEF0;
@@ -27,9 +28,8 @@
   /* ---- sidebar ---- */
   .sidebar{width:216px;flex:none;background:var(--sidebar);border-right:1px solid var(--rule);
     display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
-  .brand{display:flex;align-items:center;gap:10px;padding:20px 18px;font-weight:700;font-size:16px}
-  .brand-mark{width:26px;height:26px;border-radius:7px;background:var(--accent);color:#fff;
-    display:flex;align-items:center;justify-content:center;font-size:13px;flex:none}
+  .brand{padding:24px 18px 18px;font-family:var(--display);font-weight:700;font-size:21px;
+    letter-spacing:.14em;text-transform:uppercase}
   .sidenav{display:flex;flex-direction:column;gap:2px;padding:6px 10px;flex:1}
   .navlink{display:flex;align-items:center;gap:12px;padding:10px 12px;border:none;background:none;
     color:var(--ink-soft);font-family:var(--body);font-size:13.5px;font-weight:500;text-align:left;
@@ -100,12 +100,20 @@
   .stat-value{font-family:var(--mono);font-size:26px;font-variant-numeric:tabular-nums;margin-top:6px}
   .stat-value .u{font-size:12px;color:var(--ink-soft)}
 
-  .fan-row{display:flex;align-items:center;gap:14px;padding:14px 0;border-top:1px solid var(--rule)}
-  .fan-row:first-child{border-top:none}
-  .fan-icon{width:38px;height:38px;border-radius:10px;background:var(--panel-2);flex:none;
-    display:flex;align-items:center;justify-content:center;color:var(--ink-soft)}
-  .fan-main{flex:1;min-width:0}
-  .fan-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .fan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+  .fan-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:18px}
+  .fan-card-top{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+  .fan-icon{width:48px;height:48px;border-radius:12px;background:var(--panel-2);flex:none;
+    display:flex;align-items:center;justify-content:center;color:var(--accent)}
+  .fan-icon svg{width:26px;height:26px}
+  .fan-icon.spin svg{animation:fan-spin 1s linear infinite}
+  @keyframes fan-spin{to{transform:rotate(360deg)}}
+  .fan-card-name{font-size:11px;font-weight:700;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.06em}
+  .fan-card-rpm{font-family:var(--mono);font-size:28px;font-variant-numeric:tabular-nums;margin-top:3px}
+  .fan-card-rpm .u{font-size:12px;color:var(--ink-soft);margin-left:3px}
+  .fan-card-duty{display:flex;align-items:center;gap:10px}
+  .fan-card-duty input[type=range]{flex:1}
+  .fan-duty-val{font-family:var(--mono);font-size:12px;color:var(--ink-soft);width:44px;text-align:right}
 
   .seg{display:flex;gap:2px;background:var(--panel-2);border-radius:8px;padding:2px}
   .seg button{flex:1;padding:7px;background:none;border:none;border-radius:6px;color:var(--ink-soft);
@@ -158,12 +166,16 @@
 <div class="shell">
 
   <aside class="sidebar">
-    <div class="brand"><span class="brand-mark">S</span>shyyctl</div>
+    <div class="brand">shyyctl</div>
     <nav class="sidenav" aria-label="Sections">
       <button class="navlink" id="tab-status" onclick="showPage('status')">
         <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Status</button>
       <button class="navlink" id="tab-fans" onclick="showPage('fans')">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"/></svg>Fans</button>
+        <svg class="icon" viewBox="0 0 24 24" stroke-width="1.5"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+          <path d="M12 11c0-3.5 2.2-6.5 4.8-6.5 1.1 0 1.7 2.3-.6 5-1 1.2-2.8 1.7-4.2 1.5z"/>
+          <path d="M13 12c3.5 0 6.5 2.2 6.5 4.8 0 1.1-2.3 1.7-5-.6-1.2-1-1.7-2.8-1.5-4.2z"/>
+          <path d="M12 13c0 3.5-2.2 6.5-4.8 6.5-1.1 0-1.7-2.3.6-5 1-1.2 2.8-1.7 4.2-1.5z"/>
+          <path d="M11 12c-3.5 0-6.5-2.2-6.5-4.8 0-1.1 2.3-1.7 5 .6 1.2 1 1.7 2.8 1.5 4.2z"/></svg>Fans</button>
       <button class="navlink" id="tab-rgb" onclick="showPage('rgb')">
         <svg class="icon" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>RGB</button>
       <button class="navlink" id="tab-display" onclick="showPage('display')">
@@ -204,7 +216,7 @@
       <section>
         <div class="section-head"><h2>Fan speed</h2><div class="rule"></div>
           <span class="note" id="fansNote"></span></div>
-        <div class="card" id="fansList"></div>
+        <div class="fan-grid" id="fansList"></div>
       </section>
     </div>
 
@@ -692,21 +704,26 @@ function renderFans(){
     const useOverride = override && Date.now() < override.until;
     const dutyVal = useOverride ? override.value : (duty ? Math.round(duty.value) : 0);
     const dutyKnown = useOverride || !!duty;
-    return `<div class="fan-row">
-      <div class="fan-icon"><svg class="icon" viewBox="0 0 24 24">
-        <path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"/></svg></div>
-      <div class="fan-main">
-        <div class="fan-top">
-          <strong>${ch}</strong>
-          <span class="note">${rpm ? rpm.value + " rpm" : "-- rpm"}</span>
+    const spinning = rpm && rpm.value > 0;
+    return `<div class="fan-card">
+      <div class="fan-card-top">
+        <div class="fan-icon${spinning?" spin":""}"><svg viewBox="0 0 24 24" stroke-width="1.5">
+          <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+          <path d="M12 11c0-3.5 2.2-6.5 4.8-6.5 1.1 0 1.7 2.3-.6 5-1 1.2-2.8 1.7-4.2 1.5z"/>
+          <path d="M13 12c3.5 0 6.5 2.2 6.5 4.8 0 1.1-2.3 1.7-5-.6-1.2-1-1.7-2.8-1.5-4.2z"/>
+          <path d="M12 13c0 3.5-2.2 6.5-4.8 6.5-1.1 0-1.7-2.3.6-5 1-1.2 2.8-1.7 4.2-1.5z"/>
+          <path d="M11 12c-3.5 0-6.5-2.2-6.5-4.8 0-1.1 2.3-1.7 5 .6 1.2 1 1.7 2.8 1.5 4.2z"/></svg></div>
+        <div>
+          <div class="fan-card-name">${ch}</div>
+          <div class="fan-card-rpm">${rpm ? rpm.value : "--"}<span class="u">rpm</span></div>
         </div>
-        <div class="row" style="align-items:center">
-          <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}" style="flex:1"
-            onpointerdown="dutySliderActive=true" onpointerup="dutySliderActive=false"
-            oninput="document.getElementById('dutyval-${ch}').textContent=this.value+' %'"
-            onchange="setDuty('${ch}', this.value)">
-          <span class="note" id="dutyval-${ch}" style="width:56px;text-align:right">${dutyKnown ? dutyVal+" %" : "-- %"}</span>
-        </div>
+      </div>
+      <div class="fan-card-duty">
+        <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}"
+          onpointerdown="dutySliderActive=true" onpointerup="dutySliderActive=false"
+          oninput="document.getElementById('dutyval-${ch}').textContent=this.value+' %'"
+          onchange="setDuty('${ch}', this.value)">
+        <span class="fan-duty-val" id="dutyval-${ch}">${dutyKnown ? dutyVal+" %" : "-- %"}</span>
       </div>
     </div>`;
   }).join("");

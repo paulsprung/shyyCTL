@@ -361,6 +361,17 @@ async def list_fans():
     # slider for a header confirmed empty. A channel never scanned at
     # all still shows, since nothing's confirmed either way for it yet.
     channels = [c for c in hub.channels.get("fan", []) if c not in scan.absent]
+    # liquidctl's own status() reports every physical channel regardless -
+    # it has no concept of scan.absent. Filtering readings to the same
+    # allowed set here means a confirmed-empty fan's "0 rpm" reading can't
+    # leak into a page that only looks at readings directly (the Status
+    # overview's stat tiles), the way the Fans page's own channel list
+    # already excludes it.
+    allowed_numbers = {c[3:] for c in channels if c.startswith("fan")}
+    def _reading_channel_ok(r):
+        m = re.match(r"fan (\d+)", str(r.get("key", "")).lower())
+        return not m or m.group(1) in allowed_numbers
+    readings = [r for r in readings if _reading_channel_ok(r)]
     return {"channels": channels, "readings": readings}
 
 
