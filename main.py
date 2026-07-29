@@ -266,6 +266,17 @@ async def lifespan(app: FastAPI):
     await get_panorama()
     _keepalive_task = asyncio.create_task(_keepalive_loop())
 
+    # Auto-discover on every launch rather than waiting for a human to open
+    # Scan and click a button - "quick" spins each fan just long enough to
+    # confirm it's there and read its RPM (no curve calibration, unlike
+    # "full") and, unless skipped, reads motherboard/RAM through OpenRGB
+    # too (see scan.py - that check now runs before any fan spins up).
+    # Only worth starting if there's something to scan; on a box with
+    # neither the hub nor OpenRGB reachable this would just spawn a thread
+    # that immediately fails with "no hub found".
+    if hub.connected or openrgb.connected:
+        scan.start("quick")
+
     if CONFIG.get("server", {}).get("open_browser"):
         url = f"http://{CONFIG['server']['host']}:{CONFIG['server']['port']}"
         webbrowser.open(url)
