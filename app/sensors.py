@@ -3,7 +3,7 @@ CPU/motherboard/RAM temperature.
 
 Independent sources, each optional and independently degrading (same
 "never crash on missing hardware" rule as the rest of this app - a laptop
-with no NVIDIA GPU, or a machine that's never run LibreHardwareMonitor,
+with no NVIDIA GPU, or a machine where nothing is serving sensor data,
 should still show whatever it *can* read, not a blank page):
 
 - CPU/RAM load: psutil. Cross-platform, no extra service needed.
@@ -16,17 +16,25 @@ should still show whatever it *can* read, not a blank page):
   is no cross-vendor CLI worth shelling out to the way nvidia-smi covers
   GPUs - the config's sensors.librehardwaremonitor_url plus
   cpu_sensor_match/mobo_sensor_match/ram_sensor_match (config.yaml) point
-  at LibreHardwareMonitor's own local web server instead (Options >
-  Remote Web Server in LHM, or auto-launched - see main.py's
-  _launch_vendor_librehardwaremonitor()), which is already the project's
-  answer for the coolant-temperature gap noted there (Asetek Gen8 pump
-  not liquidctl-recognised). CPU temp is on by default (cpu_sensor_match
+  at a local web server serving LibreHardwareMonitor-shaped JSON instead.
+  By default that's this project's own SensorHelper.exe (sensor-helper/
+  Program.cs, built by tools/setup_vendor.py, auto-launched by main.py's
+  _launch_vendor_sensor_helper()) - a tiny background wrapper around the
+  LibreHardwareMonitorLib package with no GUI window and nothing to
+  enable by hand, built specifically so a human doesn't have to run the
+  full LibreHardwareMonitor app just for this. Running the real
+  LibreHardwareMonitor app yourself (Options > Remote Web Server > Run,
+  same port) works exactly the same, since the JSON shape is identical -
+  shyyctl just won't launch its own copy if something's already answering
+  on that port. This is already the project's answer for the
+  coolant-temperature gap noted there too (Asetek Gen8 pump not
+  liquidctl-recognised). CPU temp is on by default (cpu_sensor_match
   defaults to "CPU Package", a near-universal name across vendors);
   motherboard/RAM are opt-in, since every board/kit names those sensors
-  differently in LHM's own tree - they only appear once a human has
-  checked their own LHM UI and set a real match string in config.yaml.
-  All three are unavailable (reported as None, not an error) until LHM
-  is actually running with that server enabled.
+  differently in the sensor tree - they only appear once a human has
+  checked what they're actually named there and set a real match string
+  in config.yaml. All three are unavailable (reported as None, not an
+  error) until something is actually serving that URL.
 """
 
 import json

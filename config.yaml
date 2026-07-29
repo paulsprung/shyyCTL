@@ -27,33 +27,46 @@ openrgb:
   # skip that prompt.
   launch_elevated: true
 
-librehardwaremonitor:
-  # Same auto-launch pattern as OpenRGB above (see tools/setup_vendor.py
-  # and main.py's _launch_vendor_librehardwaremonitor()) - only used if
-  # vendor/LibreHardwareMonitor/LibreHardwareMonitor.exe exists and
-  # sensors.librehardwaremonitor_url below isn't already reachable
-  # (someone already running it, or a previous auto-launch left it up).
-  # Elevated for the same reason OpenRGB's RAM access needs it: full
-  # sensor access (CPU package temperature, motherboard SuperIO chip
-  # readings) needs administrator rights on Windows. The Remote Web
-  # Server itself still needs enabling once by hand the very first time
-  # (Options > Remote Web Server > Run) - that setting persists in its
-  # own config file next to the exe from then on.
+sensor_helper:
+  # Same auto-launch pattern as OpenRGB above (see tools/setup_vendor.py,
+  # which builds vendor/SensorHelper/SensorHelper.exe from this project's
+  # own sensor-helper/Program.cs, and main.py's
+  # _launch_vendor_sensor_helper()) - only used if that exe exists and
+  # sensors.librehardwaremonitor_url below isn't already reachable (a
+  # previous auto-launch already left it up). Elevated for the same
+  # reason OpenRGB's RAM access needs it: full sensor access (CPU
+  # package temperature, motherboard SuperIO chip readings) needs
+  # administrator rights on Windows. Unlike the full LibreHardwareMonitor
+  # GUI app this replaced, there's no separate "Remote Web Server" toggle
+  # to enable by hand - SensorHelper.exe starts serving immediately on
+  # launch, no manual step needed even the first time.
   launch_elevated: true
 
 sensors:
+  # Despite the name, this now points at this project's own
+  # SensorHelper.exe by default (see the sensor_helper section above and
+  # sensor-helper/Program.cs) rather than the full LibreHardwareMonitor
+  # GUI app - kept the same URL shape/key name since SensorHelper serves
+  # the identical {Text, Value, Children} JSON tree LHM's own Remote Web
+  # Server does, at the same default port, so this still works unchanged
+  # if you'd rather run the real LibreHardwareMonitor app yourself
+  # instead (just make sure its Remote Web Server is enabled on this
+  # port, and shyyctl won't auto-launch its own copy since something's
+  # already answering here).
   librehardwaremonitor_url: "http://127.0.0.1:8085/data.json"
   cpu_sensor_match: "CPU Package"
   # Motherboard/RAM temperatures: opt-in and commented out by default -
   # unlike "CPU Package" (near-universal across vendors), every
-  # motherboard and RAM kit names these sensors differently in LHM's own
-  # tree. Open LibreHardwareMonitor's UI, find your board's temperature
-  # sensor (something like "Motherboard", "VRM", "Chipset", "PCH" under
-  # its mainboard node) and/or your RAM's (if your kit even exposes one
-  # via SPD - not all do), and uncomment + fill in the match string that
-  # actually appears there. Leave commented out (or blank) to just not
-  # show that tile - a wrong guess here would silently show the wrong
-  # sensor's reading, which is worse than not showing one at all.
+  # motherboard and RAM kit names these sensors differently in the
+  # LibreHardwareMonitorLib sensor tree. Check what SensorHelper (or
+  # LibreHardwareMonitor's own UI) actually names your board's
+  # temperature sensor (something like "Motherboard", "VRM", "Chipset",
+  # "PCH" under its mainboard node) and/or your RAM's (if your kit even
+  # exposes one via SPD - not all do), and uncomment + fill in the match
+  # string that actually appears there. Leave commented out (or blank)
+  # to just not show that tile - a wrong guess here would silently show
+  # the wrong sensor's reading, which is worse than not showing one at
+  # all.
   # mobo_sensor_match: "Motherboard"
   # ram_sensor_match: "Memory"
   # Confirmed this session: the Tryx Panorama's Asetek Gen8 pump is not

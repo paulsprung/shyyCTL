@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- WinExe, not Exe: launched via ShellExecuteW("runas", ...) from
+         main.py the same way vendor OpenRGB is (see
+         _launch_vendor_librehardwaremonitor's replacement in main.py) -
+         Exe would flash a console window every launch since there's no
+         console UI here to show, just a background HTTP listener. -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>SensorHelper</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Windows-only: LibreHardwareMonitorLib's actual sensor access
+         (MSR reads, SuperIO chip I/O) is a Windows/kernel-driver
+         concept with no meaningful cross-platform equivalent - same
+         reasoning as this whole helper existing in the first place. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <!-- Single-file publish so this ships as one .exe (like the
+         vendored ffmpeg.exe/OpenRGB.exe already do) - a person running
+         shyyctl shouldn't need the .NET runtime installed separately. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>SensorHelper</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+</Project>

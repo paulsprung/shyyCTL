@@ -390,53 +390,61 @@ def _lhm_reachable(url: str, timeout: float = 1.5) -> bool:
         return False
 
 
-def _launch_vendor_librehardwaremonitor() -> bool:
-    """Starts the bundled portable LibreHardwareMonitor (see
-    tools/setup_vendor.py), only called when its configured Remote Web
-    Server URL isn't already reachable - never launches a second
-    instance alongside one the user is already running themselves.
+def _launch_vendor_sensor_helper() -> bool:
+    """Starts the bundled SensorHelper.exe (see tools/setup_vendor.py,
+    which builds it from sensor-helper/Program.cs via `dotnet publish` -
+    this project's own tiny background HTTP server wrapping
+    LibreHardwareMonitorLib directly, not the full LibreHardwareMonitor
+    GUI app), only called when its configured URL isn't already
+    reachable - never launches a second instance alongside one already
+    running.
 
-    Elevated via a UAC prompt (librehardwaremonitor.launch_elevated in
+    Elevated via a UAC prompt (sensor_helper.launch_elevated in
     config.yaml, default on) - full sensor access (CPU package
     temperature via MSR, motherboard SuperIO chip access) needs
     administrator rights on Windows, same reasoning as OpenRGB's RAM
     SPD/SMBus access above.
 
-    Unlike OpenRGB's --server/--startminimized, there is no confirmed
-    command-line flag to auto-enable the Remote Web Server or start
-    minimized (checked; nothing documented, and this sandbox can't
-    reach GitHub to verify against the real source) - launched with no
-    extra arguments, so its window will be visible every time this
-    starts it, not just the first. The Remote Web Server itself only
-    needs enabling once by hand (Options > Remote Web Server > Run,
-    port 8085 to match config.yaml's sensors.librehardwaremonitor_url) -
-    that setting persists in LibreHardwareMonitor.config next to the
-    exe, so it's already on for every future launch after that first
-    one."""
-    exe = next((ROOT / "vendor" / "LibreHardwareMonitor").rglob("LibreHardwareMonitor.exe"), None)
-    if exe is None:
+    Unlike the full LibreHardwareMonitor GUI app this replaced, there is
+    no separate "Remote Web Server" toggle to click through by hand -
+    SensorHelper.exe's own Main() starts its HTTP listener immediately
+    on launch (see Program.cs), and it has no window at all (built as
+    WinExe with no UI), so this is genuinely a one-shot "launch it and
+    it's just working" background helper. The port is passed as its
+    one command-line argument so it always matches config.yaml's
+    sensors.librehardwaremonitor_url regardless of what port that's
+    set to."""
+    exe = ROOT / "vendor" / "SensorHelper" / "SensorHelper.exe"
+    if not exe.exists():
         return False
 
-    elevated = CONFIG.get("librehardwaremonitor", {}).get("launch_elevated", True)
-    log.info("Starting bundled LibreHardwareMonitor (%s)%s...",
-            exe, " (elevated - expect a UAC prompt)" if elevated else "")
+    port = 8085
+    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url", "")
+    try:
+        port = int(lhm_url.rsplit(":", 1)[1].split("/", 1)[0])
+    except (IndexError, ValueError):
+        pass
+
+    elevated = CONFIG.get("sensor_helper", {}).get("launch_elevated", True)
+    log.info("Starting bundled SensorHelper (%s) on port %d%s...",
+            exe, port, " (elevated - expect a UAC prompt)" if elevated else "")
     if elevated:
         try:
             import ctypes
             result = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
-                None, "runas", str(exe), "", str(exe.parent), 1)
+                None, "runas", str(exe), str(port), str(exe.parent), 0)
             if int(result) <= 32:
-                log.warning("Elevated LibreHardwareMonitor launch failed or was declined (code %s)", result)
+                log.warning("Elevated SensorHelper launch failed or was declined (code %s)", result)
                 return False
         except Exception as exc:
-            log.warning("Could not launch bundled LibreHardwareMonitor elevated: %s", exc)
+            log.warning("Could not launch bundled SensorHelper elevated: %s", exc)
             return False
         return True
 
     try:
-        subprocess.Popen([str(exe)], cwd=str(exe.parent))
+        subprocess.Popen([str(exe), str(port)], cwd=str(exe.parent))
     except OSError as exc:
-        log.warning("Could not launch bundled LibreHardwareMonitor: %s", exc)
+        log.warning("Could not launch bundled SensorHelper: %s", exc)
         return False
     return True
 
@@ -562,17 +570,17 @@ async def lifespan(app: FastAPI):
                 log.warning("Still not connected after starting bundled OpenRGB (waited ~20s): %s",
                            openrgb.last_error)
 
-    # Same auto-launch idea as OpenRGB above, for LibreHardwareMonitor
-    # (CPU/motherboard/RAM temperature - see app/sensors.py). Only
-    # attempts this if a URL is configured at all and it isn't already
-    # reachable (someone already running it themselves, or a previous
+    # Same auto-launch idea as OpenRGB above, for SensorHelper.exe (CPU/
+    # motherboard/RAM temperature - see app/sensors.py and
+    # sensor-helper/Program.cs). Only attempts this if a URL is
+    # configured at all and it isn't already reachable (a previous
     # launch already left it up) - never launches a second instance.
     # Fire-and-forget: unlike OpenRGB, nothing else in startup needs this
     # to be up synchronously, sensors are polled independently and
     # asynchronously later.
     lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
     if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
-        _launch_vendor_librehardwaremonitor()
+        _launch_vendor_sensor_helper()
 
     await get_panorama()
     _keepalive_task = asyncio.create_task(_keepalive_loop())

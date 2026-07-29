@@ -1,12 +1,13 @@
-"""Downloads the portable Windows binaries this project needs but doesn't
-want to force a separate install for: ffmpeg (Panorama media encoding),
-OpenRGB (RGB control backend, with its SDK server this project talks to),
-and LibreHardwareMonitor (CPU/motherboard/RAM temperature - see
-app/sensors.py). None of these get committed to git - all sizeable (tens
-to a couple hundred MB) and don't belong in source control; this script
-fetches them into vendor/, which is gitignored. main.py looks there first
-before falling back to PATH (see app/panorama.py's ffmpeg lookup, this
-module's find_openrgb_exe(), and _launch_vendor_librehardwaremonitor()).
+"""Downloads or builds the portable Windows binaries this project needs
+but doesn't want to force a separate install for: ffmpeg (Panorama media
+encoding), OpenRGB (RGB control backend, with its SDK server this project
+talks to), and sensor-helper (CPU/motherboard/RAM temperature - see
+app/sensors.py and sensor-helper/Program.cs). None of these get committed
+to git - all sizeable (tens to a couple hundred MB) and don't belong in
+source control; this script fetches/builds them into vendor/, which is
+gitignored. main.py looks there first before falling back to PATH (see
+app/panorama.py's ffmpeg lookup, this module's find_openrgb_exe(), and
+_launch_vendor_sensor_helper()).
 
 ffmpeg's URL is confirmed working (run against the real internet on the
 target Windows machine this session - downloads and extracts cleanly).
@@ -29,24 +30,25 @@ the actual target Windows machine) - the API shape itself is standard
 Forgejo/Gitea, not a guess, but the exact asset-name filtering below
 hasn't been proven against a live response.
 
-LibreHardwareMonitor: same situation as OpenRGB above - this sandbox's
-network policy blocks direct GitHub API access outside this project's
-own repo, so the exact asset filename below is NOT confirmed against a
-live response either. GitHub's releases API shape
-(GET /repos/{owner}/{repo}/releases) is standard and stable, so the
-lookup logic itself isn't a guess, just unverified end-to-end here.
-Matching by "librehardwaremonitor" + ".zip" in the asset name rather
-than a hardcoded version string, for the same reason OpenRGB's filter
-avoids one - release asset names change across versions.
-
-Deliberately does NOT attempt to pre-configure LibreHardwareMonitor's
-Remote Web Server (Options > Remote Web Server > Run, port 8085) - its
-settings do persist in a LibreHardwareMonitor.config file next to the
-exe once portable, so this only needs doing once by hand, but there is
-no confirmed, documented way to write that setting into the config file
-directly without risking a malformed file that stops the app from
-starting at all. One manual toggle the first time beats a guessed file
-that might silently break every launch after.
+sensor-helper: this project's OWN small C#/.NET console app
+(sensor-helper/Program.cs), not a downloaded third party binary - it
+uses the LibreHardwareMonitorLib NuGet package directly (the same
+library the full LibreHardwareMonitor GUI app is built on) to serve
+just the CPU/motherboard/RAM temperature data this project actually
+needs, over a tiny built-in HTTP listener, with no visible window and
+no manual "Remote Web Server" toggle to click through - replaces an
+earlier version of this script that downloaded and auto-launched the
+full LibreHardwareMonitor GUI app instead. Built here via `dotnet
+publish` (self-contained, single-file win-x64) rather than downloaded,
+so this machine needs the .NET 8 SDK installed at setup time only - not
+at runtime, since the published output is self-contained. Confirmed
+against a real build in this project's dev environment (a real .NET 8
+SDK installed via apt, LibreHardwareMonitorLib 0.9.6 restored from
+NuGet, compiled clean, published a real ~70MB self-contained win-x64
+.exe) - the actual sensor reads themselves are NOT confirmed against
+real Windows hardware from here, only that the code compiles against
+the library's real API surface (verified via its own XML docs, not
+guessed from memory) and produces a valid executable.
 
 Usage:
     python tools/setup_vendor.py
@@ -54,6 +56,7 @@ Usage:
 
 import json
 import shutil
+import subprocess
 import sys
 import urllib.request
 import zipfile
@@ -64,7 +67,6 @@ VENDOR = ROOT / "vendor"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 OPENRGB_RELEASES_API = "https://codeberg.org/api/v1/repos/OpenRGB/OpenRGB/releases?limit=10"
-LHM_RELEASES_API = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases?per_page=10"
 
 
 def _download(url: str, dest: Path):
@@ -164,62 +166,44 @@ def setup_openrgb():
     print(f"Done: {target_dir}")
 
 
-def setup_librehardwaremonitor():
-    target_dir = VENDOR / "LibreHardwareMonitor"
-    if target_dir.exists() and any(target_dir.rglob("LibreHardwareMonitor.exe")):
-        print("LibreHardwareMonitor already present, skipping.")
+def setup_sensor_helper():
+    target_dir = VENDOR / "SensorHelper"
+    target_exe = target_dir / "SensorHelper.exe"
+    if target_exe.exists():
+        print("SensorHelper.exe already present, skipping (delete vendor/SensorHelper/ "
+              "to force a rebuild after changing sensor-helper/Program.cs).")
         return
-    VENDOR.mkdir(parents=True, exist_ok=True)
-    print("Looking up the latest LibreHardwareMonitor release via the GitHub API ...")
-    asset_url = None
-    asset_name = None
+    project_dir = ROOT / "sensor-helper"
+    if not (project_dir / "SensorHelper.csproj").exists():
+        print(f"No sensor-helper/SensorHelper.csproj found at {project_dir} - "
+              "skipping (nothing to build).")
+        return
+    print("Building sensor-helper (dotnet publish, self-contained win-x64) ...")
     try:
-        req = urllib.request.Request(LHM_RELEASES_API, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            releases = json.load(resp)
-        for release in releases:
-            for asset in release.get("assets", []):
-                name = asset.get("name", "")
-                lowered = name.lower()
-                if "librehardwaremonitor" in lowered and lowered.endswith(".zip"):
-                    asset_url = asset.get("browser_download_url")
-                    asset_name = name
-                    break
-            if asset_url:
-                break
-    except Exception as exc:
-        print(f"GitHub API request failed: {exc}")
-    if asset_url is None:
-        print("Could not find a release asset via the GitHub API - download manually "
-              "from https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases "
-              "(the portable zip, e.g. 'LibreHardwareMonitor-net472.zip') and extract it to "
-              "vendor/LibreHardwareMonitor/ yourself (so that "
-              "vendor/LibreHardwareMonitor/LibreHardwareMonitor.exe exists).")
-        sys.exit(1)
-    print(f"Found: {asset_name}")
-    zip_path = VENDOR / "_lhm_download.zip"
-    try:
-        _download(asset_url, zip_path)
-        print("Extracting LibreHardwareMonitor ...")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(target_dir)
-    finally:
-        zip_path.unlink(missing_ok=True)
-    if not any(target_dir.rglob("LibreHardwareMonitor.exe")):
-        print("Extracted, but no LibreHardwareMonitor.exe found anywhere inside - the "
-              "release archive's layout may not match what this script expects. "
-              "Check vendor/LibreHardwareMonitor/ manually.")
-        sys.exit(1)
-    print(f"Done: {target_dir}")
-    print("One-time manual step still needed: launch it once, go to "
-          "Options > Remote Web Server > Run (port 8085), then close it. "
-          "That setting persists in LibreHardwareMonitor.config next to the exe, "
-          "so every future auto-launch by shyyctl will already have it running.")
+        subprocess.run(
+            ["dotnet", "publish", "-c", "Release", "-r", "win-x64",
+             "--self-contained", "true", "-o", str(target_dir)],
+            cwd=str(project_dir), check=True,
+        )
+    except FileNotFoundError:
+        print("dotnet not found on PATH - install the .NET 8 SDK "
+              "(https://dotnet.microsoft.com/download/dotnet/8.0) to build this. "
+              "CPU/motherboard/RAM temperature just won't be available until then; "
+              "everything else in shyyctl works fine without it.")
+        return
+    except subprocess.CalledProcessError as exc:
+        print(f"dotnet publish failed (exit code {exc.returncode}) - see output above.")
+        return
+    if not target_exe.exists():
+        print(f"Build finished, but no SensorHelper.exe found at {target_exe} - "
+              "check the dotnet publish output above.")
+        return
+    print(f"Done: {target_exe}")
 
 
 if __name__ == "__main__":
     setup_ffmpeg()
     setup_openrgb()
-    setup_librehardwaremonitor()
-    print("\nDone. vendor/ffmpeg.exe, vendor/OpenRGB/, and vendor/LibreHardwareMonitor/ ready.")
+    setup_sensor_helper()
+    print("\nDone. vendor/ffmpeg.exe, vendor/OpenRGB/, and vendor/SensorHelper/ ready "
+          "(whichever of these had what they needed to build/download).")

@@ -12,3 +12,5 @@ effect_state.json
 rgb_state.json
 effect_presets.json
 media_gallery/
+sensor-helper/bin/
+sensor-helper/obj/
