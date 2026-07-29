@@ -55,14 +55,24 @@ jobs:
       - name: Build shyyctl.exe (PyInstaller, --onedir)
         run: pyinstaller --noconfirm tools/build_installer/shyyctl.spec
 
+      - name: Install NSIS
+        shell: pwsh
+        # Confirmed empirically this run: windows-latest does NOT actually
+        # ship makensis preinstalled ("'makensis' is not recognized as an
+        # internal or external command") - Chocolatey, which windows-latest
+        # does ship, is the standard way to get it there instead.
+        run: choco install nsis -y --no-progress
+
       - name: Build installer (NSIS)
         shell: cmd
-        # windows-latest ships NSIS (makensis) preinstalled - no separate
-        # setup step needed. Paths are relative to
-        # tools/build_installer/ (where installer.nsi's own defaults
-        # assume it's run from), matching this working-directory.
+        # Paths are relative to tools/build_installer/ (where
+        # installer.nsi's own defaults assume it's run from), matching
+        # this working-directory. Chocolatey's nsis package puts
+        # makensis.exe on PATH itself - refreshenv isn't reliable inside
+        # a single Actions step, so call it by its installed path instead
+        # of trusting an inherited PATH update.
         run: |
-          makensis -DVERSION=${{ steps.version.outputs.version }} -DDIST_DIR=..\..\dist\shyyctl -DVENDOR_DIR=..\..\vendor installer.nsi
+          "%ProgramFiles(x86)%\NSIS\makensis.exe" -DVERSION=${{ steps.version.outputs.version }} -DDIST_DIR=..\..\dist\shyyctl -DVENDOR_DIR=..\..\vendor installer.nsi
         working-directory: tools/build_installer
 
       - name: Upload installer artifact
