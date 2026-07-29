@@ -919,8 +919,13 @@ function renderCurveList(){
   if(!box) return;
   box.innerHTML = curveProfiles.map(curve => {
     const status = (curveStatusData.curves || []).find(s => s.id === curve.id);
-    const statusText = status && status.temp_c != null
-      ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%` : "waiting on temperature&hellip;";
+    // temp_c and duty are independent now - the temp reading no longer
+    // depends on the hub being connected (see main.py's _curve_loop),
+    // so a curve can show a real temperature with duty still null (no
+    // fans assigned yet, or the hub itself is what's unavailable).
+    const statusText = !status || status.temp_c == null ? "waiting on temperature&hellip;"
+      : status.duty != null ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%`
+      : `${Math.round(status.temp_c)}°C`;
     return `<div class="curve-card">
       <div class="curve-card-top">
         <input type="text" class="curve-name-input" value="${curve.name}"

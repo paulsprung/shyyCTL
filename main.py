@@ -859,32 +859,41 @@ async def _curve_loop():
             state = {}
         curves = state.get("curves") or _default_curves()
         statuses = []
-        if hub.connected:
-            sensors_cfg = CONFIG.get("sensors", {})
-            cpu_t = await asyncio.to_thread(
-                sensors_mod.lhm_temp,
-                sensors_cfg.get("librehardwaremonitor_url", ""),
-                sensors_cfg.get("cpu_sensor_match", "CPU Package"),
-            )
-            gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
-            temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
-            fan_channels = hub.channels.get("fan", [])
-            for curve in curves:
-                temp_c = temps.get(curve.get("source"))
-                channels = [c for c in curve.get("channels", []) if c in fan_channels and c not in scan.absent]
-                duty = None
-                if temp_c is not None and channels:
-                    duty = _curve_duty_for_temp(
-                        curve.get("points") or [], CONFIG["curve"].get("min_duty", 20), temp_c)
+        # CPU/GPU temp reads have nothing to do with the hub - gating the
+        # whole block on hub.connected (as this used to) meant every
+        # single curve, including a GPU-only one, went blank the instant
+        # the hub connection flickered, since liquidctl's own USB read is
+        # a separate, independently flaky thing (real report: recurring
+        # "missing messages" AssertionErrors from the hub's own HID
+        # comms). Confirmed as the actual cause of curves looking like
+        # they "lag/flicker weirdly" - it wasn't the curve logic itself,
+        # it was losing every reading in sync with an unrelated hub
+        # hiccup. Only the actual fan-setting step below genuinely needs
+        # the hub, so only that part is still gated on it.
+        sensors_cfg = CONFIG.get("sensors", {})
+        cpu_t = await asyncio.to_thread(
+            sensors_mod.lhm_temp,
+            sensors_cfg.get("librehardwaremonitor_url", ""),
+            sensors_cfg.get("cpu_sensor_match", "CPU Package"),
+        )
+        gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
+        temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
+        fan_channels = hub.channels.get("fan", []) if hub.connected else []
+        for curve in curves:
+            temp_c = temps.get(curve.get("source"))
+            channels = [c for c in curve.get("channels", []) if c in fan_channels and c not in scan.absent]
+            duty = None
+            if temp_c is not None and channels:
+                duty = _curve_duty_for_temp(
+                    curve.get("points") or [], CONFIG["curve"].get("min_duty", 20), temp_c)
+                if hub.connected:
                     for channel in channels:
                         try:
                             await asyncio.to_thread(hub.set_fan, channel, duty)
                         except Exception as exc:
                             log.warning("curve %s: could not set %s to %s%%: %s",
                                        curve.get("id"), channel, duty, exc)
-                statuses.append({"id": curve.get("id"), "temp_c": temp_c, "duty": duty})
-        else:
-            statuses = [{"id": c.get("id"), "temp_c": None, "duty": None} for c in curves]
+            statuses.append({"id": curve.get("id"), "temp_c": temp_c, "duty": duty})
         _curve_status = {"curves": statuses}
         await asyncio.sleep(4)
 
