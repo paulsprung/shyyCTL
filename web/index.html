@@ -63,6 +63,14 @@
   .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
   .stack{display:flex;flex-direction:column;gap:10px}
 
+  .gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}
+  .gallery-tile{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);overflow:hidden}
+  .gallery-thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:var(--panel-2);display:block}
+  .gallery-tile-body{padding:10px}
+  .gallery-tile-name{font-size:12px;font-weight:600;margin-bottom:8px;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .gallery-tile-actions{display:flex;gap:4px;flex-wrap:wrap}
+
   .btn{font-family:var(--body);font-size:12.5px;font-weight:600;padding:9px 16px;border:none;
     border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
   .btn.sec{background:var(--panel-2);color:var(--ink);box-shadow:inset 0 0 0 1px var(--rule)}
@@ -99,6 +107,10 @@
   .stat-label{font-size:11px;font-weight:600;color:var(--ink-soft)}
   .stat-value{font-family:var(--mono);font-size:26px;font-variant-numeric:tabular-nums;margin-top:6px}
   .stat-value .u{font-size:12px;color:var(--ink-soft)}
+  .stat.lg{padding:22px}
+  .stat.lg .stat-label{font-size:12px}
+  .stat.lg .stat-value{font-size:44px;margin-top:10px}
+  .stat.lg .stat-value .u{font-size:16px}
 
   .fan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
   .fan-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:18px}
@@ -198,7 +210,15 @@
     <!-- ================= STATUS ================= -->
     <div class="page" id="page-status">
       <section>
-        <div class="section-head"><h2>Overview</h2><div class="rule"></div></div>
+        <div class="section-head"><h2>Temperatures</h2><div class="rule"></div></div>
+        <div class="stat-grid" id="statusTemps"></div>
+      </section>
+      <section>
+        <div class="section-head"><h2>System</h2><div class="rule"></div></div>
+        <div class="stat-grid" id="statusSystem"></div>
+      </section>
+      <section>
+        <div class="section-head"><h2>Fan speed</h2><div class="rule"></div></div>
         <div class="stat-grid" id="statusStats"></div>
         <div class="note" id="statusEmpty" style="margin-top:14px"></div>
       </section>
@@ -216,7 +236,25 @@
       <section>
         <div class="section-head"><h2>Fan speed</h2><div class="rule"></div>
           <span class="note" id="fansNote"></span></div>
+        <div class="row" style="margin-bottom:14px">
+          <div class="seg" id="fanModeSeg" style="width:200px">
+            <button data-v="fixed" aria-pressed="true">Fixed</button>
+            <button data-v="curve">Curve</button>
+          </div>
+          <span class="note" id="curveStatusNote"></span>
+        </div>
         <div class="fan-grid" id="fansList"></div>
+      </section>
+
+      <section id="curveSection" style="display:none">
+        <div class="section-head"><h2>Fan curve</h2><div class="rule"></div>
+          <span class="note">CPU temperature &rarr; duty, applied to every fan channel</span></div>
+        <div class="card">
+          <div id="curvePoints"></div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn sm" onclick="saveCurve()">Save curve</button>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -350,29 +388,22 @@
       </section>
 
       <section>
-        <div class="section-head"><h2>Media on device</h2><div class="rule"></div></div>
+        <div class="section-head"><h2>Gallery</h2><div class="rule"></div>
+          <span class="note">apply a tile or set it as the boot image</span></div>
         <div class="card">
-          <table class="res" id="panoMediaTable"></table>
+          <div class="row">
+            <input type="file" id="galleryUploadFile" accept="image/*,video/*">
+            <button class="btn sm" onclick="uploadToGallery()">Add to gallery</button>
+          </div>
         </div>
+        <div class="gallery-grid" id="galleryGrid" style="margin-top:14px"></div>
       </section>
 
       <section>
-        <div class="section-head"><h2>Upload</h2><div class="rule"></div></div>
-        <div class="split">
-          <div class="card">
-            <div class="card-title">Apply now</div>
-            <input type="file" id="panoApplyFile" accept="image/*,video/*">
-            <div class="row" style="margin-top:10px">
-              <button class="btn sm" onclick="uploadPanoMedia(false)">Upload &amp; apply</button>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">Set as boot image</div>
-            <input type="file" id="panoBootFile" accept="image/*,video/*">
-            <div class="row" style="margin-top:10px">
-              <button class="btn sm" onclick="uploadPanoMedia(true)">Upload &amp; set as boot</button>
-            </div>
-          </div>
+        <div class="section-head"><h2>Media on device</h2><div class="rule"></div>
+          <span class="note">as reported by the panel itself</span></div>
+        <div class="card">
+          <table class="res" id="panoMediaTable"></table>
         </div>
       </section>
     </div>
@@ -615,7 +646,47 @@ function renderStatus(){
       <div class="stat-value" style="${String(v).length>5?'font-size:17px':''}">${v}<span class="u">${u}</span></div></div>`).join("");
   document.getElementById("statusEmpty").textContent =
     status_.hub.connected ? "" : "Hub not connected — check Settings.";
+  renderSensorTiles();
   drawStatusPreview();
+}
+
+/* ---------- status: system sensors -----------
+   CPU/GPU temperature, CPU/RAM/GPU load - see app/sensors.py for exactly
+   where each one comes from; each field is independently nullable (no
+   NVIDIA GPU, no LibreHardwareMonitor running, psutil missing) rather
+   than the whole call failing, so "--" per-tile is the normal shape for
+   a box missing one of these, not an error state. */
+let sensorsData = null;
+
+async function loadSensors(){
+  try{ sensorsData = await api("/api/sensors"); }
+  catch(e){ sensorsData = null; }
+}
+
+function renderSensorTiles(){
+  const temps = document.getElementById("statusTemps");
+  const sys = document.getElementById("statusSystem");
+  if(!temps || !sys) return;
+  const cpuTemp = sensorsData ? sensorsData.cpu_temp_c : null;
+  const gpu = (sensorsData && sensorsData.gpu) || {};
+  temps.innerHTML = [
+    ["CPU Temperature", cpuTemp!=null ? Math.round(cpuTemp) : "--", "°C"],
+    ["GPU Temperature", gpu.temp_c!=null ? Math.round(gpu.temp_c) : "--", "°C"],
+  ].map(([l,v,u])=>`
+    <div class="stat lg"><div class="stat-label">${l}</div>
+      <div class="stat-value">${v}<span class="u">${u}</span></div></div>`).join("");
+  const gpuMemGb = gpu.mem_used_mb!=null ? Math.round(gpu.mem_used_mb/1024*10)/10 : null;
+  const ramRow = sensorsData && sensorsData.ram_used_gb!=null
+    ? `${sensorsData.ram_used_gb}/${sensorsData.ram_total_gb}` : "--";
+  const rows = [
+    ["CPU Load", sensorsData && sensorsData.cpu_percent!=null ? Math.round(sensorsData.cpu_percent) : "--", "%"],
+    ["RAM", ramRow, "GB"],
+    ["GPU Load", gpu.load_percent!=null ? Math.round(gpu.load_percent) : "--", "%"],
+    ["GPU Memory", gpuMemGb!=null ? gpuMemGb : "--", "GB"],
+  ];
+  sys.innerHTML = rows.map(([l,v,u])=>`
+    <div class="stat"><div class="stat-label">${l}</div>
+      <div class="stat-value" style="${String(v).length>5?'font-size:17px':''}">${v}<span class="u">${u}</span></div></div>`).join("");
 }
 
 /* ---------- status: preview -----------
@@ -718,6 +789,11 @@ function renderFans(){
           <div class="fan-card-rpm">${rpm ? rpm.value : "--"}<span class="u">rpm</span></div>
         </div>
       </div>
+      ${fanMode === "curve" ? `
+      <div class="note">${curveStatusData && curveStatusData.temp_c!=null
+          ? `following curve · ${Math.round(curveStatusData.temp_c)}°C &rarr; ${curveStatusData.duty}%`
+          : "waiting on CPU temperature&hellip;"}</div>
+      ` : `
       <div class="fan-card-duty">
         <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}"
           onpointerdown="dutySliderActive=true" onpointerup="dutySliderActive=false"
@@ -725,6 +801,7 @@ function renderFans(){
           onchange="setDuty('${ch}', this.value)">
         <span class="fan-duty-val" id="dutyval-${ch}">${dutyKnown ? dutyVal+" %" : "-- %"}</span>
       </div>
+      `}
     </div>`;
   }).join("");
 }
@@ -735,6 +812,75 @@ async function setDuty(channel, value){
     await api(`/api/fans/${channel}/duty`,{method:"POST",body:JSON.stringify({duty:parseInt(value)})});
     say(`${channel} set to ${value}%.`);
   }catch(e){ say(e.message,"error"); }
+}
+
+/* ---------- fan curve ----------
+   CPU temperature -> duty, applied to every fan channel by main.py's own
+   _curve_loop (a background asyncio task, not something this page drives
+   itself) - Fixed/Curve here just flips curve.json's "enabled" flag and
+   reflects what the loop reports back via /api/curve/status. Switching
+   to Curve replaces each fan card's slider with a read-only readout,
+   since the loop would just override a manual duty change within a few
+   seconds anyway - better to make that obvious than let a slider drag
+   silently get overwritten. */
+let curveState = {points: [[30,30],[40,50],[60,75],[80,100]], enabled: false};
+let curveStatusData = null;
+let fanMode = "fixed";
+
+async function loadCurve(){
+  try{ curveState = await api("/api/curve"); }catch(e){}
+  fanMode = curveState.enabled ? "curve" : "fixed";
+}
+
+function initFanModeControls(){
+  document.getElementById("fanModeSeg").addEventListener("click", e=>{
+    const btn = e.target.closest("button"); if(!btn) return;
+    setFanMode(btn.dataset.v);
+  });
+  setPressed("fanModeSeg", fanMode);
+  document.getElementById("curveSection").style.display = fanMode === "curve" ? "block" : "none";
+  renderCurvePoints();
+}
+
+async function setFanMode(mode){
+  fanMode = mode;
+  setPressed("fanModeSeg", mode);
+  document.getElementById("curveSection").style.display = mode === "curve" ? "block" : "none";
+  curveState.enabled = mode === "curve";
+  try{ await api("/api/curve",{method:"POST",body:JSON.stringify(curveState)}); }
+  catch(e){ say(e.message,"error"); }
+  renderFans();
+}
+
+function renderCurvePoints(){
+  const box = document.getElementById("curvePoints");
+  if(!box) return;
+  box.innerHTML = curveState.points.map((p,i)=>`
+    <div class="row" style="margin-bottom:8px">
+      <label class="inline">temp <input type="number" value="${p[0]}" style="width:70px"
+        onchange="curveState.points[${i}][0]=parseInt(this.value)||0"> &deg;C</label>
+      <label class="inline">duty <input type="number" value="${p[1]}" min="0" max="100" style="width:70px"
+        onchange="curveState.points[${i}][1]=parseInt(this.value)||0"> %</label>
+    </div>`).join("");
+}
+
+async function saveCurve(){
+  try{
+    await api("/api/curve",{method:"POST",body:JSON.stringify(curveState)});
+    say("Curve saved.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function pollCurveStatus(){
+  try{ curveStatusData = await api("/api/curve/status"); }catch(e){ curveStatusData = null; }
+  const note = document.getElementById("curveStatusNote");
+  if(note){
+    note.textContent = fanMode !== "curve" ? "" : (curveStatusData && curveStatusData.temp_c!=null
+      ? `${Math.round(curveStatusData.temp_c)}°C &rarr; ${curveStatusData.duty}%`.replace("&rarr;","→")
+      : "CPU temperature unavailable - is LibreHardwareMonitor's web server running?");
+  }
+  if(document.getElementById("page-fans").classList.contains("active")) renderFans();
+  setTimeout(pollCurveStatus, 4000);
 }
 
 /* ---------- rgb ---------- */
@@ -1260,17 +1406,75 @@ async function setPanoBrightness(){
   }catch(e){ say(e.message,"error"); }
 }
 
-async function uploadPanoMedia(asBoot){
-  const input = document.getElementById(asBoot ? "panoBootFile" : "panoApplyFile");
+/* ---------- panorama gallery ----------
+   A local cache of everything ever uploaded (see main.py's gallery
+   endpoints) - the device itself can't hand back a thumbnail or the
+   original file for something already on it, so re-showing what's been
+   uploaded before means keeping our own copy. Uploading only caches;
+   Apply/Set boot are separate actions on a tile, each re-running the
+   real upload-to-panel path against the cached original file. */
+let galleryItems = [];
+
+async function loadGallery(){
+  try{ galleryItems = await api("/api/panorama/gallery"); }
+  catch(e){ galleryItems = []; }
+}
+
+function renderGallery(){
+  const box = document.getElementById("galleryGrid");
+  if(!box) return;
+  if(!galleryItems.length){ box.innerHTML = `<div class="note">No media uploaded yet.</div>`; return; }
+  box.innerHTML = galleryItems.slice().reverse().map(item=>`
+    <div class="gallery-tile">
+      ${item.has_thumb
+        ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${item.name}">`
+        : `<div class="gallery-thumb"></div>`}
+      <div class="gallery-tile-body">
+        <div class="gallery-tile-name" title="${item.name}">${item.name}</div>
+        <div class="gallery-tile-actions">
+          <button class="btn sm" onclick="applyGalleryItem('${item.id}')">Apply</button>
+          <button class="btn sec sm" onclick="setGalleryBoot('${item.id}')">Set boot</button>
+          <button class="btn sec sm" onclick="deleteGalleryItem('${item.id}')">Delete</button>
+        </div>
+      </div>
+    </div>`).join("");
+}
+
+async function uploadToGallery(){
+  const input = document.getElementById("galleryUploadFile");
   if(!input.files.length){ say("Pick a file first.","error"); return; }
   const form = new FormData();
   form.append("file", input.files[0]);
-  say("Uploading and encoding — this can take a moment...");
+  say("Uploading and generating a thumbnail…");
   try{
-    const r = await api(asBoot ? "/api/panorama/boot-image" : "/api/panorama/media",
-      {method:"POST", body:form});
-    say(`Uploaded as ${r.filename}${asBoot?" (boot image)":""}.`);
+    await api("/api/panorama/gallery",{method:"POST", body:form});
+    input.value = "";
+    say("Added to gallery.");
+    await loadGallery(); renderGallery();
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function applyGalleryItem(id){
+  say("Encoding and uploading to the panel…");
+  try{
+    await api(`/api/panorama/gallery/${id}/apply`,{method:"POST"});
+    say("Applied.");
     await loadPanorama(); renderPanorama();
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function setGalleryBoot(id){
+  say("Encoding and uploading to the panel…");
+  try{
+    await api(`/api/panorama/gallery/${id}/boot`,{method:"POST"});
+    say("Set as boot image.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function deleteGalleryItem(id){
+  try{
+    await api(`/api/panorama/gallery/${id}`,{method:"DELETE"});
+    await loadGallery(); renderGallery();
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -1672,6 +1876,7 @@ async function refresh(){
   try{
     status_ = await api("/api/status");
     await loadFans();
+    await loadSensors();
     await loadPanorama();
     renderDevices(); renderStatus(); renderFans();
     renderPanorama(); renderSettings();
@@ -1695,6 +1900,10 @@ async function refresh(){
   }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
   try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
+  try{ await loadGallery(); renderGallery(); }catch(e){}
+  try{ await loadCurve(); }catch(e){}
+  initFanModeControls();
+  pollCurveStatus();
   initEffectControls();
   loadHubModes();
   pollEffectStatus();
@@ -1706,6 +1915,7 @@ setInterval(async ()=>{
   try{
     status_ = await api("/api/status");
     await loadFans();
+    if(document.getElementById("page-status").classList.contains("active")) await loadSensors();
     renderDevices(); renderStatus();
     if(document.getElementById("page-fans").classList.contains("active")) renderFans();
   }catch(e){}
