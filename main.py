@@ -257,6 +257,29 @@ async def get_panorama():
                 _panorama.last_poweron_media = saved["poweron_media"]
             if saved.get("standby_media"):
                 _panorama.last_standby_media = saved["standby_media"]
+            # Restoring the fields above only fixes what THIS process
+            # remembers - it does not, by itself, put anything back on
+            # the panel's own screen. Confirmed by _keepalive_loop's own
+            # docstring: the panel reverts to its default content a few
+            # seconds after the last message it sees, with or without a
+            # USB-level disconnect - so a transient USB dropout (reported
+            # directly this session: a working connection went dark on
+            # its own after ~15 minutes, panel absent from usb_probe()
+            # entirely, not just "something else has the handle") leaves
+            # the panel showing nothing/its own default until a fresh
+            # screen-config message reaches it again. Every reconnect
+            # (this fresh-_panorama branch, whether it's the first
+            # connection at server launch or recovery from a mid-session
+            # drop) now resends the saved config unconditionally - same
+            # "no readback, so always reapply" reasoning as the RGB
+            # colour/position-effect resume elsewhere in this file, not
+            # a guess that it's needed.
+            if saved.get("media"):
+                try:
+                    await asyncio.to_thread(
+                        _panorama.set_screen_config, _panorama.last_media, _panorama.last_brightness)
+                except Exception as exc:
+                    log.warning("could not reapply saved screen config after (re)connect: %s", exc)
         return _panorama
 
 
