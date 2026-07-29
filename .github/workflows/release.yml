@@ -75,13 +75,13 @@ jobs:
           "%ProgramFiles(x86)%\NSIS\makensis.exe" -DVERSION=${{ steps.version.outputs.version }} -DDIST_DIR=..\..\dist\shyyctl -DVENDOR_DIR=..\..\vendor installer.nsi
         working-directory: tools/build_installer
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shyyctl-setup-${{ steps.version.outputs.version }}
-          path: tools/build_installer/shyyctl-setup-${{ steps.version.outputs.version }}.exe
-
       - name: Create GitHub release
+        # No separate actions/upload-artifact step here (there was one,
+        # dropped after a real run) - confirmed empirically that it fails
+        # with "Artifact storage quota has been hit" on this repo, since
+        # Actions artifact storage and GitHub Release asset storage are
+        # separate quotas. The release asset upload below is the only
+        # place this .exe needs to land anyway.
         uses: softprops/action-gh-release@v2
         with:
           # On a tag push, GITHUB_REF_NAME already is the tag - reuse it
