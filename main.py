@@ -104,7 +104,8 @@ def _load_panorama_state() -> dict:
     return {}
 
 
-def _save_panorama_state(media: str | None, brightness: int | None):
+def _save_panorama_state(media: str | None, brightness: int | None,
+                          poweron_media: str | None = None, standby_media: str | None = None):
     """Persists what shyyctl itself last applied - not a read of the
     device's real current state, which the reverse-engineered protocol has
     no command for (checked: neither the handshake's device-info reply nor
@@ -113,9 +114,20 @@ def _save_panorama_state(media: str | None, brightness: int | None):
     KANALI itself almost certainly does the same thing (remembers its own
     last action rather than querying it back). This at least survives a
     shyyctl restart or panel reconnect, instead of resetting to a guessed
-    default every time a fresh connection object is created."""
+    default every time a fresh connection object is created.
+
+    poweron_media/standby_media added alongside media/brightness for the
+    same reason set_screen_config() now tracks them on the panel object
+    (see its docstring) - without restoring these too on reconnect, a
+    fresh connection's panel.last_poweron_media starts back at the
+    factory DEFAULT_POWERON_MEDIA, and the very next set_media()/
+    set_brightness() call would silently re-send that default and wipe
+    out a custom boot image across a mere shyyctl restart, not just a
+    real power cycle."""
     PANORAMA_STATE_FILE.write_text(
-        json.dumps({"media": media, "brightness": brightness}), encoding="utf-8")
+        json.dumps({"media": media, "brightness": brightness,
+                   "poweron_media": poweron_media, "standby_media": standby_media}),
+        encoding="utf-8")
 
 
 def _save_effect_state(body: "PositionEffectRequest"):
@@ -224,15 +236,27 @@ async def get_panorama():
                 _panorama_info = await asyncio.to_thread(_panorama.handshake)
             except Exception as exc:
                 log.warning("panorama handshake failed: %s", exc)
-            # A fresh connection object's last_media/last_brightness start
-            # at hardcoded defaults (see app/panorama.py) - reload whatever
-            # shyyctl itself last actually applied instead of forgetting it
-            # on every reconnect.
+            # A fresh connection object's last_media/last_brightness/
+            # last_poweron_media/last_standby_media all start at hardcoded
+            # defaults (see app/panorama.py) - reload whatever shyyctl
+            # itself last actually applied instead of forgetting it on
+            # every reconnect. Restoring the last two matters as much as
+            # the first two now: set_screen_config() defaults poweron/
+            # standby media to these tracked values on every call, so an
+            # un-restored fresh connection would silently re-send the
+            # factory boot/standby default on the very next set_media()/
+            # set_brightness() call after a shyyctl restart - the same
+            # bug that made a custom boot image not survive an unrelated
+            # Apply, just triggered by a restart instead.
             saved = _load_panorama_state()
             if saved.get("media"):
                 _panorama.last_media = saved["media"]
             if saved.get("brightness") is not None:
                 _panorama.last_brightness = saved["brightness"]
+            if saved.get("poweron_media"):
+                _panorama.last_poweron_media = saved["poweron_media"]
+            if saved.get("standby_media"):
+                _panorama.last_standby_media = saved["standby_media"]
         return _panorama
 
 
@@ -1650,7 +1674,8 @@ async def panorama_brightness(body: BrightnessRequest):
     async with _panorama_lock:
         ok = await _call_panel(panel.set_brightness, body.value)
     if ok:
-        _save_panorama_state(panel.last_media, panel.last_brightness)
+        _save_panorama_state(panel.last_media, panel.last_brightness,
+                             panel.last_poweron_media, panel.last_standby_media)
     return {"ok": ok}
 
 
@@ -1718,8 +1743,9 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
             ok = await _call_panel(panel.set_boot_media, remote_name)
         else:
             ok = await _call_panel(panel.set_media, remote_name)
-            if ok:
-                _save_panorama_state(panel.last_media, panel.last_brightness)
+        if ok:
+            _save_panorama_state(panel.last_media, panel.last_brightness,
+                                 panel.last_poweron_media, panel.last_standby_media)
     return {"filename": remote_name, "applied": ok}
 
 

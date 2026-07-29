@@ -557,6 +557,8 @@ class _PanoramaBase:
         self.timeout = timeout
         self.last_media: str = DEFAULT_STANDBY_MEDIA
         self.last_brightness: int = 100
+        self.last_poweron_media: str = DEFAULT_POWERON_MEDIA
+        self.last_standby_media: str = DEFAULT_STANDBY_MEDIA
 
     @property
     def connected(self) -> bool:
@@ -763,13 +765,31 @@ class _PanoramaBase:
         return items
 
     def set_screen_config(self, active_media: str, brightness: int | None = None,
-                          poweron_media: str = DEFAULT_POWERON_MEDIA,
-                          standby_media: str = DEFAULT_STANDBY_MEDIA,
+                          poweron_media: str | None = None,
+                          standby_media: str | None = None,
                           timeout_s: float = 2.0) -> bool:
+        """poweron_media/standby_media default to whatever was last
+        actually set (self.last_poweron_media/last_standby_media), NOT a
+        hardcoded factory default - every real screen-config message
+        resends all three media slots together (see
+        build_screen_config_frame's docstring), so any caller that
+        doesn't care about changing the boot/standby slot (set_media()
+        applying a new wallpaper, set_brightness() adjusting brightness)
+        must still resend whatever those slots actually are, or it
+        silently resets them back to the factory default on every
+        unrelated action. Confirmed as the real cause of a custom boot
+        image not surviving past the very next Apply/brightness change,
+        let alone an actual reboot - both previously defaulted to the
+        DEFAULT_POWERON_MEDIA/DEFAULT_STANDBY_MEDIA constants instead of
+        preserving whatever set_boot_media() had last set."""
         if not self.connected:
             raise PanoramaError("not connected")
         if brightness is None:
             brightness = self.last_brightness
+        if poweron_media is None:
+            poweron_media = self.last_poweron_media
+        if standby_media is None:
+            standby_media = self.last_standby_media
         self._write(build_screen_config_frame(active_media, brightness, poweron_media, standby_media))
         ok = self.read_message(timeout_s=timeout_s) is not None
         self._write(build_commit_frame())
@@ -783,6 +803,8 @@ class _PanoramaBase:
         self.read_message(timeout_s=timeout_s)
         self.last_media = active_media
         self.last_brightness = max(0, min(100, int(brightness)))
+        self.last_poweron_media = poweron_media
+        self.last_standby_media = standby_media
         return ok
 
     def set_brightness(self, value: int, timeout_s: float = 2.0) -> bool:
@@ -803,13 +825,25 @@ class _PanoramaBase:
         the f200.f1 slot (poweron_media), independent of the currently
         active screen (set_media() above uses f200.f3 instead). Every real
         captured screen-config command included this as its own stable
-        field, separate from "what's showing right now" - unverified
-        whether it actually persists correctly across a real power cycle
-        with the host fully disconnected, since that's not something a
-        live USB capture can observe; worth confirming by physically
-        power-cycling the PC (or the AIO's own connector) after calling
-        this and checking what the panel shows before any software runs.
-        """
+        field, separate from "what's showing right now".
+
+        Found and fixed a real bug this session: set_media()/
+        set_brightness() call set_screen_config() without touching this
+        slot, and every real screen-config message resends all three
+        media slots together whether the caller cares about them or not
+        (see build_screen_config_frame's docstring) - set_screen_config()
+        used to default poweron_media/standby_media back to the factory
+        constants whenever a caller didn't explicitly pass them, so the
+        very next Apply or brightness change after this call silently
+        reset the boot slot back to the default before a human ever got
+        anywhere near power-cycling anything. set_screen_config() now
+        defaults both to self.last_poweron_media/last_standby_media
+        instead, and this call updates that, so it survives any number of
+        later set_media()/set_brightness() calls. Still unverified
+        whether the DEVICE itself actually persists f200.f1 across a
+        real power cycle with the host fully disconnected (not something
+        a live USB capture can observe) - worth re-testing now that the
+        host side isn't undoing itself first."""
         return self.set_screen_config(self.last_media, self.last_brightness,
                                       poweron_media=filename, timeout_s=timeout_s)
 
