@@ -9,4 +9,5 @@ vendor/
 curve.json
 panorama_state.json
 effect_state.json
+rgb_state.json
 media_gallery/

@@ -160,6 +160,16 @@
   .curve-status{font-size:10.5px;color:var(--ink-soft);margin-bottom:6px;display:block}
   .curve-channels{font-size:10.5px;margin-top:6px}
 
+  .rgb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,320px));gap:14px}
+  .rgb-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:16px}
+  .rgb-card-top{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  .rgb-swatch{width:38px;height:38px;border-radius:10px;flex:none;border:1px solid var(--rule);
+    background:var(--panel-2);box-shadow:inset 0 0 0 1px rgba(0,0,0,.04)}
+  .rgb-card-name{font-size:13px;font-weight:700}
+  .rgb-card-sub{font-size:11px;color:var(--ink-soft);margin-top:2px}
+  .rgb-card input[type=color]{width:52px;height:38px}
+  .rgb-card .row{flex-wrap:wrap}
+
   .subnav{display:flex;gap:2px;background:var(--panel-2);border-radius:9px;padding:3px;margin-bottom:20px;
     width:fit-content}
   .subnav button{padding:8px 16px;background:none;border:none;border-radius:7px;color:var(--ink-soft);
@@ -275,26 +285,27 @@
       <section>
         <div class="section-head"><h2>Detail</h2><div class="rule"></div>
           <span class="note" id="rgbNote"></span></div>
-        <div class="split">
-          <div class="card">
-            <div class="card-title">Motherboard</div>
+        <div class="rgb-grid">
+          <div class="rgb-card">
+            <div class="rgb-card-top">
+              <div class="rgb-swatch" id="moboSwatch"></div>
+              <div><div class="rgb-card-name">Motherboard</div>
+                <div class="rgb-card-sub">last applied colour</div></div>
+            </div>
             <div class="row">
-              <input type="color" id="moboColor" value="#4c79ff">
+              <input type="color" id="moboColor" value="#4c79ff" oninput="previewSwatch('moboSwatch',this.value)">
               <label class="inline"><input type="checkbox" id="moboPersist" checked> persistent</label>
               <button class="btn sm" onclick="setMoboColor()">Apply</button>
             </div>
           </div>
-          <div class="card">
-            <div class="card-title">RAM</div>
-            <div id="ramSticksList"><div class="note">Loading&hellip;</div></div>
-          </div>
+          <div id="ramSticksList" style="display:contents"><div class="note">Loading&hellip;</div></div>
         </div>
       </section>
 
       <section>
         <div class="section-head"><h2>Hub channels</h2><div class="rule"></div>
           <span class="note">from the last scan</span></div>
-        <div id="hubRgbList"></div>
+        <div id="hubRgbList" class="rgb-grid"></div>
       </section>
 
       <section>
@@ -999,11 +1010,40 @@ async function pollCurveStatus(){
    in this main flow. Advanced still offers real per-LED control on the
    one populated zone for anyone who wants it - moboLedColors below is
    only for that page, lazily filled in on first use there. */
+/* rgbState mirrors main.py's rgb_state.json - the last colour shyyctl
+   itself applied to each target (mobo/"0", ram/{index}, hub/{channel}).
+   Loaded once on startup (see the boot IIFE below) so every colour
+   picker and swatch opens already showing what's actually on the
+   hardware, instead of resetting to a generic default on every reload -
+   the whole point of persisting it server-side in the first place. */
+let rgbState = {};
+
+async function loadRgbState(){
+  try{ rgbState = await api("/api/rgb/state"); }
+  catch(e){ rgbState = {}; }
+}
+
+function previewSwatch(id, hex){
+  const el = document.getElementById(id);
+  if(el) el.style.background = hex;
+}
+
+function applyMoboState(){
+  const saved = rgbState.mobo && rgbState.mobo["0"];
+  if(saved){
+    document.getElementById("moboColor").value = saved.color;
+    document.getElementById("moboPersist").checked = saved.persistent;
+  }
+  previewSwatch("moboSwatch", saved ? saved.color : "#4c79ff");
+}
+
 async function setMoboColor(){
   const hex = document.getElementById("moboColor").value;
+  const persistent = document.getElementById("moboPersist").checked;
   try{
-    await api("/api/rgb/mobo/color",{method:"POST",body:JSON.stringify(
-      {color:hex, persistent:document.getElementById("moboPersist").checked})});
+    await api("/api/rgb/mobo/color",{method:"POST",body:JSON.stringify({color:hex, persistent})});
+    rgbState.mobo = {"0": {color:hex, persistent}};
+    previewSwatch("moboSwatch", hex);
     say("Motherboard colour applied.");
   }catch(e){ say(e.message,"error"); }
 }
@@ -1026,14 +1066,22 @@ function renderRamSticks(){
     box.innerHTML = `<div class="note">No RAM RGB device found.</div>`;
     return;
   }
-  box.innerHTML = ramSticks.map(s=>`
-    <div class="row" style="justify-content:space-between;margin-bottom:6px">
-      <span>Stick ${s.index+1} <span class="note">${s.name} &middot; ${s.leds} LED</span></span>
-      <span class="row">
-        <input type="color" id="ramStickColor-${s.index}" value="#4c79ff">
+  box.innerHTML = ramSticks.map(s=>{
+    const saved = rgbState.ram && rgbState.ram[String(s.index)];
+    const color = saved ? saved.color : "#4c79ff";
+    return `<div class="rgb-card">
+      <div class="rgb-card-top">
+        <div class="rgb-swatch" id="ramSwatch-${s.index}" style="background:${color}"></div>
+        <div><div class="rgb-card-name">Stick ${s.index+1}</div>
+          <div class="rgb-card-sub">${s.name} &middot; ${s.leds} LED</div></div>
+      </div>
+      <div class="row">
+        <input type="color" id="ramStickColor-${s.index}" value="${color}"
+          oninput="previewSwatch('ramSwatch-${s.index}',this.value)">
         <button class="btn sm" onclick="setRamStickColor(${s.index})">Apply</button>
-      </span>
-    </div>`).join("");
+      </div>
+    </div>`;
+  }).join("");
 }
 
 async function setRamStickColor(index){
@@ -1041,6 +1089,8 @@ async function setRamStickColor(index){
   try{
     await api(`/api/rgb/ram/stick/${index}/color`,{method:"POST",body:JSON.stringify(
       {color:hex, persistent:true})});
+    (rgbState.ram ||= {})[String(index)] = {color:hex, persistent:true};
+    previewSwatch(`ramSwatch-${index}`, hex);
     say(`RAM stick ${index} set.`);
   }catch(e){ say(e.message,"error"); }
 }
@@ -1049,33 +1099,37 @@ function renderHubRgb(){
   const box = document.getElementById("hubRgbList");
   const results = (scanState && scanState.results || []).filter(r=>r.led_channel);
   if(!results.length){
-    box.innerHTML = `<div class="card note">No LED channels known yet — run a scan first.</div>`;
-  } else {
-    box.innerHTML = `<div class="stack">` + results.map(r=>{
-      const ch = r.led_channel;
-      const sized = r.leds != null;
-      return `<div class="card">
-        <div class="row" style="justify-content:space-between">
-          <strong>${ch}</strong>
-          <span class="note">${r.model ? r.model+" · "+r.leds+" LED" : (sized ? r.leds+" LED" : "not sized - see Settings")}</span>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <input type="color" id="color-${ch}" value="#4c79ff">
-          <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
-          <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
-        </div>
-      </div>`;
-    }).join("") + `</div>`;
+    box.innerHTML = `<div class="rgb-card note">No LED channels known yet — run a scan first.</div>`;
+    return;
   }
+  box.innerHTML = results.map(r=>{
+    const ch = r.led_channel;
+    const sized = r.leds != null;
+    const saved = rgbState.hub && rgbState.hub[ch];
+    const color = saved ? saved.color : "#4c79ff";
+    return `<div class="rgb-card">
+      <div class="rgb-card-top">
+        <div class="rgb-swatch" id="hubSwatch-${ch}" style="background:${color}"></div>
+        <div><div class="rgb-card-name">${ch}</div>
+          <div class="rgb-card-sub">${r.model ? r.model+" · "+r.leds+" LED" : (sized ? r.leds+" LED" : "not sized - see Settings")}</div></div>
+      </div>
+      <div class="row">
+        <input type="color" id="color-${ch}" value="${color}"
+          oninput="previewSwatch('hubSwatch-${ch}',this.value)">
+        <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
+        <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
+      </div>
+    </div>`;
+  }).join("");
 }
 
 async function setHubColor(channel){
   const hex = document.getElementById(`color-${channel}`).value;
+  const persistent = document.getElementById(`persist-${channel}`).checked;
   try{
-    await api(`/api/rgb/hub/${channel}/color`,{method:"POST",body:JSON.stringify({
-      color: hex,
-      persistent: document.getElementById(`persist-${channel}`).checked,
-    })});
+    await api(`/api/rgb/hub/${channel}/color`,{method:"POST",body:JSON.stringify({color:hex, persistent})});
+    (rgbState.hub ||= {})[channel] = {color:hex, persistent};
+    previewSwatch(`hubSwatch-${channel}`, hex);
     say(`${channel} colour applied.`);
   }catch(e){ say(e.message,"error"); }
 }
@@ -2001,6 +2055,8 @@ async function refresh(){
 
 (async ()=>{
   await refresh();
+  await loadRgbState();
+  applyMoboState();
   try{
     scanState = await api("/api/scan/status");
     renderScan(); renderHubRgb(); renderHubSizes();

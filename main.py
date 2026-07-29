@@ -51,6 +51,7 @@ CURVE_FILE = ROOT / "curve.json"
 LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
 EFFECT_STATE_FILE = ROOT / "effect_state.json"
+RGB_STATE_FILE = ROOT / "rgb_state.json"
 GALLERY_DIR = ROOT / "media_gallery"
 GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
@@ -134,6 +135,29 @@ def _clear_effect_state():
     doesn't surprise a human by resuming something they deliberately
     turned off or replaced."""
     EFFECT_STATE_FILE.unlink(missing_ok=True)
+
+
+def _load_rgb_state() -> dict:
+    if not RGB_STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(RGB_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("could not load saved RGB state: %s", exc)
+        return {}
+
+
+def _save_rgb_state_entry(group: str, key: str, color: str, persistent: bool):
+    """Records the last colour explicitly applied to one target (the
+    motherboard, one RAM stick, or one hub channel) so it can be pushed
+    back to the hardware on the next launch. Same reasoning as
+    _save_panorama_state - no OpenRGB call here has a way to read back a
+    device's current colour, so there's no way to check "is the hardware
+    already showing this" on startup, only to unconditionally re-apply
+    (see _reapply_rgb_state)."""
+    state = _load_rgb_state()
+    state.setdefault(group, {})[key] = {"color": color, "persistent": persistent}
+    RGB_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
 def _load_gallery() -> list[dict]:
@@ -309,6 +333,81 @@ def _launch_vendor_openrgb() -> bool:
     return True
 
 
+async def _reapply_rgb_state():
+    """Pushes every colour saved by _save_rgb_state_entry back to the
+    hardware. Called unconditionally on every launch, same reasoning as
+    the saved position effect and Panorama's last-applied media/
+    brightness: OpenRGB gives no way to read a device's actual current
+    colour back, so there's no "only if not already set" check possible -
+    only "always re-apply, best effort, one target's failure doesn't
+    block the rest"."""
+    state = _load_rgb_state()
+    if not state:
+        return
+
+    mobo = state.get("mobo", {}).get("0")
+    if mobo:
+        try:
+            devices = await asyncio.to_thread(openrgb.motherboard)
+            if devices:
+                await asyncio.to_thread(
+                    openrgb.set_color, devices, _hex_to_rgb(mobo["color"]), mobo.get("persistent", True))
+        except Exception as exc:
+            log.warning("could not reapply saved motherboard colour: %s", exc)
+
+    ram_state = state.get("ram", {})
+    if ram_state:
+        try:
+            devices = await asyncio.to_thread(openrgb.ram)
+            for idx_str, entry in ram_state.items():
+                idx = int(idx_str)
+                if 0 <= idx < len(devices):
+                    await asyncio.to_thread(
+                        openrgb.set_color, [devices[idx]], _hex_to_rgb(entry["color"]),
+                        entry.get("persistent", True))
+        except Exception as exc:
+            log.warning("could not reapply saved RAM colours: %s", exc)
+
+    hub_state = state.get("hub", {})
+    for channel, entry in hub_state.items():
+        try:
+            rgb = _hex_to_rgb(entry["color"])
+            persistent = entry.get("persistent", True)
+
+            def _do(channel=channel, rgb=rgb, persistent=persistent):
+                with _open_hub_raw() as raw:
+                    ctrl = raw.find_controller("NZXT")
+                    if ctrl is None:
+                        return
+                    zone = raw.zone_for_channel(ctrl, channel)
+                    # A channel's zone size doesn't survive an OpenRGB
+                    # restart until a scan re-sizes it (see the resize
+                    # endpoint's docstring) - skip silently rather than
+                    # writing colour data to a zone reporting 0 LEDs.
+                    if zone is None or zone.leds_count == 0:
+                        return
+                    raw.select_mode(ctrl, "static" if persistent else "direct")
+                    raw.set_zone_color(ctrl.index, zone, rgb)
+
+            await asyncio.to_thread(_do)
+        except Exception as exc:
+            log.warning("could not reapply saved hub channel %s colour: %s", channel, exc)
+
+
+async def _reapply_hub_rgb_state_delayed():
+    """A freshly (re)started OpenRGB reports every hub channel's zone as
+    0 LEDs until the startup quick-scan resizes it (scan.py's
+    _resize_hub_zones, kicked off fire-and-forget in lifespan below) -
+    reapplying hub channel colours immediately after connecting would
+    silently skip all of them. Waits long enough for a "quick" scan to
+    realistically have finished before trying, rather than blocking
+    server startup on it."""
+    await asyncio.sleep(10)
+    state = _load_rgb_state()
+    if state.get("hub"):
+        await _reapply_rgb_state()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _keepalive_task, _curve_task
@@ -343,6 +442,19 @@ async def lifespan(app: FastAPI):
     # that immediately fails with "no hub found".
     if hub.connected or openrgb.connected:
         scan.start("quick")
+
+    # Push back whatever static RGB colours shyyctl itself last applied -
+    # see _reapply_rgb_state's docstring, same "no readback, so always
+    # re-apply" reasoning as the saved effect below. Mobo/RAM colours
+    # don't depend on the scan above; hub channel colours do (a channel's
+    # zone reports 0 LEDs until the scan's resize step runs), so that
+    # part is retried again after a delay by the background task.
+    if openrgb.connected:
+        try:
+            await _reapply_rgb_state()
+        except Exception as exc:
+            log.warning("could not reapply saved RGB colours: %s", exc)
+        asyncio.create_task(_reapply_hub_rgb_state_delayed())
 
     # Resume whatever position effect was running when this process last
     # stopped - see _save_effect_state's docstring: it's host-driven, so
@@ -659,6 +771,15 @@ def _hub_via_raw() -> dict | None:
         return None
 
 
+@app.get("/api/rgb/state")
+async def rgb_state():
+    """The last colour shyyctl itself applied to each target (see
+    _save_rgb_state_entry) - lets the UI pre-fill colour pickers and show
+    a "currently applied" swatch on load, instead of every control
+    resetting to a generic default the moment the page is refreshed."""
+    return _load_rgb_state()
+
+
 @app.get("/api/rgb/devices")
 async def rgb_devices():
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
@@ -696,6 +817,7 @@ async def set_mobo_color(body: ColorRequest):
     if not devices:
         raise HTTPException(404, "no motherboard RGB device found")
     await asyncio.to_thread(openrgb.set_color, devices, rgb, body.persistent)
+    _save_rgb_state_entry("mobo", "0", body.color, body.persistent)
     return {"ok": True}
 
 
@@ -749,6 +871,8 @@ async def set_ram_color(body: ColorRequest):
     if not devices:
         raise HTTPException(404, "no RAM RGB device found")
     await asyncio.to_thread(openrgb.set_color, devices, rgb, body.persistent)
+    for i in range(len(devices)):
+        _save_rgb_state_entry("ram", str(i), body.color, body.persistent)
     return {"ok": True}
 
 
@@ -773,6 +897,7 @@ async def set_ram_stick_color(index: int, body: ColorRequest):
     if index < 0 or index >= len(devices):
         raise HTTPException(404, f"no RAM stick at index {index}")
     await asyncio.to_thread(openrgb.set_color, [devices[index]], rgb, body.persistent)
+    _save_rgb_state_entry("ram", str(index), body.color, body.persistent)
     return {"ok": True}
 
 
@@ -875,6 +1000,7 @@ async def set_hub_channel_color(channel: str, body: ColorRequest):
         raise HTTPException(404, "no hub RGB device found")
     if error:
         raise HTTPException(400, error)
+    _save_rgb_state_entry("hub", channel, body.color, body.persistent)
     return {"ok": True}
 
 
