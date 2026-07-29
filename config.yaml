@@ -54,19 +54,34 @@ sensors:
   # port, and shyyctl won't auto-launch its own copy since something's
   # already answering here).
   librehardwaremonitor_url: "http://127.0.0.1:8085/data.json"
-  cpu_sensor_match: "CPU Package"
-  # Motherboard/RAM temperatures: opt-in and commented out by default -
-  # unlike "CPU Package" (near-universal across vendors), every
-  # motherboard and RAM kit names these sensors differently in the
-  # LibreHardwareMonitorLib sensor tree. Check what SensorHelper (or
-  # LibreHardwareMonitor's own UI) actually names your board's
-  # temperature sensor (something like "Motherboard", "VRM", "Chipset",
-  # "PCH" under its mainboard node) and/or your RAM's (if your kit even
-  # exposes one via SPD - not all do), and uncomment + fill in the match
-  # string that actually appears there. Leave commented out (or blank)
-  # to just not show that tile - a wrong guess here would silently show
-  # the wrong sensor's reading, which is worse than not showing one at
-  # all.
+  # "CPU Package" is an Intel-only naming convention - confirmed this
+  # session against a real AMD system (Ryzen 9 9950X3D, X870 board):
+  # LibreHardwareMonitorLib names the equivalent sensor "Core
+  # (Tctl/Tdie)" under the CPU's own node, not "CPU Package" (that name
+  # never appears at all on this hardware, which is exactly why it was
+  # showing "--" even with the sensor helper confirmed working). If
+  # you're on an Intel CPU, change this back to "CPU Package"; on AMD,
+  # "Core (Tctl/Tdie)" is correct.
+  cpu_sensor_match: "Core (Tctl/Tdie)"
+  # RAM: confirmed this session too - each G.Skill Trident Z5 stick shows
+  # up as its own "DIMM #N" sensor (e.g. "DIMM #1", "DIMM #3" for two
+  # sticks in slots 1/3) under its own memory device node. "DIMM" as a
+  # substring matches whichever one lhm_temp's walker reaches first -
+  # this only ever surfaces one aggregate reading, not one tile per
+  # stick, same limitation as the CPU/motherboard tiles.
+  ram_sensor_match: "DIMM"
+  # Motherboard: left commented out - confirmed this session that this
+  # board's SuperIO chip (Nuvoton NCT6701D) exposes six temperature
+  # sensors with NO descriptive names at all, just "Temperature #1"
+  # through "Temperature #6" - unlike CPU/RAM above, there's no way to
+  # tell from the name alone which physical location each one is (one
+  # read 85°C, which could be a genuine VRM reading under load, or could
+  # be noise from an unpopulated header - no way to tell without
+  # comparing against another tool, like ASUS's own Armoury Crate, that
+  # labels its sensors). Uncomment and pick "Temperature #N" once you've
+  # confirmed which index is real via such a comparison - guessing here
+  # would silently show a meaningless number as if it were trustworthy.
+  # mobo_sensor_match: "Temperature #1"
   # mobo_sensor_match: "Motherboard"
   # ram_sensor_match: "Memory"
   # Confirmed this session: the Tryx Panorama's Asetek Gen8 pump is not

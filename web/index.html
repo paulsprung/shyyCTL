@@ -913,18 +913,41 @@ function renderCurveDiagramOnly(curveId){
   if(svg && curve) svg.innerHTML = curveDiagramSvg(curve);
 }
 
+function curveStatusText(curve){
+  const status = (curveStatusData.curves || []).find(s => s.id === curve.id);
+  // temp_c and duty are independent now - the temp reading no longer
+  // depends on the hub being connected (see main.py's _curve_loop),
+  // so a curve can show a real temperature with duty still null (no
+  // fans assigned yet, or the hub itself is what's unavailable).
+  return !status || status.temp_c == null ? "waiting on temperature&hellip;"
+    : status.duty != null ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%`
+    : `${Math.round(status.temp_c)}°C`;
+}
+
+/* Called on every status poll (every 4s, see pollCurveStatus) - only
+   touches each card's status text in place, never rebuilds the DOM.
+   renderCurveList() below does a full innerHTML replace, which used to
+   run on this same 4s tick: any in-progress point drag held a
+   reference to the SVG element that replace would silently detach
+   (the point would just stop moving mid-drag), and any focused
+   curve-name input would lose focus/cursor position every 4 seconds.
+   Confirmed as the real cause of the fan curve UI "feeling laggy" -
+   full rebuilds are still fine, and still happen, for actions that
+   really do change the DOM structure (add/delete/rename a curve,
+   change its source, add/remove points) - those already call
+   renderCurveList() directly from their own handlers. */
+function updateCurveStatusText(){
+  for(const curve of curveProfiles){
+    const el = document.querySelector(`.curve-status[data-id="${curve.id}"]`);
+    if(el) el.innerHTML = curveStatusText(curve);
+  }
+}
+
 function renderCurveList(){
   const box = document.getElementById("curveList");
   if(!box) return;
   box.innerHTML = curveProfiles.map(curve => {
-    const status = (curveStatusData.curves || []).find(s => s.id === curve.id);
-    // temp_c and duty are independent now - the temp reading no longer
-    // depends on the hub being connected (see main.py's _curve_loop),
-    // so a curve can show a real temperature with duty still null (no
-    // fans assigned yet, or the hub itself is what's unavailable).
-    const statusText = !status || status.temp_c == null ? "waiting on temperature&hellip;"
-      : status.duty != null ? `${Math.round(status.temp_c)}°C &rarr; ${status.duty}%`
-      : `${Math.round(status.temp_c)}°C`;
+    const statusText = curveStatusText(curve);
     return `<div class="curve-card">
       <div class="curve-card-top">
         <input type="text" class="curve-name-input" value="${curve.name}"
@@ -936,7 +959,7 @@ function renderCurveList(){
         <button aria-pressed="${curve.source==='gpu'}" onclick="setCurveSource('${curve.id}','gpu')">GPU</button>
         <button aria-pressed="${curve.source==='cpu_gpu'}" onclick="setCurveSource('${curve.id}','cpu_gpu')">CPU+GPU</button>
       </div>
-      <span class="curve-status">${statusText}</span>
+      <span class="curve-status" data-id="${curve.id}">${statusText}</span>
       <svg class="curve-diagram" data-id="${curve.id}" viewBox="0 0 ${CURVE_W} ${CURVE_H}"
         style="width:100%;display:block;touch-action:none;background:var(--panel-2);border-radius:8px"
         ondblclick="addCurvePointAt(event,'${curve.id}')">${curveDiagramSvg(curve)}</svg>
@@ -1032,7 +1055,7 @@ async function saveCurves(){
 
 async function pollCurveStatus(){
   try{ curveStatusData = await api("/api/curve/status"); }catch(e){ curveStatusData = {curves: []}; }
-  if(document.getElementById("page-fans").classList.contains("active")){ renderFans(); renderCurveList(); }
+  if(document.getElementById("page-fans").classList.contains("active")){ renderFans(); updateCurveStatusText(); }
   setTimeout(pollCurveStatus, 4000);
 }
 
