@@ -26,6 +26,9 @@
 !ifndef VENDOR_DIR
   !define VENDOR_DIR "..\..\vendor"
 !endif
+!ifndef ICON_FILE
+  !define ICON_FILE "shyyctl.ico"
+!endif
 
 Name "shyyctl"
 OutFile "shyyctl-setup-${VERSION}.exe"
@@ -37,6 +40,12 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define MUI_ABORTWARNING
+!ifdef MUI_ICON
+  !undef MUI_ICON
+!endif
+!ifdef ICON_FILE
+  !define MUI_ICON "${ICON_FILE}"
+!endif
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY

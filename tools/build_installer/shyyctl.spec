@@ -30,6 +30,11 @@ block_cipher = None
 
 REPO_ROOT = Path(SPECPATH).resolve().parent.parent
 
+# Optional: Use a custom icon if it exists at tools/build_installer/shyyctl.ico
+# To create from an image, run: python tools/build_installer/create_icon.py your_image.png
+ICON_PATH = Path(SPECPATH).resolve().parent / "shyyctl.ico"
+ICON = str(ICON_PATH) if ICON_PATH.exists() else None
+
 extra_datas = [
     (str(REPO_ROOT / "web"), "web"),
 ]
@@ -124,6 +129,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON,
 )
 
 coll = COLLECT(
