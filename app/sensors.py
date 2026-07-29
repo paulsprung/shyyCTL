@@ -68,6 +68,89 @@ def cpu_ram() -> dict:
         return {"cpu_percent": None, "ram_percent": None, "ram_used_gb": None, "ram_total_gb": None}
 
 
+_resource_procs: dict[str, "psutil.Process | None"] = {}
+
+
+def process_resources() -> dict:
+    """Live CPU/RAM cost of shyyctl itself and its two vendored helper
+    processes (OpenRGB.exe, SensorHelper.exe) - what this app specifically
+    is costing the machine, for the Settings resource viewer. Deliberately
+    separate from cpu_ram() above, which reports the whole machine's load,
+    not this app's share of it.
+
+    psutil.Process.cpu_percent(interval=None) is a non-blocking call that
+    reports the delta since that same Process handle's *previous*
+    cpu_percent() call - meaningless (always 0.0) on the very first call
+    after a handle is created, which is why every handle here gets one
+    throwaway priming call the moment it's first found, before its result
+    is ever returned to a caller. Handles are cached across polls (by
+    name, since neither helper's PID is tracked anywhere else in this
+    file - both are found/killed by image name via tasklist/taskkill, see
+    main.py's _process_running/_kill_process) so a real reading is
+    available from the very next poll onward rather than resetting to 0.0
+    every single call. is_running() on a cached handle correctly reports
+    False after that specific process exits even if a new process reuses
+    the same name (psutil tracks each handle's own start time internally
+    to detect PID reuse) - a stale cache entry is dropped and re-searched
+    for automatically rather than ever reporting a dead process's last
+    known numbers as if they were live."""
+    if psutil is None:
+        return {"self": None, "openrgb": None, "sensor_helper": None}
+
+    def usage(proc) -> dict | None:
+        if proc is None:
+            return None
+        try:
+            with proc.oneshot():
+                cpu = proc.cpu_percent(interval=None)
+                rss_mb = proc.memory_info().rss / (1024 ** 2)
+            return {"cpu_percent": round(cpu, 1), "ram_mb": round(rss_mb, 1)}
+        except Exception:
+            return None
+
+    def find_by_name(exe_name: str):
+        cached = _resource_procs.get(exe_name)
+        if cached is not None:
+            try:
+                if not cached.is_running():
+                    cached = None
+            except Exception:
+                cached = None
+        if cached is None:
+            for p in psutil.process_iter(["name"]):
+                try:
+                    if (p.info.get("name") or "").lower() == exe_name:
+                        p.cpu_percent(interval=None)  # prime - see docstring
+                        cached = p
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            _resource_procs[exe_name] = cached
+        return cached
+
+    try:
+        self_proc = _resource_procs.get("self")
+        if self_proc is None:
+            self_proc = psutil.Process()
+            self_proc.cpu_percent(interval=None)  # prime - see docstring
+            _resource_procs["self"] = self_proc
+        self_usage = usage(self_proc)
+    except Exception as exc:
+        log.warning("could not read shyyctl's own process usage: %s", exc)
+        self_usage = None
+
+    openrgb_usage = usage(find_by_name("openrgb.exe"))
+    sensor_helper_usage = usage(find_by_name("sensorhelper.exe"))
+
+    total_cpu = sum(u["cpu_percent"] for u in (self_usage, openrgb_usage, sensor_helper_usage) if u)
+    total_ram = sum(u["ram_mb"] for u in (self_usage, openrgb_usage, sensor_helper_usage) if u)
+
+    return {
+        "self": self_usage, "openrgb": openrgb_usage, "sensor_helper": sensor_helper_usage,
+        "total_cpu_percent": round(total_cpu, 1), "total_ram_mb": round(total_ram, 1),
+    }
+
+
 def gpu() -> dict:
     """First NVIDIA GPU's utilisation/memory/temperature via nvidia-smi.
     None across the board (not an exception) on a box with no NVIDIA GPU or

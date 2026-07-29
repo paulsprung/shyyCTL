@@ -517,6 +517,13 @@
             </div>
           </div>
         </section>
+        <section id="resourceUsageSection">
+          <div class="section-head"><h2>Resource usage</h2><div class="rule"></div>
+            <span class="note">what shyyctl itself is costing this machine right now</span></div>
+          <div class="card">
+            <table class="res" id="resourceUsageTable"></table>
+          </div>
+        </section>
         <section id="autostartSection" style="display:none">
           <div class="section-head"><h2>Startup</h2><div class="rule"></div></div>
           <div class="card">
@@ -526,6 +533,19 @@
             </label>
             <p class="note" style="margin:10px 0 0">Runs silently in the background - opening shyyctl from
               the Start Menu just opens this page against it, it won't start a second copy.</p>
+          </div>
+        </section>
+        <section id="liteExportSection">
+          <div class="section-head"><h2>Portable background service</h2><div class="rule"></div></div>
+          <div class="card">
+            <p class="note" style="margin:0 0 12px">Exports config.yaml, fan curves, LED layout, and the saved
+              RGB effect/colours as a zip. Copy its contents into another shyyctl install (e.g. a dual-boot
+              gaming OS) and run <code>shyyctl.exe --lite</code> there - RGB effects and fan curves keep
+              running with no web server, no browser tab, and no display/gallery overhead, only launching
+              SensorHelper at all if a saved curve actually reads a CPU/motherboard temperature.</p>
+            <div class="row">
+              <button class="btn sec sm" onclick="exportConfig()">Export config</button>
+            </div>
           </div>
         </section>
       </div>
@@ -2394,6 +2414,46 @@ async function loadSystemInfo(){
   }catch(e){}
 }
 
+async function loadResourceUsage(){
+  try{
+    const r = await api("/api/system/resources");
+    renderResourceUsage(r);
+  }catch(e){}
+}
+
+function renderResourceRow(label, u){
+  if(!u) return `<tr><td>${label}</td><td colspan="2" class="note">not running</td></tr>`;
+  return `<tr><td>${label}</td><td>${u.cpu_percent}%</td><td>${u.ram_mb} MB</td></tr>`;
+}
+
+function renderResourceUsage(r){
+  const table = document.getElementById("resourceUsageTable");
+  if(!table) return;
+  table.innerHTML = `
+    <thead><tr><th>Process</th><th>CPU</th><th>RAM</th></tr></thead>
+    <tbody>
+      ${renderResourceRow("shyyctl", r.self)}
+      ${renderResourceRow("OpenRGB", r.openrgb)}
+      ${renderResourceRow("SensorHelper", r.sensor_helper)}
+      <tr style="font-weight:600"><td>Total</td><td>${r.total_cpu_percent}%</td><td>${r.total_ram_mb} MB</td></tr>
+    </tbody>`;
+}
+
+async function exportConfig(){
+  say("Exporting config…");
+  try{
+    const resp = await fetch("/api/system/export-config");
+    if(!resp.ok) throw new Error(`export failed (${resp.status})`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "shyyctl-config.zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    say("Config exported.");
+  }catch(e){ say(e.message,"error"); }
+}
+
 function renderServicesStatus(s){
   document.getElementById("servicesStatusNote").textContent =
     `OpenRGB: ${s.openrgb ? "running" : "stopped"} · SensorHelper: ${s.sensor_helper ? "running" : "stopped"}`;
@@ -2437,6 +2497,8 @@ async function setAutostart(enabled){
 
 loadSystemInfo();
 setInterval(loadSystemInfo, 30000);
+loadResourceUsage();
+setInterval(loadResourceUsage, 4000);
 </script>
 </body>
 </html>

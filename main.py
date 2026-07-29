@@ -16,6 +16,7 @@ Run:
 import asyncio
 import colorsys
 import contextlib
+import io
 import json
 import logging
 import math
@@ -30,12 +31,13 @@ import time
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -837,6 +839,87 @@ async def lifespan(app: FastAPI):
         _panorama.disconnect()
 
 
+async def _lite_service_main():
+    """Entry point for `--lite` (see the __main__ block below) - RGB
+    effects and fan curves only, with no web server ever bound, no
+    browser tab, and no Panorama display/gallery involvement at all.
+    Built for the direct user request of running shyyctl on a second,
+    leaned-down Windows install (a dual-boot "gaming" OS) purely as a
+    background helper: the CPU/RAM lifespan() normally spends on
+    FastAPI/uvicorn's own request-handling stack, the Panorama keepalive
+    ping loop, and the startup quick-scan is exactly what a machine like
+    that has no use for, on top of what OpenRGB/SensorHelper themselves
+    already cost.
+
+    Reuses every real hardware/state function lifespan() itself uses
+    (same hub/openrgb connect calls, same _reapply_rgb_state/
+    _resume_effect_after_scan resume logic, same _curve_loop) rather than
+    reimplementing any of it - this is a trimmed-down startup order, not
+    a second implementation of RGB effects or fan curves. Config for it
+    is whatever's already sitting next to the exe (config.yaml,
+    curve.json, layout.json, rgb_state.json, effect_state.json) - see the
+    Settings page's "Export config" button (/api/system/export-config),
+    which bundles exactly those files for copying into another install.
+
+    OpenRGB is only launched if there's actually an effect or a saved
+    static colour to show - no point paying for a Qt GUI app to sit idle
+    with nothing to display. SensorHelper is only launched if a saved
+    curve both has a channel assigned AND reads a cpu/cpu_gpu
+    temperature - a GPU-only curve needs nothing from it (nvidia-smi
+    alone covers GPU temp), and an unassigned curve isn't driving
+    anything regardless of its source."""
+    global _curve_task
+    log.info("Starting in --lite mode: RGB effects + fan curves only, no web UI.")
+
+    if not await asyncio.to_thread(hub.connect):
+        log.warning("hub not connected: %s", hub.last_error)
+
+    saved_effect = _load_effect_state()
+    rgb_state = _load_rgb_state()
+    if saved_effect is not None or rgb_state:
+        if not await asyncio.to_thread(openrgb.connect):
+            log.warning("OpenRGB not connected: %s", openrgb.last_error)
+            if _launch_vendor_openrgb():
+                for _ in range(10):
+                    await asyncio.sleep(2)
+                    if await asyncio.to_thread(openrgb.connect):
+                        break
+                else:
+                    log.warning("Still not connected after starting bundled OpenRGB "
+                               "(waited ~20s): %s", openrgb.last_error)
+
+    try:
+        curve_state = json.loads(CURVE_FILE.read_text(encoding="utf-8")) if CURVE_FILE.is_file() else {}
+    except Exception:
+        curve_state = {}
+    curves = curve_state.get("curves") or []
+    needs_lhm = any(c.get("source") in ("cpu", "cpu_gpu") and c.get("channels") for c in curves)
+    if needs_lhm:
+        lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
+        if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
+            _launch_vendor_sensor_helper()
+
+    if hub.connected and rgb_state.get("hub"):
+        scan.start("quick")
+        asyncio.create_task(_reapply_hub_rgb_state_delayed())
+    if openrgb.connected and rgb_state:
+        try:
+            await _reapply_rgb_state()
+        except Exception as exc:
+            log.warning("could not reapply saved RGB colours: %s", exc)
+    if saved_effect is not None:
+        asyncio.create_task(_resume_effect_after_scan(saved_effect))
+
+    _curve_task = asyncio.create_task(_curve_loop())
+    try:
+        await _curve_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await _stop_effect()
+        hub.disconnect()
+
+
 app = FastAPI(title="shyyctl", lifespan=lifespan)
 
 
@@ -871,6 +954,15 @@ async def sensors():
     app/sensors.py for exactly where each one comes from and why each
     degrades to None independently rather than failing the whole call."""
     return await asyncio.to_thread(sensors_mod.snapshot, CONFIG)
+
+
+@app.get("/api/system/resources")
+async def system_resources():
+    """CPU/RAM cost of shyyctl itself plus OpenRGB.exe/SensorHelper.exe,
+    for the Settings resource viewer - see app/sensors.py's
+    process_resources for how each reading degrades to None (psutil
+    missing, or that particular process not running)."""
+    return await asyncio.to_thread(sensors_mod.process_resources)
 
 
 @app.get("/api/conflicts")
@@ -978,6 +1070,44 @@ async def quit_shyyctl():
 
     asyncio.create_task(_delayed_exit())
     return {"ok": True}
+
+
+# Every ROOT-relative state file a `--lite` instance (see _lite_service_main
+# below) reads on its own - deliberately everything RGB-effect/fan-curve
+# related and nothing display/gallery related, since --lite never touches
+# either. config.yaml first since it's the one file that's mandatory (hub/
+# openrgb host/port); the rest are included only if they actually exist -
+# a fresh Setup with no saved effect yet shouldn't make this endpoint 404,
+# it should just export a smaller zip.
+_LITE_EXPORT_FILES: list[tuple[str, "Path"]] = [
+    ("config.yaml", _CONFIG_FILE),
+    ("curve.json", CURVE_FILE),
+    ("layout.json", LAYOUT_FILE),
+    ("rgb_state.json", RGB_STATE_FILE),
+    ("effect_state.json", EFFECT_STATE_FILE),
+    ("effect_presets.json", EFFECT_PRESETS_FILE),
+]
+
+
+@app.get("/api/system/export-config")
+async def export_config():
+    """Zips up everything a `--lite` instance needs (see
+    _LITE_EXPORT_FILES/_lite_service_main) so it can be copied straight
+    into another shyyctl install's folder - e.g. a leaned-down dual-boot
+    gaming Windows where the point is running RGB effects and fan curves
+    for the least possible CPU/RAM, not opening the web UI there at all.
+    Built in memory (io.BytesIO) rather than a temp file - these are all
+    small JSON/YAML files, nothing here is big enough to justify touching
+    disk twice."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, path in _LITE_EXPORT_FILES:
+            if path.is_file():
+                zf.write(path, arcname)
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=shyyctl-config.zip"})
 
 
 # -- fans -----------------------------------------------------------------
@@ -2284,10 +2414,27 @@ def _already_running(host: str, port: int) -> bool:
 
 
 if __name__ == "__main__":
-    import uvicorn
-
     _host = CONFIG["server"]["host"]
     _port = CONFIG["server"]["port"]
+
+    if "--lite" in sys.argv:
+        # Deliberately still checked against the *normal* instance's port
+        # even though --lite never binds one itself - running both at once
+        # against the same hardware would just mean two processes racing
+        # each other to write the same fan curve / RGB effect, not two
+        # independent capabilities.
+        if _already_running(_host, _port):
+            log.info("shyyctl is already running (full instance) on %s:%d - not starting "
+                     "a second, --lite copy alongside it.", _host, _port)
+            sys.exit(0)
+        try:
+            asyncio.run(_lite_service_main())
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
+
+    import uvicorn
+
     if getattr(sys, "frozen", False) and _already_running(_host, _port):
         if "--background" in sys.argv:
             log.info("shyyctl is already running on %s:%d - nothing to do for a "
