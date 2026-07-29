@@ -69,8 +69,23 @@ TRYX_MAGIC = b"TRYX"
 MEDIA_WIDTH = 2240
 MEDIA_HEIGHT = 1080
 MEDIA_SUFFIX = f".h264_{MEDIA_WIDTH}x{MEDIA_HEIGHT}"
-DEFAULT_POWERON_MEDIA = f"default_poweron.mp4{MEDIA_SUFFIX}"
-DEFAULT_STANDBY_MEDIA = f"default_standby.mp4{MEDIA_SUFFIX}"
+
+# These two were placeholder guesses ("default_poweron.mp4"/
+# "default_standby.mp4") until a real device's own media listing (f103 ->
+# f503, list_media() below) showed the actual factory filenames are
+# "start.mp4" and "screensaver.mp4" under /userdata/default/ - alongside
+# default_01..06.mp4 (selectable built-in animations, likely what a bare
+# KANALI install's own preset gallery shows) and whatever a human has
+# separately uploaded, listed under /userdata/user/. This matters beyond
+# cosmetics: set_screen_config() below resends poweron_media/standby_media
+# on EVERY call (confirmed real protocol behavior, not a shortcut this
+# code took - see its docstring), including from set_media() (applying a
+# picture) and set_brightness() (just changing brightness), neither of
+# which overrides these two params. With the old wrong guesses, every one
+# of those calls was silently pointing the panel's poweron/standby slots
+# at files that don't exist on it.
+DEFAULT_POWERON_MEDIA = f"start.mp4{MEDIA_SUFFIX}"
+DEFAULT_STANDBY_MEDIA = f"screensaver.mp4{MEDIA_SUFFIX}"
 
 
 class PanoramaError(Exception):
