@@ -471,21 +471,32 @@ async def _connect_openrgb_with_recovery() -> bool:
     on failure, launch a *second* OpenRGB.exe that then can't bind the
     already-held SDK port - compounding the exact symptom being fixed.
 
-    A process that's already running should answer almost immediately if
-    it's healthy, so this bounds that specific attempt far tighter (8s)
-    than a fresh launch's own warm-up budget below - a miss here is
-    treated as "stuck", not "still starting", and the stale process is
-    killed before relaunching the bundled copy fresh. Killing it also
-    unblocks openrgb_bridge's own connect() if that 8s wait timed out
-    while a background thread was still mid-read inside it (asyncio can
-    cancel *this* coroutine's wait, never the underlying blocking call
-    that thread is running) - the socket read that thread is stuck in
-    ends almost immediately once the process backing it is gone, rather
-    than only after its own multi-second read timeout."""
+    Deliberately NOT a tight timeout here, even though a process that's
+    already running should usually answer fast if it's healthy: this
+    same module's own docstring on openrgb_bridge.py documents OpenRGB's
+    SMBus/RAM detection taking "well past 30s" on real hardware right
+    after launch, and connect() itself walks every device sequentially
+    (see this function's own docstring above). A short window here would
+    misdiagnose an instance that's merely still warming up - e.g. Windows
+    autostarted it at login at roughly the same moment as shyyctl - as
+    "stuck", and kill it: actively counterproductive (worse than doing
+    nothing) against a healthy process, and user-hostile against one the
+    human is running themselves, not something shyyctl launched at all.
+    20s costs nothing extra here that _launch_vendor_openrgb's own
+    warm-up wait below wouldn't already cost anyway in the failure case,
+    and the outer 50s budget in lifespan is the actual backstop against
+    a genuinely wedged instance eating the whole startup.
+
+    Killing it also unblocks openrgb_bridge's own connect() if this wait
+    timed out while a background thread was still mid-read inside it
+    (asyncio can cancel *this* coroutine's wait, never the underlying
+    blocking call that thread is running) - the socket read that thread
+    is stuck in ends almost immediately once the process backing it is
+    gone, rather than only after its own multi-second read timeout."""
     running = await asyncio.to_thread(_process_running, "OpenRGB.exe")
     if running:
         try:
-            if await asyncio.wait_for(asyncio.to_thread(openrgb.connect), timeout=8):
+            if await asyncio.wait_for(asyncio.to_thread(openrgb.connect), timeout=20):
                 return True
         except asyncio.TimeoutError:
             pass
@@ -825,14 +836,15 @@ async def lifespan(app: FastAPI):
 
     try:
         # Overall budget on top of _connect_openrgb_with_recovery's own
-        # internal waits (8s zombie check + ~20s relaunch poll = ~28s
-        # already) - a final backstop so a worse-than-expected case (e.g.
+        # internal waits (20s zombie check + ~20s relaunch poll = ~40s
+        # already, see its docstring on why 20s and not something
+        # tighter) - a final backstop so a worse-than-expected case (e.g.
         # the kill not releasing openrgb_bridge's lock as quickly as
         # usual) still can't hold up the rest of startup indefinitely.
-        if not await asyncio.wait_for(_connect_openrgb_with_recovery(), timeout=45):
+        if not await asyncio.wait_for(_connect_openrgb_with_recovery(), timeout=50):
             log.warning("OpenRGB still not connected after recovery attempts: %s", openrgb.last_error)
     except asyncio.TimeoutError:
-        log.warning("OpenRGB connection attempt exceeded the 45s startup budget - "
+        log.warning("OpenRGB connection attempt exceeded the 50s startup budget - "
                    "continuing without it for this launch")
 
     # Same auto-launch idea as OpenRGB above, for SensorHelper.exe (CPU/
