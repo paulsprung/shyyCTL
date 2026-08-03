@@ -2143,7 +2143,13 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         # future frame would otherwise keep retrying the
                         # identical broken socket forever, since nothing
                         # else ever reopens it. One reconnect attempt;
-                        # failing that, just try again after another 3.
+                        # failing that, only back off to 2 (not reset to
+                        # 0) so it takes just one more write failure to
+                        # try again, not three - a full reset here meant a
+                        # reconnect attempt that itself failed (the hub
+                        # genuinely still gone, say) waited through two
+                        # extra needless failure cycles before retrying,
+                        # on top of the one this branch just handled.
                         try:
                             raw.close()
                             raw.connect()
@@ -2151,9 +2157,10 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             if ctrl is not None:
                                 raw.select_mode(ctrl, "direct")
                             log.info("effect: reconnected to the hub after repeated write failures")
+                            hub_failures = 0
                         except Exception as exc:
                             log.debug("effect: hub reconnect failed: %s", exc)
-                        hub_failures = 0
+                            hub_failures = 2
 
                 for u, device in ram_targets:
                     _, frame = frame_colors(u)
@@ -2195,9 +2202,10 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         if mobo_target is not None:
                             openrgb.select_mode(mobo_target[1], "direct")
                         log.info("effect: reconnected to OpenRGB after repeated RAM/mobo write failures")
+                        bridge_failures = 0
                     except Exception as exc:
                         log.debug("effect: OpenRGB reconnect failed: %s", exc)
-                    bridge_failures = 0
+                        bridge_failures = 2
 
                 _effect_stop.wait(0.08 if moving else 1.0)
     except Exception as exc:
