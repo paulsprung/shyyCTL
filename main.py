@@ -97,6 +97,9 @@ EFFECT_PRESETS_FILE = ROOT / "effect_presets.json"
 GALLERY_DIR = ROOT / "media_gallery"
 GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
+LOG_FILE = ROOT / "shyyctl.log"
+LOG_FILE_OLD = ROOT / "shyyctl.log.old"
+
 _log_handlers: list = []
 if getattr(sys, "frozen", False):
     # The frozen exe is built with console=False (see
@@ -112,7 +115,20 @@ if getattr(sys, "frozen", False):
     # FileHandler alongside untouched None streams - fixes both problems
     # at once with one file, and keeps uvicorn's own startup banner in
     # the same place as this app's own log lines.
-    _log_file = open(ROOT / "shyyctl.log", "a", encoding="utf-8", buffering=1)
+    #
+    # Rotated once here at startup, not via logging.handlers.
+    # RotatingFileHandler - this file is also sys.stdout/sys.stderr
+    # themselves (not just a logging handler's target), and a
+    # size-triggered mid-run rotation would close and reopen that
+    # shared file object out from under the redirect above, leaving
+    # both pointed at a stale/closed handle. A background service can
+    # run for weeks; capping growth to "this run plus one prior run"
+    # at process start is enough for a human to export and attach to a
+    # bug report, without touching anything mid-run.
+    if LOG_FILE.is_file() and LOG_FILE.stat().st_size > 10 * 1024 * 1024:
+        LOG_FILE_OLD.unlink(missing_ok=True)
+        LOG_FILE.rename(LOG_FILE_OLD)
+    _log_file = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
     sys.stdout = _log_file
     sys.stderr = _log_file
     _log_handlers.append(logging.StreamHandler(_log_file))
@@ -1227,6 +1243,29 @@ async def export_config():
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=shyyctl-config.zip"})
+
+
+@app.get("/api/system/export-log")
+async def export_log():
+    """Downloads shyyctl.log (and shyyctl.log.old too, if a rotation has
+    happened - see LOG_FILE_OLD above) - direct user request: something
+    to attach to a bug report instead of describing a failure from
+    memory after the fact. Only ever written when running as the
+    installed exe (see the frozen-only sys.stdout/stderr redirect this
+    module starts with) - a dev `python main.py` run has nothing here,
+    reported as 404 rather than an empty/missing file download."""
+    if not LOG_FILE.is_file():
+        raise HTTPException(404, "no log file yet - only written when running as the installed app")
+    if not LOG_FILE_OLD.is_file():
+        return FileResponse(LOG_FILE, media_type="text/plain", filename="shyyctl.log")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(LOG_FILE, "shyyctl.log")
+        zf.write(LOG_FILE_OLD, "shyyctl.log.old")
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=shyyctl-logs.zip"})
 
 
 # -- fans -----------------------------------------------------------------

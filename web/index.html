@@ -538,6 +538,15 @@
             <table class="res" id="resourceUsageTable"></table>
           </div>
         </section>
+        <section id="debugLogSection">
+          <div class="section-head"><h2>Debug log</h2><div class="rule"></div>
+            <span class="note">to attach when reporting a problem</span></div>
+          <div class="card">
+            <div class="row">
+              <button class="btn sec sm" onclick="exportLog()">Export debug log</button>
+            </div>
+          </div>
+        </section>
         <section id="autostartSection" style="display:none">
           <div class="section-head"><h2>Startup</h2><div class="rule"></div></div>
           <div class="card">
@@ -2739,6 +2748,31 @@ async function exportConfig(){
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
     say("Config exported.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function exportLog(){
+  say("Exporting debug log…");
+  try{
+    const resp = await fetch("/api/system/export-log");
+    if(!resp.ok){
+      const body = await resp.json().catch(()=>({}));
+      throw new Error(body.detail || `export failed (${resp.status})`);
+    }
+    // Filename depends on whether a rotation has happened (see main.py's
+    // export_log) - shyyctl.log alone, or shyyctl-logs.zip with the
+    // previous run too - read it back from the response rather than
+    // guessing one or the other here.
+    const disposition = resp.headers.get("Content-Disposition") || "";
+    const match = /filename=([^;]+)/.exec(disposition);
+    const filename = match ? match[1].trim().replace(/^"|"$/g, "") : "shyyctl.log";
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    say("Debug log exported.");
   }catch(e){ say(e.message,"error"); }
 }
 
