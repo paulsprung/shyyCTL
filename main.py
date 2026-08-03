@@ -45,6 +45,7 @@ from app.hub import Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
+from app.ambient import AmbientSampler
 from app.panorama import PanoramaError, find_print_panel, find_usb_panel, generate_thumbnail
 from app.procflags import NO_WINDOW
 from app.scan import Scan
@@ -142,6 +143,7 @@ hub = Hub(match=CONFIG["hub"]["match"])
 openrgb = OpenRgbBridge(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
 scan = Scan(hub, openrgb)
 layout = Layout(LAYOUT_FILE)
+ambient_sampler = AmbientSampler()
 
 _panorama = None
 _panorama_info: dict | None = None
@@ -264,6 +266,28 @@ def _load_gallery() -> list[dict]:
 def _save_gallery(items: list[dict]):
     GALLERY_DIR.mkdir(parents=True, exist_ok=True)
     GALLERY_MANIFEST.write_text(json.dumps(items), encoding="utf-8")
+
+
+_VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".avi"}  # mirrors web/index.html's VIDEO_SUFFIXES
+
+
+def _current_panorama_media_path() -> tuple[str, bool] | None:
+    """The local file backing whatever's currently applied to the
+    Panorama panel (see _save_panorama_state) - what the "ambient" RGB
+    effect decodes locally (app/ambient.py), never the live screen.
+    Returns (path, is_video), or None if nothing's been applied yet or
+    the gallery entry it names has since been deleted."""
+    media_name = _load_panorama_state().get("media")
+    if not media_name:
+        return None
+    for item in _load_gallery():
+        if item.get("name") != media_name:
+            continue
+        original = next((GALLERY_DIR / item["id"]).glob("original.*"), None)
+        if original is None:
+            return None
+        return str(original), original.suffix.lower() in _VIDEO_SUFFIXES
+    return None
 
 
 def _load_effect_state() -> "PositionEffectRequest | None":
@@ -1782,8 +1806,17 @@ PALETTES = ("solid", "two_color", "multicolor", "rainbow")
 # "confetti" is sparkle with a different palette colour per flash instead
 # of one shared base colour (ignore direction). "comet" is a bright band
 # with a fading tail bouncing between the two ends of `direction`'s axis,
-# instead of wave/sweep's continuous wrap-around travel.
-SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle", "fire", "confetti", "comet")
+# instead of wave/sweep's continuous wrap-around travel. "wipe" is a hard
+# on/off edge sweeping across `direction`'s axis rather than wave's
+# smooth gradient. "pulse_ring" is one narrow band travelling across
+# `direction`'s axis and wrapping at the edge (a genuine ring when
+# direction is outward/inward). "meteor" is several comets at once,
+# staggered in phase. "ambient" ignores palette/colours entirely and
+# colours each LED from the Panorama display's own currently-applied
+# media (see app/ambient.py) - a local file shyyctl already manages, not
+# a live screen/desktop capture.
+SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle", "fire", "confetti", "comet",
+          "wipe", "pulse_ring", "meteor", "ambient")
 
 
 def _resolve_effect_targets():
@@ -2104,6 +2137,72 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 brightness = max(0.0, 1.0 - dist / tail_width)
                 colors_out.append(tuple(round(c * brightness) for c in color))
 
+        elif shape == "wipe":
+            # A hard on/off edge sweeping across direction's axis, not
+            # wave's smoothly interpolated gradient - the lit half is a
+            # single solid colour (cycling through the palette if it's
+            # moving/rainbow), the rest is off, with a sharp boundary
+            # between them rather than a blend.
+            base_color = _sample_palette(palette, colors, phase[0], True)
+            colors_out = [
+                base_color if (_position_value(direction, led, bounds) - phase[0]) % 1.0 < 0.5 else (0, 0, 0)
+                for led in unit_leds
+            ]
+
+        elif shape == "pulse_ring":
+            # One narrow band travelling continuously across direction's
+            # axis and wrapping back around at the edge (unlike Comet,
+            # which bounces) - a genuine ring when direction is outward/
+            # inward, a travelling band on any other axis, same as wave/
+            # sweep generalise to all six directions.
+            ring_width = 0.18
+            pos_phase = phase[0] % 1.0
+            color = _sample_palette(palette, colors, phase[0], True)
+            colors_out = []
+            for led in unit_leds:
+                dist = abs(_position_value(direction, led, bounds) - pos_phase)
+                dist = min(dist, 1.0 - dist)  # wrap distance, so the band re-enters smoothly at the far edge
+                brightness = max(0.0, 1.0 - dist / ring_width)
+                colors_out.append(tuple(round(c * brightness) for c in color))
+
+        elif shape == "meteor":
+            # Several comets at once instead of Comet's single one, each
+            # offset in phase so they don't move in lockstep - same
+            # ping-pong triangle, repeated at a few staggered starting
+            # points for a "shower" instead of one travelling band.
+            tail_width = 0.22
+            meteor_count = 3
+            color = _sample_palette(palette, colors, phase[0], True)
+            colors_out = []
+            for led in unit_leds:
+                pos = _position_value(direction, led, bounds)
+                brightness = 0.0
+                for i in range(meteor_count):
+                    meteor_phase = (phase[0] + i / meteor_count) % 1.0
+                    meteor_pos = meteor_phase * 2 if meteor_phase < 0.5 else 2 * (1 - meteor_phase)
+                    dist = abs(pos - meteor_pos)
+                    brightness = max(brightness, 1.0 - dist / tail_width)
+                colors_out.append(tuple(round(c * max(0.0, brightness)) for c in color))
+
+        elif shape == "ambient":
+            # Colours come from the Panorama's own currently-applied
+            # media (see app/ambient.py), not the palette/colours the
+            # human picked - each LED blends the video's four sampled
+            # edge zones by its own normalised top/bottom and left/right
+            # position, so the rig mirrors roughly what's on the panel's
+            # edges the way a TV ambilight mirrors screen edges, just
+            # from a locally decoded file instead of a live feed.
+            zones = ambient_sampler.zones()
+            top, bottom, left, right = zones["top"], zones["bottom"], zones["left"], zones["right"]
+            colors_out = []
+            for led in unit_leds:
+                v = _position_value("top_to_bottom", led, bounds)
+                h = _position_value("left_to_right", led, bounds)
+                colors_out.append(tuple(
+                    round((top[c] * (1 - v) + bottom[c] * v + left[c] * (1 - h) + right[c] * h) / 2)
+                    for c in range(3)
+                ))
+
         else:
             # Default wave behavior
             colors_out = [
@@ -2118,6 +2217,17 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                           for led, c in zip(unit_leds, colors_out)]
 
         return unit_leds, colors_out
+
+    def refresh_ambient_source():
+        media = _current_panorama_media_path()
+        if media is not None:
+            ambient_sampler.set_source(*media)
+        else:
+            ambient_sampler.stop()
+
+    if shape == "ambient":
+        refresh_ambient_source()
+    last_ambient_check = time.monotonic()
 
     for _, device in ram_targets:
         openrgb.select_mode(device, "direct")
@@ -2147,6 +2257,15 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             while not _effect_stop.is_set():
                 if moving:
                     phase[0] = ((time.monotonic() - start) / period_s) % 1.0
+
+                if shape == "ambient" and time.monotonic() - last_ambient_check > 2.0:
+                    # Cheap enough to just do every couple seconds
+                    # (one small JSON read + string compare) rather than
+                    # needing the human to restart the effect after
+                    # switching what's applied to the panel while
+                    # ambient is already running.
+                    refresh_ambient_source()
+                    last_ambient_check = time.monotonic()
 
                 if ctrl is not None:
                     for u in fan_units:
@@ -2250,7 +2369,9 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     except Exception as exc:
         log.warning("position effect stopped: %s", exc)
         _effect_status = {"running": False, "kind": None, "error": str(exc)}
+        ambient_sampler.stop()
         return
+    ambient_sampler.stop()
     _effect_status = {"running": False, "kind": None, "error": None}
 
 

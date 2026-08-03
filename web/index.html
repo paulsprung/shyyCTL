@@ -74,7 +74,7 @@
      rather than native scroll - a real "3D stack", not a scrolling
      strip. */
   .kanali-carousel{display:flex;align-items:center;gap:6px}
-  .kanali-track{position:relative;flex:1;min-width:0;height:230px}
+  .kanali-track{position:relative;flex:1;min-width:0;height:230px;overflow:hidden}
   .kanali-card{position:absolute;left:50%;top:50%;width:260px;aspect-ratio:16/10;border-radius:var(--radius);
     overflow:hidden;background:var(--panel-2);cursor:pointer;border:2px solid transparent;
     transition:transform .3s cubic-bezier(.2,.7,.3,1),opacity .3s ease,border-color .2s;
@@ -177,6 +177,8 @@
   .rgb-card .row{flex-wrap:wrap}
 
   .effect-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  .effect-grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media (max-width:640px){.effect-grid-3{grid-template-columns:1fr}}
   .preset-chip{display:inline-flex;align-items:center;gap:7px;padding:6px 8px 6px 12px;border-radius:20px;
     background:var(--panel-2);border:1px solid var(--rule);font-size:11.5px;cursor:pointer;color:var(--ink)}
   .preset-chip:hover{border-color:var(--accent)}
@@ -375,44 +377,57 @@
             <div class="row" id="effectPresetsRow" style="flex-wrap:wrap;gap:6px"></div>
           </div>
 
-          <div class="prop" style="margin-bottom:16px">
-            <label>Shape</label>
-            <div class="seg" id="effectShapeSeg">
-              <button data-v="wave" aria-pressed="true">Wave</button>
-              <button data-v="breathing">Breathing</button>
-              <button data-v="strobe">Strobe</button>
-              <button data-v="pulse">Pulse</button>
-              <button data-v="sweep">Sweep</button>
-              <button data-v="sparkle">Sparkle</button>
-              <button data-v="fire">Fire</button>
-              <button data-v="confetti">Confetti</button>
-              <button data-v="comet">Comet</button>
+          <div class="effect-grid-3" style="margin-bottom:16px">
+            <div class="prop"><label>Shape</label>
+              <select id="effectShapeSelect">
+                <optgroup label="Wave">
+                  <option value="wave">Wave</option>
+                  <option value="sweep">Sweep</option>
+                  <option value="wipe">Wipe</option>
+                </optgroup>
+                <optgroup label="Pulse">
+                  <option value="breathing">Breathing</option>
+                  <option value="strobe">Strobe</option>
+                  <option value="pulse">Pulse</option>
+                  <option value="pulse_ring">Pulse ring</option>
+                </optgroup>
+                <optgroup label="Twinkle">
+                  <option value="sparkle">Sparkle</option>
+                  <option value="confetti">Confetti</option>
+                </optgroup>
+                <optgroup label="Motion">
+                  <option value="comet">Comet</option>
+                  <option value="meteor">Meteor</option>
+                </optgroup>
+                <optgroup label="Organic">
+                  <option value="fire">Fire</option>
+                </optgroup>
+                <optgroup label="Reactive">
+                  <option value="ambient">Ambient (Panorama)</option>
+                </optgroup>
+              </select>
             </div>
-          </div>
-
-          <div class="effect-grid">
             <div class="prop" id="effectDirProp"><label>Direction</label>
-              <div class="seg" id="effectDirSeg">
-                <button data-v="top_to_bottom" aria-pressed="true">Top&darr;Bottom</button>
-                <button data-v="bottom_to_top">Bottom&uarr;Top</button>
-                <button data-v="left_to_right">Left&rarr;Right</button>
-                <button data-v="right_to_left">Right&larr;Left</button>
-                <button data-v="outward">In&rarr;Out</button>
-                <button data-v="inward">Out&rarr;In</button>
-              </div>
+              <select id="effectDirSelect">
+                <option value="top_to_bottom">Top&darr;Bottom</option>
+                <option value="bottom_to_top">Bottom&uarr;Top</option>
+                <option value="left_to_right">Left&rarr;Right</option>
+                <option value="right_to_left">Right&larr;Left</option>
+                <option value="outward">In&rarr;Out</option>
+                <option value="inward">Out&rarr;In</option>
+              </select>
             </div>
-
-            <div class="prop"><label>Palette</label>
-              <div class="seg" id="effectPaletteSeg">
-                <button data-v="solid">Solid</button>
-                <button data-v="two_color" aria-pressed="true">Two-colour</button>
-                <button data-v="multicolor">Multicolour</button>
-                <button data-v="rainbow">Rainbow</button>
-              </div>
+            <div class="prop" id="effectPaletteProp"><label>Palette</label>
+              <select id="effectPaletteSelect">
+                <option value="solid">Solid</option>
+                <option value="two_color">Two-colour</option>
+                <option value="multicolor">Multicolour</option>
+                <option value="rainbow">Rainbow</option>
+              </select>
             </div>
           </div>
 
-          <div class="prop"><label>Colours</label>
+          <div class="prop" id="effectColorsProp"><label>Colours</label>
             <div class="row" id="effectColorsRow" style="flex-wrap:wrap"></div>
           </div>
 
@@ -1353,7 +1368,33 @@ function drawAdvancedCase(){
     height="${CANVAS_H-(CANVAS_PAD-16)*2}" fill="none"
     stroke="var(--ink-soft)" stroke-width="1.2" opacity=".4" rx="3"/>`;
   for(const u of layoutData.units){
-    if(u.kind === "display") continue;
+    if(u.kind === "display"){
+      // No LEDs to drive here, but a monitor unit with nothing shown
+      // where it's actually placed was invisible on this canvas
+      // entirely - direct user request: see the panel's own current
+      // media (video included) right where its unit sits, both as a
+      // reference for building position effects around it and as the
+      // preview surface the ambient-light effect samples colour from.
+      const x = svgX(u.x), y = svgY(u.y);
+      const w = 132, h = 84;
+      const item = currentPanoramaMediaItem();
+      out += `<text x="${x-w/2}" y="${y-h/2-10}"
+        font-family="monospace" font-size="10" fill="var(--ink-soft)">${u.name}</text>
+        <foreignObject x="${x-w/2}" y="${y-h/2}" width="${w}" height="${h}">
+          <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;background:#000;
+            border:2px solid var(--ink-soft);border-radius:5px;overflow:hidden;display:flex;
+            align-items:center;justify-content:center">
+            ${item
+              ? (isVideoItem(item)
+                  ? `<video src="/api/panorama/gallery/${item.id}/original" autoplay muted loop playsinline
+                      style="width:100%;height:100%;object-fit:cover"></video>`
+                  : `<img src="/api/panorama/gallery/${item.id}/original" alt="${item.name}"
+                      style="width:100%;height:100%;object-fit:cover">`)
+              : `<span style="color:#5a5f66;font:10px monospace">no signal</span>`}
+          </div>
+        </foreignObject>`;
+      continue;
+    }
     const leds = layoutData.leds.filter(l=>l.unit===u.id).sort((a,b)=>a.index-b.index);
     if(!leds.length) continue;
     const info = ledEndpointInfo(u);
@@ -1632,10 +1673,10 @@ function loadEffectPreset(id){
   effectColors = p.colors && p.colors.length ? [...p.colors] : ["#4c79ff", "#ff7a30"];
   effectMoving = p.moving;
   effectShape = p.shape || "wave";
-  setPressed("effectDirSeg", effectDirection);
-  setPressed("effectPaletteSeg", effectPalette);
+  document.getElementById("effectDirSelect").value = effectDirection;
+  document.getElementById("effectPaletteSelect").value = effectPalette;
   setPressed("effectMovingSeg", effectMoving ? "moving" : "static");
-  setPressed("effectShapeSeg", effectShape);
+  document.getElementById("effectShapeSelect").value = effectShape;
   updateEffectShapeUi();
   const periodInput = document.getElementById("effectPeriod");
   if(periodInput) periodInput.value = p.period_s;
@@ -1674,20 +1715,15 @@ async function deleteEffectPreset(id){
 }
 
 function initEffectControls(){
-  document.getElementById("effectShapeSeg").addEventListener("click", e=>{
-    const btn = e.target.closest("button"); if(!btn) return;
-    effectShape = btn.dataset.v;
-    setPressed("effectShapeSeg", effectShape);
+  document.getElementById("effectShapeSelect").addEventListener("change", e=>{
+    effectShape = e.target.value;
     updateEffectShapeUi();
   });
-  document.getElementById("effectDirSeg").addEventListener("click", e=>{
-    const btn = e.target.closest("button"); if(!btn) return;
-    effectDirection = btn.dataset.v;
-    setPressed("effectDirSeg", effectDirection);
+  document.getElementById("effectDirSelect").addEventListener("change", e=>{
+    effectDirection = e.target.value;
   });
-  document.getElementById("effectPaletteSeg").addEventListener("click", e=>{
-    const btn = e.target.closest("button"); if(!btn) return;
-    setEffectPalette(btn.dataset.v);
+  document.getElementById("effectPaletteSelect").addEventListener("change", e=>{
+    setEffectPalette(e.target.value);
   });
   document.getElementById("effectMovingSeg").addEventListener("click", e=>{
     const btn = e.target.closest("button"); if(!btn) return;
@@ -1698,15 +1734,27 @@ function initEffectControls(){
   renderEffectColors();
 }
 
+// Which shapes actually use each control - lets the dropdown list grow
+// (this started at 6 shapes, now 13) without every new one needing its
+// own special-case scattered through the rest of this file: one set per
+// control category, checked in the one place that greys controls out.
+const DIRECTION_SHAPES = new Set(["wave", "sweep", "wipe", "comet", "meteor", "pulse_ring"]);
+const NO_PALETTE_SHAPES = new Set(["ambient"]); // colour comes from the Panorama's video, not a picked palette
+
 function updateEffectShapeUi(){
-  // Direction only applies to wave and sweep. Other shapes show the same
-  // colour on every LED or use random twinkling, so grey out direction
-  // to make clear it's not being used.
   const dirProp = document.getElementById("effectDirProp");
-  if(!dirProp) return;
-  const usesDirection = effectShape === "wave" || effectShape === "sweep";
-  dirProp.style.opacity = usesDirection ? "1" : "0.4";
-  dirProp.style.pointerEvents = usesDirection ? "auto" : "none";
+  const usesDirection = DIRECTION_SHAPES.has(effectShape);
+  if(dirProp){
+    dirProp.style.opacity = usesDirection ? "1" : "0.4";
+    dirProp.style.pointerEvents = usesDirection ? "auto" : "none";
+  }
+  const usesPalette = !NO_PALETTE_SHAPES.has(effectShape);
+  for(const id of ["effectPaletteProp", "effectColorsProp"]){
+    const el = document.getElementById(id);
+    if(!el) continue;
+    el.style.opacity = usesPalette ? "1" : "0.4";
+    el.style.pointerEvents = usesPalette ? "auto" : "none";
+  }
 }
 
 function setPressed(segId, value){
@@ -1716,7 +1764,7 @@ function setPressed(segId, value){
 
 function setEffectPalette(p){
   effectPalette = p;
-  setPressed("effectPaletteSeg", p);
+  document.getElementById("effectPaletteSelect").value = p;
   if(p === "solid" && effectColors.length !== 1) effectColors = [effectColors[0] || "#4c79ff"];
   else if(p === "two_color" && effectColors.length !== 2)
     effectColors = [effectColors[0] || "#4c79ff", effectColors[1] || "#ff7a30"];
@@ -1867,6 +1915,49 @@ function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, m
     const brightness = Math.max(0, 1 - Math.abs(pos - cometPos) / tailWidth);
     return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
   }
+  if(shape === "wipe"){
+    // Hard on/off edge - mirrors main.py's wipe branch exactly.
+    const [r,g,b] = samplePalette(palette, colors, phase, true);
+    const pos = positionValue(direction, l, bounds);
+    const lit = ((pos - phase) % 1 + 1) % 1 < 0.5;
+    return lit ? [r,g,b] : [0,0,0];
+  }
+  if(shape === "pulse_ring"){
+    // One band wrapping continuously - mirrors main.py's pulse_ring branch exactly.
+    const ringWidth = 0.18;
+    const posPhase = ((phase % 1) + 1) % 1;
+    const [r,g,b] = samplePalette(palette, colors, phase, true);
+    const pos = positionValue(direction, l, bounds);
+    let dist = Math.abs(pos - posPhase);
+    dist = Math.min(dist, 1 - dist);
+    const brightness = Math.max(0, 1 - dist / ringWidth);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+  }
+  if(shape === "meteor"){
+    // Several comets staggered in phase - mirrors main.py's meteor branch exactly.
+    const tailWidth = 0.22, meteorCount = 3;
+    const [r,g,b] = samplePalette(palette, colors, phase, true);
+    const pos = positionValue(direction, l, bounds);
+    let brightness = 0;
+    for(let i=0; i<meteorCount; i++){
+      const meteorPhase = ((phase + i/meteorCount) % 1 + 1) % 1;
+      const meteorPos = meteorPhase < 0.5 ? meteorPhase * 2 : 2 * (1 - meteorPhase);
+      const dist = Math.abs(pos - meteorPos);
+      brightness = Math.max(brightness, 1 - dist / tailWidth);
+    }
+    brightness = Math.max(0, brightness);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+  }
+  if(shape === "ambient"){
+    // Mirrors main.py's ambient branch's blend exactly - the sampled
+    // zones themselves are this preview's own best-effort read of the
+    // same video (see updateAmbientZones's docstring on why that's an
+    // approximation, not a guaranteed exact match).
+    const {top, bottom, left, right} = ambientZones;
+    const v = positionValue("top_to_bottom", l, bounds);
+    const h = positionValue("left_to_right", l, bounds);
+    return [0,1,2].map(c => Math.round((top[c]*(1-v) + bottom[c]*v + left[c]*(1-h) + right[c]*h) / 2));
+  }
   // Default wave behavior
   const pos = positionValue(direction, l, bounds);
   return samplePalette(palette, colors, pos - phase, cyclic);
@@ -1880,6 +1971,45 @@ function effectBounds(leds){
   const rMax = Math.max(...leds.map(l=>Math.hypot(l.x-cx, l.y-cy))) || 1;
   return {xMin, xSpan:(xMax-xMin)||1, yMin, ySpan:(yMax-yMin)||1, cx, cy, rMax};
 }
+
+/* ---------- ambient preview sampling ----------
+   Mirrors app/ambient.py's zones() exactly (top/bottom/left/right
+   averages of a 4x4 downscale), just sampled from the same <video>
+   element drawAdvancedCase already renders for the display unit instead
+   of a separate ffmpeg decode - same source file either way (whatever's
+   currently applied to the panel), so the preview tracks the real
+   ambient effect closely without needing its own video pipeline. Not
+   pixel-identical to the backend's decode (browser video frame timing
+   vs ffmpeg's own, and this canvas resample vs ffmpeg's scale filter),
+   close enough for a live preview of "roughly this colour, roughly
+   this bright" rather than an exact match - the other shapes' preview
+   guarantee (bit-for-bit identical formulas) doesn't apply here since
+   there's no way to feed this canvas the same decode ffmpeg is doing
+   server-side out of band. */
+let ambientZones = {top:[20,20,20], bottom:[20,20,20], left:[20,20,20], right:[20,20,20]};
+const _ambientCanvas = document.createElement("canvas");
+_ambientCanvas.width = 4; _ambientCanvas.height = 4;
+const _ambientCtx = _ambientCanvas.getContext("2d", {willReadFrequently: true});
+
+function updateAmbientZones(){
+  const video = document.querySelector("#advancedCase video");
+  const img = document.querySelector("#advancedCase img[alt]"); // the display unit's own preview <img>, when the applied media is a still image
+  const source = (video && video.readyState >= 2) ? video : (img && img.complete ? img : null);
+  if(!source) return;
+  try{
+    _ambientCtx.drawImage(source, 0, 0, 4, 4);
+    const {data} = _ambientCtx.getImageData(0, 0, 4, 4);
+    const px = (x,y) => { const i = (y*4+x)*4; return [data[i], data[i+1], data[i+2]]; };
+    const avg = pts => [0,1,2].map(c => Math.round(pts.reduce((s,p)=>s+p[c],0)/pts.length));
+    ambientZones = {
+      top: avg([px(0,0),px(1,0),px(2,0),px(3,0)]),
+      bottom: avg([px(0,3),px(1,3),px(2,3),px(3,3)]),
+      left: avg([px(0,0),px(0,1),px(0,2),px(0,3)]),
+      right: avg([px(3,0),px(3,1),px(3,2),px(3,3)]),
+    };
+  }catch(e){ /* cross-origin or not-yet-decoded frame - keep the last good sample */ }
+}
+setInterval(updateAmbientZones, 500);
 
 // Backend equivalent: PositionEffectRequest.led_selection / _run_position_effect's
 // led_selection param. A dict of {unit: [index,...]} (the shape sent over the
@@ -2101,6 +2231,16 @@ async function loadGallery(){
 
 const VIDEO_SUFFIXES = ['.mp4', '.webm', '.mov', '.avi'];
 function isVideoItem(item){ return !!(item.suffix && VIDEO_SUFFIXES.includes(item.suffix.toLowerCase())); }
+
+// last_applied.media (see /api/panorama/status) is a filename, not a
+// gallery id - matched against the cached gallery list to find the item
+// actually playing right now, for the Advanced canvas's live preview
+// (drawAdvancedCase) and the ambient-light effect alike.
+function currentPanoramaMediaItem(){
+  const name = panoStatus && panoStatus.last_applied && panoStatus.last_applied.media;
+  if(!name || !galleryItems) return null;
+  return galleryItems.find(g => g.name === name) || null;
+}
 
 const GALLERY_CARD_SPACING = 165;
 const GALLERY_CARD_VISIBLE = 3; // offsets beyond this are culled from the DOM entirely
