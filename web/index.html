@@ -2348,6 +2348,7 @@ async function doApplyGalleryItem(id){
     try{ localStorage.setItem("shyyctl-gallery-active", id); }catch(e){}
     renderGallery();
     await loadPanorama(); renderPanorama();
+    drawAdvancedCase(); // Advanced canvas's display-unit preview mirrors whatever's applied now
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -2786,7 +2787,12 @@ async function refresh(){
   }catch(e){}
   try{ await loadLayout(); renderSetup(); }catch(e){}
   try{ await loadRamSticks(); renderRamSticks(); }catch(e){}
-  try{ await loadGallery(); renderGallery(); }catch(e){}
+  // renderSetup() above already drew the Advanced canvas, but the display
+  // unit's preview there depends on galleryItems, which loadGallery() has
+  // not populated yet at that point - redraw once it has, so the panel's
+  // media shows up on first load instead of only after leaving/returning
+  // to Setup.
+  try{ await loadGallery(); renderGallery(); drawAdvancedCase(); }catch(e){}
   try{ await loadCurve(); renderCurveList(); renderFans(); }catch(e){}
   pollCurveStatus();
   initEffectControls();
