@@ -1726,8 +1726,13 @@ PALETTES = ("solid", "two_color", "multicolor", "rainbow")
 # "strobe" is rapid flashing between full brightness and off (ignore direction).
 # "pulse" is brightness pulsing while cycling through palette colors.
 # "sweep" is like wave but faster movement (2x speed). "sparkle" is random
-# LED twinkling with a base color (ignore direction).
-SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle")
+# LED twinkling with a base color (ignore direction). "fire" is organic
+# per-LED flicker in both brightness and colour (ignore direction).
+# "confetti" is sparkle with a different palette colour per flash instead
+# of one shared base colour (ignore direction). "comet" is a bright band
+# with a fading tail bouncing between the two ends of `direction`'s axis,
+# instead of wave/sweep's continuous wrap-around travel.
+SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle", "fire", "confetti", "comet")
 
 
 def _resolve_effect_targets():
@@ -1977,6 +1982,76 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 tuple(round(c * get_twinkle_brightness(led["index"])) for c in base_color)
                 for led in unit_leds
             ]
+
+        elif shape == "fire":
+            # Organic flicker, not a clean geometric wave/pulse - each
+            # LED's own brightness is the sum of three sine waves at
+            # incommensurate frequencies (3.1/5.3/7.9 Hz-equivalent, no
+            # common factor so their sum never repeats on a short, visibly
+            # periodic beat) rather than one sine, which is what actually
+            # makes this look irregular instead of just "pulse but
+            # dimmer". Same golden-ratio per-LED offset as sparkle so
+            # neighbouring LEDs don't flicker in lockstep. Colour also
+            # drifts slowly across the palette per LED (not just a shared
+            # base colour flickering in brightness like pulse) for the
+            # "plasma" half of the look on a multi-colour/rainbow palette.
+            def flicker_brightness(led_index):
+                offset = (led_index % 256) * 0.618 % 1.0
+                t = phase[0] + offset
+                n = (math.sin(t * 2 * math.pi * 3.1)
+                     + math.sin(t * 2 * math.pi * 5.3 + 1.7)
+                     + math.sin(t * 2 * math.pi * 7.9 + 4.2)) / 3.0  # -1..1
+                return max(0.0, min(1.0, 0.55 + 0.45 * n))
+
+            colors_out = []
+            for led in unit_leds:
+                brightness = flicker_brightness(led["index"])
+                color_t = (phase[0] * 0.3 + (led["index"] % 256) * 0.618 % 1.0) % 1.0
+                color = _sample_palette(palette, colors, color_t, True)
+                colors_out.append(tuple(round(c * brightness) for c in color))
+
+        elif shape == "confetti":
+            # Sparkle's exact brightness envelope (see its own branch
+            # above), but each flash is a different palette colour instead
+            # of the one shared base colour - the actual visual
+            # difference from sparkle, not a renamed copy of it. The
+            # colour offset uses 0.382 (1 - 0.618, the golden ratio's
+            # other conjugate) rather than sparkle's 0.618, plus its own
+            # slow phase drift, so a given LED's flash colour and flash
+            # timing don't stay locked together cycle after cycle - two
+            # per-LED sequences derived from the same index but not
+            # correlated, still fully deterministic (see sparkle's
+            # docstring on why: the frontend preview replays this exact
+            # formula and has no way to learn a value rolled with
+            # random.random() instead).
+            def confetti_brightness(led_index):
+                offset = (led_index % 256) * 0.618 % 1.0
+                t = (phase[0] + offset) % 1.0
+                triangle = t * 2 if t < 0.5 else 2 * (1 - t)
+                return triangle ** 5
+
+            colors_out = []
+            for led in unit_leds:
+                brightness = confetti_brightness(led["index"])
+                color_t = ((led["index"] % 256) * 0.382 + phase[0] * 0.15) % 1.0
+                color = _sample_palette(palette, colors, color_t, True)
+                colors_out.append(tuple(round(c * brightness) for c in color))
+
+        elif shape == "comet":
+            # A bright band with a fading tail bouncing between the two
+            # ends of direction's axis - the same 0->1->0 ping-pong
+            # triangle breathing/pulse already use for their brightness
+            # envelope, applied to *position* here instead so the bright
+            # point reverses at each end rather than wrapping around
+            # continuously like wave/sweep.
+            comet_pos = phase[0] * 2 if phase[0] < 0.5 else 2 * (1 - phase[0])
+            tail_width = 0.35  # fraction of the axis the fading trail spans
+            color = _sample_palette(palette, colors, phase[0], True)
+            colors_out = []
+            for led in unit_leds:
+                dist = abs(_position_value(direction, led, bounds) - comet_pos)
+                brightness = max(0.0, 1.0 - dist / tail_width)
+                colors_out.append(tuple(round(c * brightness) for c in color))
 
         else:
             # Default wave behavior

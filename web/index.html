@@ -384,6 +384,9 @@
               <button data-v="pulse">Pulse</button>
               <button data-v="sweep">Sweep</button>
               <button data-v="sparkle">Sparkle</button>
+              <button data-v="fire">Fire</button>
+              <button data-v="confetti">Confetti</button>
+              <button data-v="comet">Comet</button>
             </div>
           </div>
 
@@ -1819,6 +1822,41 @@ function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, m
     const triangle = t < 0.5 ? t * 2 : 2 * (1 - t);
     const brightness = Math.pow(triangle, 5);
     return [Math.round(baseColor[0]*brightness), Math.round(baseColor[1]*brightness), Math.round(baseColor[2]*brightness)];
+  }
+  if(shape === "fire"){
+    // Organic flicker - mirrors main.py's flicker_brightness exactly
+    // (three incommensurate sine waves, not one, is what avoids this
+    // looking like a dimmer pulse - see its docstring).
+    const idx = l.index % 256;
+    const offset = (idx * 0.618) % 1;
+    const t = phase + offset;
+    const n = (Math.sin(t*2*Math.PI*3.1) + Math.sin(t*2*Math.PI*5.3+1.7) + Math.sin(t*2*Math.PI*7.9+4.2)) / 3;
+    const brightness = Math.max(0, Math.min(1, 0.55 + 0.45*n));
+    const colorT = (phase*0.3 + (idx*0.618)%1) % 1;
+    const [r,g,b] = samplePalette(palette, colors, colorT, true);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+  }
+  if(shape === "confetti"){
+    // Sparkle's brightness envelope, different palette colour per flash -
+    // mirrors main.py's confetti_brightness/color_t exactly.
+    const idx = l.index % 256;
+    const offset = (idx * 0.618) % 1;
+    const t = (phase + offset) % 1;
+    const triangle = t < 0.5 ? t * 2 : 2 * (1 - t);
+    const brightness = Math.pow(triangle, 5);
+    const colorT = ((idx*0.382) + phase*0.15) % 1;
+    const [r,g,b] = samplePalette(palette, colors, colorT, true);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
+  }
+  if(shape === "comet"){
+    // Bright band with a fading tail, bouncing between the two ends of
+    // direction's axis - mirrors main.py's comet_pos/tail_width exactly.
+    const cometPos = phase < 0.5 ? phase * 2 : 2 * (1 - phase);
+    const tailWidth = 0.35;
+    const [r,g,b] = samplePalette(palette, colors, phase, true);
+    const pos = positionValue(direction, l, bounds);
+    const brightness = Math.max(0, 1 - Math.abs(pos - cometPos) / tailWidth);
+    return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
   }
   // Default wave behavior
   const pos = positionValue(direction, l, bounds);
