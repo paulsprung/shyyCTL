@@ -362,12 +362,26 @@ async def _keepalive_loop():
     can consume this loop's ping reply (or vice versa), leaving the
     request's real reply looking like it never arrived - confirmed as the
     actual cause of /api/panorama/status intermittently coming back with
-    empty device info despite a healthy connection."""
+    empty device info despite a healthy connection.
+
+    Also actively retries get_panorama() itself whenever _panorama is
+    None, not just pinging an already-live one - direct user report: the
+    display sometimes stayed black for "several minutes" after dropping.
+    The previous version only dropped the cached connection here and left
+    reconnecting entirely to whatever HTTP request happened to call
+    get_panorama() next; if the browser tab wasn't sitting on the Display
+    page (or nothing else touched it), that could be arbitrarily far in
+    the future - matching the report exactly. get_panorama() is cheap to
+    call when nothing's plugged in (find_usbprint_path's SetupAPI
+    enumeration, not a blocking retry loop - see app/panorama.py), so
+    retrying it here every 2s is safe even while genuinely disconnected."""
     global _panorama
     while True:
         try:
             panel = _panorama
-            if panel is not None and panel.connected:
+            if panel is None:
+                await get_panorama()
+            elif panel.connected:
                 async with _panorama_lock:
                     await asyncio.to_thread(panel.ping)
         except PanoramaError as exc:
@@ -377,10 +391,9 @@ async def _keepalive_loop():
             # (app/panorama.py) is only a Python-side flag, never a live
             # check, so it would otherwise stay True forever and every
             # future request would keep reusing and re-breaking the same
-            # handle. Dropping it here means the next real request's own
-            # get_panorama() call attempts a fresh reconnect within
-            # ~2s of the failure, instead of only discovering it's dead
-            # when a human-facing request crashes on it.
+            # handle. Dropping it here means this same loop's own next
+            # tick (~2s away) retries get_panorama() itself, on top of
+            # whatever a real request would trigger anyway.
             log.debug("panorama keepalive ping failed, dropping the cached connection: %s", exc)
             _panorama = None
         except Exception as exc:
@@ -442,6 +455,60 @@ def _launch_vendor_openrgb() -> bool:
         log.warning("Could not launch bundled OpenRGB: %s", exc)
         return False
     return True
+
+
+async def _connect_openrgb_with_recovery() -> bool:
+    """Called once from lifespan instead of a bare openrgb.connect() +
+    unconditional _launch_vendor_openrgb() on failure - direct user report:
+    RGB "not detected properly" after restarting shyyctl, matching a real
+    failure mode this didn't previously guard against. OpenRGB.exe is a
+    long-lived process shyyctl doesn't own the lifetime of; if the
+    previous shyyctl run (or a Windows shutdown, or a crash) left it
+    running but its SDK server wedged - not exited, just not answering -
+    the old code's openrgb.connect() would ride out however long
+    OpenRGBClient's internal per-device read timeouts take (see
+    openrgb_bridge.py's module docstring: observed >30s in the wild) and,
+    on failure, launch a *second* OpenRGB.exe that then can't bind the
+    already-held SDK port - compounding the exact symptom being fixed.
+
+    A process that's already running should answer almost immediately if
+    it's healthy, so this bounds that specific attempt far tighter (8s)
+    than a fresh launch's own warm-up budget below - a miss here is
+    treated as "stuck", not "still starting", and the stale process is
+    killed before relaunching the bundled copy fresh. Killing it also
+    unblocks openrgb_bridge's own connect() if that 8s wait timed out
+    while a background thread was still mid-read inside it (asyncio can
+    cancel *this* coroutine's wait, never the underlying blocking call
+    that thread is running) - the socket read that thread is stuck in
+    ends almost immediately once the process backing it is gone, rather
+    than only after its own multi-second read timeout."""
+    running = await asyncio.to_thread(_process_running, "OpenRGB.exe")
+    if running:
+        try:
+            if await asyncio.wait_for(asyncio.to_thread(openrgb.connect), timeout=8):
+                return True
+        except asyncio.TimeoutError:
+            pass
+        log.warning("OpenRGB.exe is running but not answering - killing the stale process and relaunching")
+        await asyncio.to_thread(_kill_process, "OpenRGB.exe")
+    elif await asyncio.to_thread(openrgb.connect):
+        return True
+    else:
+        log.warning("OpenRGB not connected: %s", openrgb.last_error)
+
+    if _launch_vendor_openrgb():
+        # A single fixed short wait wasn't enough against real hardware:
+        # OpenRGB's own device scan (SMBus/PawnIO/RAM enumeration) was
+        # still visibly running in its console output well past 3s, long
+        # before its SDK server was ready to accept connections. Poll for
+        # up to ~20s instead of one fixed-delay retry.
+        for _ in range(10):
+            await asyncio.sleep(2)
+            if await asyncio.to_thread(openrgb.connect):
+                return True
+        log.warning("Still not connected after starting bundled OpenRGB (waited ~20s): %s",
+                   openrgb.last_error)
+    return False
 
 
 def _lhm_reachable(url: str, timeout: float = 1.5) -> bool:
@@ -742,23 +809,31 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _keepalive_task, _curve_task
+    # Direct user report: the display would sometimes stay disconnected
+    # for minutes after a restart, and it "felt like" RGB hanging was to
+    # blame - it was: get_panorama() used to run strictly after the
+    # hub/OpenRGB block below, so a slow OpenRGB (see
+    # _connect_openrgb_with_recovery's docstring) delayed even *attempting*
+    # the display connection by however long that took, despite the two
+    # having nothing to do with each other. Starting it as its own task
+    # here lets it connect while hub/OpenRGB are still working, instead of
+    # queued behind them.
+    panorama_task = asyncio.create_task(get_panorama())
+
     if not await asyncio.to_thread(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
-    if not await asyncio.to_thread(openrgb.connect):
-        log.warning("OpenRGB not connected: %s", openrgb.last_error)
-        if _launch_vendor_openrgb():
-            # A single fixed short wait wasn't enough against real hardware:
-            # OpenRGB's own device scan (SMBus/PawnIO/RAM enumeration) was
-            # still visibly running in its console output well past 3s,
-            # long before its SDK server was ready to accept connections.
-            # Poll for up to ~20s instead of one fixed-delay retry.
-            for _ in range(10):
-                await asyncio.sleep(2)
-                if await asyncio.to_thread(openrgb.connect):
-                    break
-            else:
-                log.warning("Still not connected after starting bundled OpenRGB (waited ~20s): %s",
-                           openrgb.last_error)
+
+    try:
+        # Overall budget on top of _connect_openrgb_with_recovery's own
+        # internal waits (8s zombie check + ~20s relaunch poll = ~28s
+        # already) - a final backstop so a worse-than-expected case (e.g.
+        # the kill not releasing openrgb_bridge's lock as quickly as
+        # usual) still can't hold up the rest of startup indefinitely.
+        if not await asyncio.wait_for(_connect_openrgb_with_recovery(), timeout=45):
+            log.warning("OpenRGB still not connected after recovery attempts: %s", openrgb.last_error)
+    except asyncio.TimeoutError:
+        log.warning("OpenRGB connection attempt exceeded the 45s startup budget - "
+                   "continuing without it for this launch")
 
     # Same auto-launch idea as OpenRGB above, for SensorHelper.exe (CPU/
     # motherboard/RAM temperature - see app/sensors.py and
@@ -772,7 +847,10 @@ async def lifespan(app: FastAPI):
     if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
         _launch_vendor_sensor_helper()
 
-    await get_panorama()
+    try:
+        await panorama_task
+    except Exception as exc:
+        log.warning("panorama connect task failed: %s", exc)
     _keepalive_task = asyncio.create_task(_keepalive_loop())
     _curve_task = asyncio.create_task(_curve_loop())
 
@@ -1333,8 +1411,8 @@ async def _curve_loop():
 
 # -- RGB: motherboard / RAM / hub -------------------------------------------
 
-def _open_hub_raw() -> OpenRgbRaw:
-    return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
+def _open_hub_raw(timeout: float = 5.0) -> OpenRgbRaw:
+    return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"], timeout=timeout)
 
 
 def _hub_via_raw() -> dict | None:
@@ -1921,13 +1999,25 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         openrgb.select_mode(mobo_target[1], "direct")
 
     try:
-        with _open_hub_raw() as raw:
+        # A short timeout here (vs. _open_hub_raw's normal 5s default,
+        # fine for a one-off admin request) - direct user report: effects
+        # sometimes "feel like they hang" after an unrelated RGB hiccup,
+        # e.g. OpenRGB restarting mid-effect. This connection is held for
+        # the whole effect (see docstring above), so if it goes bad every
+        # frame's write would otherwise ride out the full 5s before even
+        # counting as a failure - at the intended ~80ms cadence that's
+        # every other visible thing (RAM/mobo write after this one in the
+        # same frame) stalling behind it too, on a loop with no upper
+        # bound on how many frames this repeats for.
+        with _open_hub_raw(timeout=2.0) as raw:
             ctrl = raw.find_controller("NZXT") if fan_units else None
             if fan_units and ctrl is None:
                 log.warning("effect: no hub RGB device found, fan channels won't animate")
             elif ctrl is not None:
                 raw.select_mode(ctrl, "direct")
             start = time.monotonic()
+            hub_failures = 0
+            bridge_failures = 0
             while not _effect_stop.is_set():
                 if moving:
                     phase[0] = ((time.monotonic() - start) / period_s) % 1.0
@@ -1942,6 +2032,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             if len(unit_leds) != zone.leds_count:
                                 continue
                             raw.set_zone_colors(ctrl.index, zone.index, frame)
+                            hub_failures = 0
                         except Exception as exc:
                             # A single bad write here (e.g. a transient
                             # socket hiccup talking to OpenRGB) used to
@@ -1956,21 +2047,70 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             # unrelated USB hiccup elsewhere on the same
                             # machine.
                             log.debug("effect: hub write failed for %s: %s", u["id"], exc)
+                            hub_failures += 1
+                    if hub_failures >= 3:
+                        # A handful of failures in a row (not just one -
+                        # see above) means this specific long-lived
+                        # connection is genuinely dead, most likely
+                        # OpenRGB itself was restarted mid-effect - every
+                        # future frame would otherwise keep retrying the
+                        # identical broken socket forever, since nothing
+                        # else ever reopens it. One reconnect attempt;
+                        # failing that, just try again after another 3.
+                        try:
+                            raw.close()
+                            raw.connect()
+                            ctrl = raw.find_controller("NZXT")
+                            if ctrl is not None:
+                                raw.select_mode(ctrl, "direct")
+                            log.info("effect: reconnected to the hub after repeated write failures")
+                        except Exception as exc:
+                            log.debug("effect: hub reconnect failed: %s", exc)
+                        hub_failures = 0
 
                 for u, device in ram_targets:
                     _, frame = frame_colors(u)
                     try:
                         openrgb.set_zone_colors_by_index(device, 0, frame)
+                        bridge_failures = 0
                     except Exception as exc:
                         log.debug("effect: RAM write failed for %s: %s", u["id"], exc)
+                        bridge_failures += 1
 
                 if mobo_target is not None:
                     u, device, zone_index = mobo_target
                     _, frame = frame_colors(u)
                     try:
                         openrgb.set_zone_colors_by_index(device, zone_index, frame)
+                        bridge_failures = 0
                     except Exception as exc:
                         log.debug("effect: motherboard write failed: %s", exc)
+                        bridge_failures += 1
+
+                if bridge_failures >= 3 and (ram_targets or mobo_target is not None):
+                    # Same reasoning as the hub reconnect above, for
+                    # OpenRGB's own SDK connection (RAM/mobo) - device
+                    # references resolved once at effect start (see
+                    # _resolve_effect_targets' docstring on why not
+                    # per-frame) go stale the same way if OpenRGB itself
+                    # restarts mid-effect, and set_zone_colors_by_index
+                    # has no retry/reconnect of its own (openrgb_bridge.py
+                    # - it's a hot per-frame write path by design).
+                    # openrgb.reconnect() drops and recreates the whole
+                    # SDK client; re-resolving targets after gets fresh
+                    # device objects rather than continuing to write
+                    # through the old (now-replaced) ones.
+                    try:
+                        openrgb.reconnect()
+                        _, _, ram_targets, mobo_target = _resolve_effect_targets()
+                        for _, device in ram_targets:
+                            openrgb.select_mode(device, "direct")
+                        if mobo_target is not None:
+                            openrgb.select_mode(mobo_target[1], "direct")
+                        log.info("effect: reconnected to OpenRGB after repeated RAM/mobo write failures")
+                    except Exception as exc:
+                        log.debug("effect: OpenRGB reconnect failed: %s", exc)
+                    bridge_failures = 0
 
                 _effect_stop.wait(0.08 if moving else 1.0)
     except Exception as exc:
