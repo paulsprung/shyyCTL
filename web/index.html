@@ -179,6 +179,44 @@
   .effect-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
   .effect-grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
   @media (max-width:640px){.effect-grid-3{grid-template-columns:1fr}}
+
+  /* Custom chevron replaces each browser's own (inconsistent) arrow, and
+     the focus/hover treatment matches the rest of the app's fields instead
+     of the browser-default select outline. */
+  .select-wrap{position:relative}
+  .select-wrap select{width:100%;appearance:none;-webkit-appearance:none;-moz-appearance:none;
+    padding-right:32px;cursor:pointer;transition:border-color .15s}
+  .select-wrap::after{content:"";position:absolute;right:13px;top:50%;width:7px;height:7px;
+    border-right:2px solid var(--ink-soft);border-bottom:2px solid var(--ink-soft);
+    transform:translateY(-65%) rotate(45deg);pointer-events:none}
+  .select-wrap select:hover{border-color:var(--ink-soft)}
+  .select-wrap select:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
+
+  /* A fixed glyph badge next to the Direction select - the six option
+     names (Top/Bottom, Out/In...) read slower than one glance at an
+     arrow, and it doubles as a live preview of what's picked. */
+  .dir-icon{width:38px;height:38px;flex:none;display:flex;align-items:center;justify-content:center;
+    background:var(--panel-2);border:1px solid var(--rule);border-radius:7px;
+    color:var(--accent);font-family:var(--mono);font-weight:700}
+
+  /* Native <input type=color> renders its actual fill inset inside a
+     padded border in most browsers, so at the old 44x32 size almost none
+     of the chosen colour was visible - this styles the swatch itself
+     borderless so the whole box is the colour, sized up, plus the hex
+     value printed underneath so the colour is legible even before
+     picking a bigger monitor to look at it on. */
+  .color-swatch{display:flex;flex-direction:column;align-items:center;gap:4px;position:relative}
+  .color-swatch input[type=color]{width:56px;height:44px;padding:0;border:1px solid var(--rule);
+    border-radius:9px;background:none;cursor:pointer}
+  .color-swatch input[type=color]::-webkit-color-swatch-wrapper{padding:0}
+  .color-swatch input[type=color]::-webkit-color-swatch{border:none;border-radius:8px}
+  .color-swatch input[type=color]::-moz-color-swatch{border:none;border-radius:8px}
+  .color-swatch .hex{font-family:var(--mono);font-size:10px;color:var(--ink-soft);
+    text-transform:uppercase}
+  .color-swatch .color-remove{position:absolute;top:-6px;right:-6px;width:18px;height:18px;padding:0;
+    border-radius:50%;background:var(--panel-2);box-shadow:inset 0 0 0 1px var(--rule);color:var(--ink-soft);
+    font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center}
+  .color-swatch .color-remove:hover{color:var(--warn);box-shadow:inset 0 0 0 1px var(--warn)}
   .preset-chip{display:inline-flex;align-items:center;gap:7px;padding:6px 8px 6px 12px;border-radius:20px;
     background:var(--panel-2);border:1px solid var(--rule);font-size:11.5px;cursor:pointer;color:var(--ink)}
   .preset-chip:hover{border-color:var(--accent)}
@@ -379,7 +417,7 @@
 
           <div class="effect-grid-3" style="margin-bottom:16px">
             <div class="prop"><label>Shape</label>
-              <select id="effectShapeSelect">
+              <div class="select-wrap"><select id="effectShapeSelect">
                 <optgroup label="Wave">
                   <option value="wave">Wave</option>
                   <option value="sweep">Sweep</option>
@@ -405,30 +443,33 @@
                 <optgroup label="Reactive">
                   <option value="ambient">Ambient (Panorama)</option>
                 </optgroup>
-              </select>
+              </select></div>
             </div>
             <div class="prop" id="effectDirProp"><label>Direction</label>
-              <select id="effectDirSelect">
-                <option value="top_to_bottom">Top&darr;Bottom</option>
-                <option value="bottom_to_top">Bottom&uarr;Top</option>
-                <option value="left_to_right">Left&rarr;Right</option>
-                <option value="right_to_left">Right&larr;Left</option>
-                <option value="outward">In&rarr;Out</option>
-                <option value="inward">Out&rarr;In</option>
-              </select>
+              <div class="row" style="gap:8px;flex-wrap:nowrap">
+                <span class="dir-icon" id="effectDirIcon">&darr;</span>
+                <div class="select-wrap" style="flex:1"><select id="effectDirSelect">
+                  <option value="top_to_bottom">Top&darr;Bottom</option>
+                  <option value="bottom_to_top">Bottom&uarr;Top</option>
+                  <option value="left_to_right">Left&rarr;Right</option>
+                  <option value="right_to_left">Right&larr;Left</option>
+                  <option value="outward">In&rarr;Out</option>
+                  <option value="inward">Out&rarr;In</option>
+                </select></div>
+              </div>
             </div>
             <div class="prop" id="effectPaletteProp"><label>Palette</label>
-              <select id="effectPaletteSelect">
+              <div class="select-wrap"><select id="effectPaletteSelect">
                 <option value="solid">Solid</option>
                 <option value="two_color">Two-colour</option>
                 <option value="multicolor">Multicolour</option>
                 <option value="rainbow">Rainbow</option>
-              </select>
+              </select></div>
             </div>
           </div>
 
           <div class="prop" id="effectColorsProp"><label>Colours</label>
-            <div class="row" id="effectColorsRow" style="flex-wrap:wrap"></div>
+            <div class="row" id="effectColorsRow" style="flex-wrap:wrap;gap:14px"></div>
           </div>
 
           <div class="effect-grid" style="align-items:end;margin-bottom:0">
@@ -1674,6 +1715,7 @@ function loadEffectPreset(id){
   effectMoving = p.moving;
   effectShape = p.shape || "wave";
   document.getElementById("effectDirSelect").value = effectDirection;
+  updateDirIcon();
   document.getElementById("effectPaletteSelect").value = effectPalette;
   setPressed("effectMovingSeg", effectMoving ? "moving" : "static");
   document.getElementById("effectShapeSelect").value = effectShape;
@@ -1721,6 +1763,7 @@ function initEffectControls(){
   });
   document.getElementById("effectDirSelect").addEventListener("change", e=>{
     effectDirection = e.target.value;
+    updateDirIcon();
   });
   document.getElementById("effectPaletteSelect").addEventListener("change", e=>{
     setEffectPalette(e.target.value);
@@ -1731,7 +1774,24 @@ function initEffectControls(){
     setPressed("effectMovingSeg", btn.dataset.v);
   });
   updateEffectShapeUi();
+  updateDirIcon();
   renderEffectColors();
+}
+
+// The six direction names read slower than one glance at an arrow -
+// outward/inward (used by pulse_ring) aren't a single axis so they get a
+// word instead of forcing a diagonal glyph to stand in for "radiating".
+const DIR_ICONS = {
+  top_to_bottom: "↓", bottom_to_top: "↑",
+  left_to_right: "→", right_to_left: "←",
+  outward: "OUT", inward: "IN",
+};
+const DIR_ICON_WORDS = new Set(["outward", "inward"]);
+function updateDirIcon(){
+  const el = document.getElementById("effectDirIcon");
+  if(!el) return;
+  el.textContent = DIR_ICONS[effectDirection] || "↓";
+  el.style.fontSize = DIR_ICON_WORDS.has(effectDirection) ? "10.5px" : "18px";
 }
 
 // Which shapes actually use each control - lets the dropdown list grow
@@ -1780,16 +1840,21 @@ function renderEffectColors(){
     return;
   }
   box.innerHTML = effectColors.map((hex,i)=>`
-    <span class="row" style="gap:4px">
-      <input type="color" value="${hex}" onchange="setEffectColor(${i}, this.value)">
+    <span class="color-swatch">
+      <input type="color" value="${hex}" oninput="setEffectColor(${i}, this.value)">
+      <span class="hex" id="effectColorHex-${i}">${hex}</span>
       ${effectPalette==="multicolor" && effectColors.length>2
-        ? `<button class="btn sec sm" onclick="removeEffectColor(${i})">&times;</button>` : ""}
+        ? `<button class="color-remove" onclick="removeEffectColor(${i})" title="Remove">&times;</button>` : ""}
     </span>`).join("")
     + (effectPalette==="multicolor" && effectColors.length<6
       ? `<button class="btn sec sm" onclick="addEffectColor()">+ colour</button>` : "");
 }
 
-function setEffectColor(i, hex){ effectColors[i] = hex; }
+function setEffectColor(i, hex){
+  effectColors[i] = hex;
+  const label = document.getElementById(`effectColorHex-${i}`);
+  if(label) label.textContent = hex;
+}
 function addEffectColor(){ effectColors.push("#ffffff"); renderEffectColors(); }
 function removeEffectColor(i){ effectColors.splice(i,1); renderEffectColors(); }
 
