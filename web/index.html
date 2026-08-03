@@ -570,6 +570,17 @@
             <button class="btn sec sm" onclick="reconnectAll()">Reconnect all</button>
           </div>
         </section>
+        <section id="updatesSection">
+          <div class="section-head"><h2>Updates</h2><div class="rule"></div>
+            <span class="note" id="updateVersionNote"></span></div>
+          <div class="card">
+            <div class="row">
+              <button class="btn sec sm" id="updateCheckBtn" onclick="checkForUpdate()">Check for updates</button>
+              <button class="btn sm" id="updateApplyBtn" style="display:none" onclick="applyUpdate()">Update now</button>
+            </div>
+            <div class="note" id="updateStatusNote" style="margin-top:8px"></div>
+          </div>
+        </section>
         <section>
           <div class="section-head"><h2>Appearance</h2><div class="rule"></div></div>
           <div class="card">
@@ -754,6 +765,9 @@ function showSettingsTab(name){
   if(name === "scan") renderScan();
   if(name === "placement") renderSetup();
   if(name === "advanced"){ renderHubSizes(); loadRgbDump(); }
+  // One check per session the first time General is opened - not a
+  // recurring background poller, see checkForUpdate's own docstring.
+  if(name === "general" && !checkForUpdate._done) checkForUpdate();
   if(location.hash.startsWith("#/settings")) location.hash = "#/settings/"+name;
 }
 
@@ -3019,6 +3033,55 @@ async function exportLog(){
     URL.revokeObjectURL(url);
     say("Debug log exported.");
   }catch(e){ say(e.message,"error"); }
+}
+
+// Only ever runs from a human opening Settings > General or clicking
+// "Check for updates" - never a background timer, so this never phones
+// home without the user having the Settings page open right now.
+let _lastUpdateCheck = null;
+async function checkForUpdate(){
+  checkForUpdate._done = true;
+  const versionNote = document.getElementById("updateVersionNote");
+  const statusNote = document.getElementById("updateStatusNote");
+  const applyBtn = document.getElementById("updateApplyBtn");
+  const checkBtn = document.getElementById("updateCheckBtn");
+  checkBtn.disabled = true;
+  statusNote.textContent = "Checking…";
+  applyBtn.style.display = "none";
+  try{
+    const r = await api("/api/system/update-check");
+    _lastUpdateCheck = r;
+    versionNote.textContent = `v${r.current}`;
+    if(r.available){
+      statusNote.textContent = `Update available: v${r.latest}`;
+      if(r.download_url){ applyBtn.style.display = ""; applyBtn.textContent = `Update to v${r.latest}`; }
+      else statusNote.textContent += " - no installer attached to that release, download it manually.";
+    } else {
+      statusNote.textContent = "Up to date.";
+    }
+  }catch(e){
+    statusNote.textContent = e.message;
+  }finally{
+    checkBtn.disabled = false;
+  }
+}
+
+async function applyUpdate(){
+  if(!_lastUpdateCheck || !_lastUpdateCheck.download_url) return;
+  if(!confirm(`Download and install v${_lastUpdateCheck.latest} now? shyyctl will restart itself - `
+    + `nothing you've configured (fan curves, RGB layout, effects, gallery) is touched, only the app's own files.`)) return;
+  const applyBtn = document.getElementById("updateApplyBtn");
+  const statusNote = document.getElementById("updateStatusNote");
+  applyBtn.disabled = true;
+  statusNote.textContent = "Downloading update…";
+  try{
+    await api("/api/system/update-apply", {method:"POST",
+      body: JSON.stringify({download_url: _lastUpdateCheck.download_url})});
+    statusNote.textContent = "Installing - shyyctl will restart itself in a few seconds.";
+  }catch(e){
+    statusNote.textContent = e.message;
+    applyBtn.disabled = false;
+  }
 }
 
 function renderServicesStatus(s){

@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -100,6 +101,15 @@ GALLERY_MANIFEST = GALLERY_DIR / "manifest.json"
 
 LOG_FILE = ROOT / "shyyctl.log"
 LOG_FILE_OLD = ROOT / "shyyctl.log.old"
+
+# Bumped by hand alongside each release tag (see .github/workflows/release.yml,
+# which takes the version from the tag/workflow_dispatch input, not from
+# here - this is just this running process's own idea of its version, for
+# the Settings > Updates check below to compare against GitHub's latest
+# release tag). Nothing here ever calls out on its own; it only runs when
+# a human clicks "Check for updates".
+APP_VERSION = "1.0.6"
+UPDATE_REPO = "paulsprung/shyyctl"
 
 _log_handlers: list = []
 if getattr(sys, "frozen", False):
@@ -1290,6 +1300,82 @@ async def export_log():
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=shyyctl-logs.zip"})
+
+
+def _version_tuple(v: str) -> tuple:
+    """"1.0.10" -> (1, 0, 10) so a >= comparison works numerically instead
+    of comparing "10" < "9" as strings. Any non-numeric component (a
+    "-dev"/"-rc1" suffix, say) contributes 0 rather than raising, since
+    this only ever needs to answer "is the release newer", not fully
+    parse arbitrary version strings."""
+    parts = []
+    for p in v.split("."):
+        m = re.match(r"\d+", p)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts)
+
+
+@app.get("/api/system/update-check")
+async def check_for_update():
+    """Compares APP_VERSION against the shyyctl repo's latest GitHub
+    release - only ever runs when a human opens Settings or clicks
+    "Check for updates" (see Settings > Updates in the web UI), never on
+    a background timer. Unauthenticated GitHub API call, same as any
+    browser hitting this repo's public releases page would make."""
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "shyyctl-update-check",
+        "Accept": "application/vnd.github+json",
+    })
+    try:
+        data = await asyncio.to_thread(lambda: json.loads(urllib.request.urlopen(req, timeout=6).read()))
+    except Exception as exc:
+        raise HTTPException(503, f"could not reach GitHub: {exc}")
+    latest_tag = data.get("tag_name", "") or ""
+    latest = latest_tag[1:] if latest_tag.startswith("v") else latest_tag
+    asset = next((a for a in data.get("assets", []) if a.get("name", "").endswith(".exe")), None)
+    return {
+        "current": APP_VERSION,
+        "latest": latest,
+        "available": bool(latest) and _version_tuple(latest) > _version_tuple(APP_VERSION),
+        "notes_url": data.get("html_url"),
+        "download_url": asset["browser_download_url"] if asset else None,
+        "asset_name": asset["name"] if asset else None,
+    }
+
+
+class UpdateApplyRequest(BaseModel):
+    download_url: str
+
+
+@app.post("/api/system/update-apply")
+async def apply_update(body: UpdateApplyRequest):
+    """Downloads the installer .exe an update-check response pointed at
+    and launches it silently (NSIS's own /S flag). installer.nsi's
+    Section already kills this exact running process and copies fresh
+    files over it (see that script's own docstring on why), then
+    relaunches shyyctl.exe itself when done - this endpoint's job ends
+    the moment that installer process starts, same as a human
+    double-clicking the downloaded installer themselves would, just
+    without the extra manual download/uninstall-first dance that was
+    silently wiping curve.json/layout.json/rgb_state.json/the media
+    gallery whenever someone uninstalled the old version first instead
+    of just running the new installer over it.
+
+    Only meaningful for the installed exe - a `python main.py` dev run
+    has no installer.exe concept for this to drive."""
+    if not getattr(sys, "frozen", False):
+        raise HTTPException(400, "updating only works for the installed app, not a dev run")
+    tmp_path = Path(tempfile.gettempdir()) / "shyyctl-update-setup.exe"
+    try:
+        await asyncio.to_thread(urllib.request.urlretrieve, body.download_url, tmp_path)
+    except Exception as exc:
+        raise HTTPException(502, f"download failed: {exc}")
+    try:
+        subprocess.Popen([str(tmp_path), "/S"], creationflags=NO_WINDOW)
+    except Exception as exc:
+        raise HTTPException(500, f"could not launch installer: {exc}")
+    return {"ok": True}
 
 
 # -- fans -----------------------------------------------------------------
