@@ -400,7 +400,10 @@
             <div class="canvas adv-canvas"><svg id="advancedCase" viewBox="0 0 900 600"
               style="width:100%;display:block;touch-action:none"
               onpointerdown="advPointerDown(event)" onpointermove="advPointerMove(event)"
-              onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)"></svg></div>
+              onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)">
+              <g id="advLedLayer"></g>
+              <g id="advDisplayLayer"></g>
+            </svg></div>
           </div>
           <div id="advancedLedProps"><div class="note">Click or drag to select LEDs.</div></div>
         </div>
@@ -765,6 +768,15 @@ function showPage(name, sub){
     if(p===name) tab.setAttribute("aria-current","page"); else tab.removeAttribute("aria-current");
   });
   document.getElementById("pageTitle").textContent = PAGE_TITLES[name] || name;
+  // The display unit's preview <video> autoplays/loops as long as it
+  // exists in the DOM, which is always (just hidden via CSS on other
+  // pages) - left running it'd decode video in the background forever,
+  // so pause it off Advanced and resume it on return.
+  const advVideo = document.querySelector("#advDisplayLayer video");
+  if(advVideo){
+    if(name === "advanced"){ if(advVideo.paused) advVideo.play().catch(()=>{}); }
+    else if(!advVideo.paused) advVideo.pause();
+  }
   if(name === "settings") showSettingsTab(sub || showSettingsTab._last || "general");
   const hash = "#/"+name+(name==="settings" ? "/"+(sub || showSettingsTab._last || "general") : "");
   if(location.hash !== hash) location.hash = hash;
@@ -1399,9 +1411,11 @@ function ledColorArray(u, info){
 
 function drawAdvancedCase(){
   const svg = document.getElementById("advancedCase");
-  if(!svg) return;
+  const ledLayer = document.getElementById("advLedLayer");
+  if(!svg || !ledLayer) return;
+  syncAdvancedDisplayPreview();
   if(!layoutData || !layoutData.units.length){
-    svg.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
+    ledLayer.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
       fill="var(--ink-soft)">No units yet - place them in Settings &gt; Placement first.</text>`;
     return;
   }
@@ -1409,33 +1423,7 @@ function drawAdvancedCase(){
     height="${CANVAS_H-(CANVAS_PAD-16)*2}" fill="none"
     stroke="var(--ink-soft)" stroke-width="1.2" opacity=".4" rx="3"/>`;
   for(const u of layoutData.units){
-    if(u.kind === "display"){
-      // No LEDs to drive here, but a monitor unit with nothing shown
-      // where it's actually placed was invisible on this canvas
-      // entirely - direct user request: see the panel's own current
-      // media (video included) right where its unit sits, both as a
-      // reference for building position effects around it and as the
-      // preview surface the ambient-light effect samples colour from.
-      const x = svgX(u.x), y = svgY(u.y);
-      const w = 132, h = 84;
-      const item = currentPanoramaMediaItem();
-      out += `<text x="${x-w/2}" y="${y-h/2-10}"
-        font-family="monospace" font-size="10" fill="var(--ink-soft)">${u.name}</text>
-        <foreignObject x="${x-w/2}" y="${y-h/2}" width="${w}" height="${h}">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;background:#000;
-            border:2px solid var(--ink-soft);border-radius:5px;overflow:hidden;display:flex;
-            align-items:center;justify-content:center">
-            ${item
-              ? (isVideoItem(item)
-                  ? `<video src="/api/panorama/gallery/${item.id}/original" autoplay muted loop playsinline
-                      style="width:100%;height:100%;object-fit:cover"></video>`
-                  : `<img src="/api/panorama/gallery/${item.id}/original" alt="${item.name}"
-                      style="width:100%;height:100%;object-fit:cover">`)
-              : `<span style="color:#5a5f66;font:10px monospace">no signal</span>`}
-          </div>
-        </foreignObject>`;
-      continue;
-    }
+    if(u.kind === "display") continue; // handled by syncAdvancedDisplayPreview, not rebuilt every redraw
     const leds = layoutData.leds.filter(l=>l.unit===u.id).sort((a,b)=>a.index-b.index);
     if(!leds.length) continue;
     const info = ledEndpointInfo(u);
@@ -1454,7 +1442,48 @@ function drawAdvancedCase(){
         data-x="${x}" data-y="${y}" data-selectable="${info?1:0}"/>`;
     });
   }
-  svg.innerHTML = out;
+  ledLayer.innerHTML = out;
+}
+
+// The display unit's own foreignObject (<video>/<img>) used to be rebuilt
+// inline as part of the string drawAdvancedCase() reassigns to the whole
+// canvas's innerHTML every redraw - fine for LED dots (cheap to recreate),
+// but drawAdvancedCase() runs on every single pointermove while dragging a
+// LED selection, and reassigning innerHTML always tears down and recreates
+// any <video> inside it even when the markup string is byte-identical, so
+// the preview was silently restarting from frame 0 dozens of times a
+// second during a drag. Kept in its own layer, touched only when the
+// applied media actually changes.
+let advDisplayLastKey = undefined;
+function syncAdvancedDisplayPreview(){
+  const layer = document.getElementById("advDisplayLayer");
+  if(!layer || !layoutData) return;
+  const unit = layoutData.units.find(u => u.kind === "display");
+  if(!unit){
+    if(advDisplayLastKey !== null){ layer.innerHTML = ""; advDisplayLastKey = null; }
+    return;
+  }
+  const item = currentPanoramaMediaItem();
+  const key = `${unit.x},${unit.y},${item ? item.id : ""}`;
+  if(key === advDisplayLastKey) return;
+  advDisplayLastKey = key;
+  const x = svgX(unit.x), y = svgY(unit.y);
+  const w = 132, h = 84;
+  layer.innerHTML = `<text x="${x-w/2}" y="${y-h/2-10}"
+    font-family="monospace" font-size="10" fill="var(--ink-soft)">${unit.name}</text>
+    <foreignObject x="${x-w/2}" y="${y-h/2}" width="${w}" height="${h}">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;background:#000;
+        border:2px solid var(--ink-soft);border-radius:5px;overflow:hidden;display:flex;
+        align-items:center;justify-content:center">
+        ${item
+          ? (isVideoItem(item)
+              ? `<video src="/api/panorama/gallery/${item.id}/original" autoplay muted loop playsinline
+                  style="width:100%;height:100%;object-fit:cover"></video>`
+              : `<img src="/api/panorama/gallery/${item.id}/original" alt="${item.name}"
+                  style="width:100%;height:100%;object-fit:cover">`)
+          : `<span style="color:#5a5f66;font:10px monospace">no signal</span>`}
+      </div>
+    </foreignObject>`;
 }
 
 /* ---------- Advanced canvas: click / click-drag LED selection ----------
@@ -2057,6 +2086,11 @@ _ambientCanvas.width = 4; _ambientCanvas.height = 4;
 const _ambientCtx = _ambientCanvas.getContext("2d", {willReadFrequently: true});
 
 function updateAmbientZones(){
+  // The video only ever exists on the Advanced page (and is paused
+  // elsewhere - see showPage), but the canvas resample itself is wasted
+  // work on every other page too, so skip it there rather than running a
+  // getImageData every 500ms forever regardless of what's on screen.
+  if(!document.getElementById("page-advanced").classList.contains("active")) return;
   const video = document.querySelector("#advancedCase video");
   const img = document.querySelector("#advancedCase img[alt]"); // the display unit's own preview <img>, when the applied media is a still image
   const source = (video && video.readyState >= 2) ? video : (img && img.complete ? img : null);

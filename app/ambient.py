@@ -79,23 +79,30 @@ class AmbientSampler:
                "-vf", f"scale={GRID_W}:{GRID_H}", "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-r", str(SAMPLE_FPS), "-"]
         try:
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                          creationflags=NO_WINDOW)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     creationflags=NO_WINDOW)
         except FileNotFoundError:
             log.warning("ambient: ffmpeg not found (checked vendor/ffmpeg.exe and PATH)")
             return
         except Exception as exc:
             log.warning("ambient: could not start ffmpeg for %s: %s", path, exc)
             return
+        # self._proc is only for stop()'s external kill of "whatever's
+        # current" - this thread's own read loop and cleanup use the local
+        # `proc` throughout, so a fast media switch (stop() starting a new
+        # thread and thus a new self._proc while this thread is still
+        # unwinding) can't make this thread's finally-block kill the *new*
+        # process instead of its own already-dead one.
+        self._proc = proc
         try:
             while not self._stop.is_set():
-                data = self._proc.stdout.read(FRAME_BYTES)
+                data = proc.stdout.read(FRAME_BYTES)
                 if not data or len(data) < FRAME_BYTES:
                     break  # video ended without -stream_loop looping (or the process died) - stop quietly
                 self._update_zones_from_frame(data)
         finally:
             try:
-                self._proc.kill()
+                proc.kill()
             except Exception:
                 pass
 
