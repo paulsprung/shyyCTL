@@ -37,7 +37,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -111,6 +111,7 @@ LOG_FILE_OLD = ROOT / "shyyctl.log.old"
 APP_VERSION = "1.0.6"
 UPDATE_REPO = "paulsprung/shyyctl"
 
+_log_file = None  # only ever opened below (frozen build) - export_log() flushes it before reading
 _log_handlers: list = []
 if getattr(sys, "frozen", False):
     # The frozen exe is built with console=False (see
@@ -1309,19 +1310,40 @@ async def export_log():
     memory after the fact. Only ever written when running as the
     installed exe (see the frozen-only sys.stdout/stderr redirect this
     module starts with) - a dev `python main.py` run has nothing here,
-    reported as 404 rather than an empty/missing file download."""
+    reported as 404 rather than an empty/missing file download.
+
+    Reads the file's bytes directly (LOG_FILE.read_bytes()) rather than
+    handing FileResponse the path to open a second handle itself - this
+    file is also _log_file, held open for append for the app's entire
+    lifetime as sys.stdout/sys.stderr, so it's still being written to
+    while this request is in flight. flush() first so a line just
+    written (e.g. logging this very request) isn't missing from what
+    gets exported, and any read failure is caught and reported with
+    real detail instead of surfacing as an opaque 500 the frontend can't
+    show a useful message for - the whole point of this endpoint is
+    giving a human something to send when something else already went
+    wrong; failing silently here defeats that."""
     if not LOG_FILE.is_file():
         raise HTTPException(404, "no log file yet - only written when running as the installed app")
-    if not LOG_FILE_OLD.is_file():
-        return FileResponse(LOG_FILE, media_type="text/plain", filename="shyyctl.log")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(LOG_FILE, "shyyctl.log")
-        zf.write(LOG_FILE_OLD, "shyyctl.log.old")
-    buf.seek(0)
-    return StreamingResponse(
-        buf, media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=shyyctl-logs.zip"})
+    try:
+        if _log_file is not None:
+            _log_file.flush()
+        log_bytes = LOG_FILE.read_bytes()
+        if not LOG_FILE_OLD.is_file():
+            return Response(
+                log_bytes, media_type="text/plain",
+                headers={"Content-Disposition": 'attachment; filename="shyyctl.log"'})
+        old_bytes = LOG_FILE_OLD.read_bytes()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("shyyctl.log", log_bytes)
+            zf.writestr("shyyctl.log.old", old_bytes)
+        return Response(
+            buf.getvalue(), media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="shyyctl-logs.zip"'})
+    except OSError as exc:
+        log.warning("export_log: could not read log file(s): %s", exc)
+        raise HTTPException(500, f"could not read the log file: {exc}")
 
 
 def _version_tuple(v: str) -> tuple:
