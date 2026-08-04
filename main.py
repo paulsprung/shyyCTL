@@ -196,7 +196,8 @@ def _load_panorama_state() -> dict:
 
 
 def _save_panorama_state(media: str | None, brightness: int | None,
-                          poweron_media: str | None = None, standby_media: str | None = None):
+                          poweron_media: str | None = None, standby_media: str | None = None,
+                          gallery_id: str | None = "__unset__"):
     """Persists what shyyctl itself last applied - not a read of the
     device's real current state, which the reverse-engineered protocol has
     no command for (checked: neither the handshake's device-info reply nor
@@ -214,10 +215,24 @@ def _save_panorama_state(media: str | None, brightness: int | None,
     factory DEFAULT_POWERON_MEDIA, and the very next set_media()/
     set_brightness() call would silently re-send that default and wipe
     out a custom boot image across a mere shyyctl restart, not just a
-    real power cycle."""
+    real power cycle.
+
+    gallery_id: the local gallery item id last applied, kept separately
+    from `media` - `media` is the PANEL's own remote filename for it
+    (default_media_name()'s generated timestamp name, confirmed against
+    real hardware to never equal the gallery item's original uploaded
+    filename), so nothing that wants "which gallery item is this" can
+    match it back against _load_gallery()'s entries by name. Defaults to
+    the sentinel "__unset__" (not None) so brightness-only calls that
+    don't know or care about the current media (panorama_brightness) can
+    omit it and leave whatever gallery_id was already saved alone,
+    distinct from a real caller explicitly clearing it to None."""
+    if gallery_id == "__unset__":
+        gallery_id = _load_panorama_state().get("gallery_id")
     PANORAMA_STATE_FILE.write_text(
         json.dumps({"media": media, "brightness": brightness,
-                   "poweron_media": poweron_media, "standby_media": standby_media}),
+                   "poweron_media": poweron_media, "standby_media": standby_media,
+                   "gallery_id": gallery_id}),
         encoding="utf-8")
 
 
@@ -286,12 +301,19 @@ def _current_panorama_media_path() -> tuple[str, bool] | None:
     Panorama panel (see _save_panorama_state) - what the "ambient" RGB
     effect decodes locally (app/ambient.py), never the live screen.
     Returns (path, is_video), or None if nothing's been applied yet or
-    the gallery entry it names has since been deleted."""
-    media_name = _load_panorama_state().get("media")
-    if not media_name:
+    the gallery entry it names has since been deleted.
+
+    Matched by gallery_id, not by the saved "media" name - that field is
+    the PANEL's own generated remote filename for the upload (see
+    _save_panorama_state's docstring), which on real hardware is never
+    equal to the gallery item's original filename this used to compare
+    it against, so the match never actually succeeded outside a demo
+    where both were fabricated to line up."""
+    gallery_id = _load_panorama_state().get("gallery_id")
+    if not gallery_id:
         return None
     for item in _load_gallery():
-        if item.get("name") != media_name:
+        if item.get("id") != gallery_id:
             continue
         original = next((GALLERY_DIR / item["id"]).glob("original.*"), None)
         if original is None:
@@ -2805,7 +2827,15 @@ async def panorama_status():
     return {
         "connected": True,
         "info": _panorama_info,
-        "last_applied": {"media": panel.last_media, "brightness": panel.last_brightness},
+        "last_applied": {
+            "media": panel.last_media, "brightness": panel.last_brightness,
+            # The gallery item id behind `media`, not `media` itself (the
+            # panel's own generated remote filename) - see
+            # _current_panorama_media_path's docstring for why matching by
+            # name never worked. The frontend's currentPanoramaMediaItem()
+            # matches on this instead of last_applied.media.
+            "gallery_id": _load_panorama_state().get("gallery_id"),
+        },
     }
 
 
@@ -2913,8 +2943,18 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
         else:
             ok = await _call_panel(panel.set_media, remote_name)
         if ok:
-            _save_panorama_state(panel.last_media, panel.last_brightness,
-                                 panel.last_poweron_media, panel.last_standby_media)
+            # Boot/standby media is a different slot from what's actively
+            # showing now - only a non-boot apply changes which gallery
+            # item is "current" (omitting gallery_id for the as_boot
+            # branch leaves whatever was already saved alone, via
+            # _save_panorama_state's "__unset__" sentinel default).
+            if as_boot:
+                _save_panorama_state(panel.last_media, panel.last_brightness,
+                                     panel.last_poweron_media, panel.last_standby_media)
+            else:
+                _save_panorama_state(panel.last_media, panel.last_brightness,
+                                     panel.last_poweron_media, panel.last_standby_media,
+                                     gallery_id=item_id)
     return {"filename": remote_name, "applied": ok}
 
 

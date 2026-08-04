@@ -244,6 +244,10 @@
     background-image:radial-gradient(var(--rule) 1px, transparent 1px);
     background-size:22px 22px; background-position:-11px -11px;
     cursor:crosshair;
+    /* advPointerDown's preventDefault() stops most of it, but this is
+       what actually stops Firefox/Safari from still native-selecting the
+       unit-name <text> labels a drag happens to sweep over. */
+    user-select:none; -webkit-user-select:none;
   }
   #advancedCase circle.led-dot{transition:r .12s ease, stroke-width .12s ease, filter .12s ease}
   #advancedCase circle.led-dot.led-selected{filter:drop-shadow(0 0 5px var(--accent))}
@@ -1543,6 +1547,7 @@ function advPointerDown(evt){
   advDragAdditive = evt.shiftKey;
   if(!advDragAdditive) selectedLeds.clear();
   try{ svg.setPointerCapture(evt.pointerId); }catch(e){}
+  evt.preventDefault(); // without this, dragging across the unit-name <text> labels native-selects them as text
   advPointerMove(evt);
 }
 
@@ -2345,14 +2350,18 @@ async function loadGallery(){
 const VIDEO_SUFFIXES = ['.mp4', '.webm', '.mov', '.avi'];
 function isVideoItem(item){ return !!(item.suffix && VIDEO_SUFFIXES.includes(item.suffix.toLowerCase())); }
 
-// last_applied.media (see /api/panorama/status) is a filename, not a
-// gallery id - matched against the cached gallery list to find the item
-// actually playing right now, for the Advanced canvas's live preview
-// (drawAdvancedCase) and the ambient-light effect alike.
+// Finds the gallery item actually applied to the panel right now, for
+// the Advanced canvas's live preview (drawAdvancedCase) and the
+// ambient-light effect's frontend approximation alike.
 function currentPanoramaMediaItem(){
-  const name = panoStatus && panoStatus.last_applied && panoStatus.last_applied.media;
-  if(!name || !galleryItems) return null;
-  return galleryItems.find(g => g.name === name) || null;
+  // Matched by gallery_id, not by last_applied.media - that field is the
+  // panel's own generated remote filename for the upload, which on real
+  // hardware is never equal to the gallery item's original filename this
+  // used to compare it against (only ever matched in the demo, where
+  // both were fabricated to line up).
+  const id = panoStatus && panoStatus.last_applied && panoStatus.last_applied.gallery_id;
+  if(!id || !galleryItems) return null;
+  return galleryItems.find(g => g.id === id) || null;
 }
 
 const GALLERY_CARD_SPACING = 165;
