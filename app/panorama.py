@@ -497,6 +497,33 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
     return result.stdout
 
 
+def build_encoded_media_container(local_path: str, duration_s: float = 2.0) -> bytes | None:
+    """The CPU-bound half of what upload_media used to do inline: ffmpeg
+    encode plus container framing, no device access at all - safe to run
+    without holding _panorama_lock. Split out specifically so a caller can
+    do this (which can take several real seconds for anything more than a
+    trivial image) *before* acquiring the lock upload_media's actual
+    device I/O needs, instead of holding that lock - and starving
+    _keepalive_loop's ping - for the whole encode. See upload_media's own
+    docstring for the confirmed real-world symptom this fixes.
+
+    content_type/frame_count used to be hardcoded (2, 1) in the container
+    this builds - see build_media_container's and count_h264_frames' own
+    docstrings for the real capture evidence that was wrong for anything
+    with more than one real frame, and the most likely reason a genuine
+    video previously only ever showed its first frame on the panel."""
+    h264 = encode_to_h264(local_path, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, duration_s)
+    if h264 is None:
+        return None
+    frame_count = count_h264_frames(h264)
+    content_type = 4 if _has_own_motion(local_path) else 2
+    container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264,
+                                      frame_count=frame_count, content_type=content_type)
+    log.info("build_encoded_media_container: %s, container=%d bytes (h264=%d bytes, frames=%d, content_type=%d)",
+             local_path, len(container), len(h264), frame_count, content_type)
+    return container
+
+
 def generate_thumbnail(local_path: str, out_path: str, size: int = 240,
                         ffmpeg_path: str | None = None) -> bool:
     """A small JPEG preview for the Display page's gallery. One frame is
@@ -850,7 +877,8 @@ class _PanoramaBase:
                                       poweron_media=filename, timeout_s=timeout_s)
 
     def upload_media(self, local_path: str, remote_name: str | None = None,
-                     duration_s: float = 2.0, timeout_s: float = 15.0) -> str | None:
+                     duration_s: float = 2.0, timeout_s: float = 15.0,
+                     container: bytes | None = None) -> str | None:
         """Encodes local_path (image or gif) and uploads it directly over
         this same connection - the confirmed real mechanism (see
         build_media_announce_frame() and friends above), not ADB. Requires
@@ -861,26 +889,31 @@ class _PanoramaBase:
         Does not itself call set_screen_config() - apply the upload with a
         separate set_media(name) call once this returns, mirroring how the
         real protocol keeps "store a file" and "show a file" as separate
-        steps."""
+        steps.
+
+        container, when given, is an already-built container (see
+        build_encoded_media_container below) - skips the encode step
+        entirely. Direct user report: the panel's display went black and
+        only came back "eventually" using shyyctl specifically, never
+        KANALI - traced to main.py's caller holding _panorama_lock around
+        this whole method, including the encode step below, which used to
+        run unconditionally right here. The panel goes idle-blank a few
+        seconds after its last message (see _keepalive_loop's docstring);
+        an ffmpeg encode of a real video is not a few seconds, and while
+        it ran, the keepalive ping - which needs that same lock - couldn't
+        fire at all. Encoding ahead of time and only acquiring the lock
+        for the actual device I/O (see _apply_gallery_item) fixes that
+        without touching this method's protocol logic at all."""
         if not self.connected:
             raise PanoramaError("not connected")
         if remote_name is None:
             remote_name = default_media_name(local_path)
-        h264 = encode_to_h264(local_path, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, duration_s)
-        if h264 is None:
-            return None
-        # content_type/frame_count used to be hardcoded (2, 1) - see
-        # build_media_container's and count_h264_frames' docstrings for
-        # the real capture evidence that this was wrong for anything with
-        # more than one real frame, and the most likely reason a genuine
-        # video previously only ever showed its first frame on the panel.
-        frame_count = count_h264_frames(h264)
-        content_type = 4 if _has_own_motion(local_path) else 2
-        container = build_media_container(MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_FPS, h264,
-                                          frame_count=frame_count, content_type=content_type)
+        if container is None:
+            container = build_encoded_media_container(local_path, duration_s)
+            if container is None:
+                return None
         session_id = random.randint(1, 999_999)
-        log.info("upload_media: %s, container=%d bytes (h264=%d bytes, frames=%d, content_type=%d)",
-                 remote_name, len(container), len(h264), frame_count, content_type)
+        log.info("upload_media: %s, container=%d bytes", remote_name, len(container))
 
         self._drain_stray_reply()
 

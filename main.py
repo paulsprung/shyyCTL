@@ -47,7 +47,8 @@ from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
 from app.ambient import AmbientSampler
-from app.panorama import PanoramaError, find_print_panel, find_usb_panel, generate_thumbnail
+from app.panorama import (PanoramaError, build_encoded_media_container, find_print_panel,
+                          find_usb_panel, generate_thumbnail)
 from app.procflags import NO_WINDOW
 from app.scan import Scan
 from app import sensors as sensors_mod
@@ -2804,7 +2805,7 @@ async def identify_unit(unit_id: str):
 
 # -- panorama display -----------------------------------------------------
 
-async def _call_panel(fn, *args):
+async def _call_panel(fn, *args, **kwargs):
     """Runs a blocking panel.<method> call in a thread and treats a write/
     read failure on the underlying handle as "this connection is dead"
     rather than an unhandled 500. panel.connected (app/panorama.py) is
@@ -2821,7 +2822,7 @@ async def _call_panel(fn, *args):
     server restarts."""
     global _panorama
     try:
-        return await asyncio.to_thread(fn, *args)
+        return await asyncio.to_thread(fn, *args, **kwargs)
     except PanoramaError as exc:
         log.warning("panel command failed, dropping the cached connection: %s", exc)
         _panorama = None
@@ -2956,10 +2957,23 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
     panel = await get_panorama()
     if panel is None or not panel.connected:
         raise HTTPException(503, "panel not connected")
+    # Encode BEFORE taking _panorama_lock, not inside it - direct user
+    # report: the panel's display went black and only recovered
+    # "eventually", using shyyctl specifically, never KANALI. Traced to
+    # this lock being held for the whole old panel.upload_media() call,
+    # including its ffmpeg encode step - _keepalive_loop's ping needs
+    # this same lock, so it couldn't fire for however long a real video's
+    # encode took, easily longer than the panel's few-seconds idle
+    # timeout (see _keepalive_loop's docstring). The encode itself
+    # touches no device state at all, so it doesn't need the lock -
+    # only the actual upload/apply protocol exchange below does.
+    container = await asyncio.to_thread(build_encoded_media_container, str(original))
+    if container is None:
+        raise HTTPException(500, "media encode failed - check server logs")
     async with _panorama_lock:
-        remote_name = await _call_panel(panel.upload_media, str(original))
+        remote_name = await _call_panel(panel.upload_media, str(original), None, 2.0, 15.0, container)
         if remote_name is None:
-            raise HTTPException(500, "upload failed (encode or transfer step) - check server logs")
+            raise HTTPException(500, "upload failed (transfer step) - check server logs")
         if as_boot:
             ok = await _call_panel(panel.set_boot_media, remote_name)
         else:
