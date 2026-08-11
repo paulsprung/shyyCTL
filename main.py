@@ -450,14 +450,34 @@ async def _keepalive_loop():
     enumeration, not a blocking retry loop - see app/panorama.py), so
     retrying it here every 2s is safe even while genuinely disconnected."""
     global _panorama
+    # Was this loop's last tick able to see a live connection - tracked
+    # only to log state *transitions* (dropped / recovered), not every
+    # single 2s tick, while still landing on INFO level (a plain
+    # `python main.py` run, or the installed exe's shyyctl.log, both
+    # default to INFO - see logging.basicConfig above) instead of DEBUG,
+    # which never made it into an exported log at all. Direct user
+    # report: the display goes black and recovers on its own repeatedly
+    # (minutes on, minutes off, cycling) - this loop's own reasoning
+    # already covers *that* a drop gets retried and recovered, but
+    # without these two lines actually reaching the log file, there was
+    # no way to see *when* each drop/recovery happened to tell a real
+    # recurring USB-level dropout apart from a shyyctl-side bug from the
+    # log alone.
+    was_connected = False
     while True:
         try:
             panel = _panorama
             if panel is None:
                 await get_panorama()
+                if _panorama is not None and _panorama.connected:
+                    log.info("panorama keepalive: reconnected")
+                    was_connected = True
             elif panel.connected:
                 async with _panorama_lock:
                     await asyncio.to_thread(panel.ping)
+                if not was_connected:
+                    log.info("panorama keepalive: ping succeeding again")
+                was_connected = True
         except PanoramaError as exc:
             # A real protocol-level failure (not just "nothing plugged in
             # yet") - most likely something else (KANALI) grabbed the
@@ -468,10 +488,14 @@ async def _keepalive_loop():
             # handle. Dropping it here means this same loop's own next
             # tick (~2s away) retries get_panorama() itself, on top of
             # whatever a real request would trigger anyway.
-            log.debug("panorama keepalive ping failed, dropping the cached connection: %s", exc)
+            if was_connected:
+                log.info("panorama keepalive: connection lost (%s) - retrying every 2s", exc)
             _panorama = None
+            was_connected = False
         except Exception as exc:
-            log.debug("panorama keepalive ping failed: %s", exc)
+            if was_connected:
+                log.info("panorama keepalive: connection lost (%s) - retrying every 2s", exc)
+            was_connected = False
         await asyncio.sleep(2)
 
 
