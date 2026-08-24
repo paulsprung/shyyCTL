@@ -102,7 +102,19 @@ def process_resources() -> dict:
             return None
         try:
             with proc.oneshot():
-                cpu = proc.cpu_percent(interval=None)
+                # Process.cpu_percent() is expressed relative to ONE core
+                # (0-100*cpu_count, confirmed against psutil's own docs) -
+                # unlike the module-level psutil.cpu_percent() cpu_ram()
+                # uses below, which is already normalized to the whole
+                # machine. Direct user report: this showed OpenRGB at
+                # "95.3%" while Windows' own Task Manager showed 11.6% for
+                # the exact same process at the exact same moment on an
+                # 8-core machine (95.3/8 = 11.9, matching) - dividing by
+                # cpu_count() here makes this match Task Manager's numbers
+                # instead of alarming anyone into thinking one process is
+                # close to pegging the entire CPU when it's actually maxed
+                # out on a single core.
+                cpu = proc.cpu_percent(interval=None) / (psutil.cpu_count() or 1)
                 rss_mb = proc.memory_info().rss / (1024 ** 2)
             return {"cpu_percent": round(cpu, 1), "ram_mb": round(rss_mb, 1)}
         except Exception:
