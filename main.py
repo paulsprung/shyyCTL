@@ -155,7 +155,7 @@ LOG_FILE_OLD = ROOT / "shyyctl.log.old"
 # the Settings > Updates check below to compare against GitHub's latest
 # release tag). Nothing here ever calls out on its own; it only runs when
 # a human clicks "Check for updates".
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 UPDATE_REPO = "paulsprung/shyyctl"
 
 _log_file = None  # only ever opened below (frozen build) - export_log() flushes it before reading
