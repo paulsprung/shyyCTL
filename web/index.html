@@ -741,6 +741,14 @@ function say(message, kind="info"){
   clearTimeout(say._t); say._t = setTimeout(()=>el.style.display="none", 6000);
 }
 
+// Names that end up inside innerHTML templates (gallery filenames, unit/
+// curve/preset names, device names reported by OpenRGB) are data, not
+// markup - a filename like `<img src=x onerror=...>.png` must render as
+// text, not run.
+function esc(value){
+  return String(value ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
 async function api(path, options={}){
   const opts = {...options};
   if(!(opts.body instanceof FormData)){
@@ -748,7 +756,15 @@ async function api(path, options={}){
   }
   const r = await fetch(path, opts);
   const body = await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(body.detail || r.statusText);
+  if(!r.ok){
+    // FastAPI validation errors (422) carry a list of {msg, loc} objects,
+    // not a string - joined here instead of surfacing "[object Object]".
+    const d = body.detail;
+    const msg = typeof d === "string" ? d
+      : Array.isArray(d) ? d.map(x=>x && x.msg ? x.msg : JSON.stringify(x)).join("; ")
+      : r.statusText;
+    throw new Error(msg || `request failed (${r.status})`);
+  }
   return body;
 }
 
@@ -796,6 +812,12 @@ function showPage(name, sub){
     else if(!advVideo.paused) advVideo.pause();
   }
   if(name === "settings") showSettingsTab(sub || showSettingsTab._last || "general");
+  // Fan readings are only polled while Status/Fans is open (see the 3s
+  // refresh loop) - fetch once right away on arriving there instead of
+  // showing whatever was last read until the next tick.
+  if((name === "fans" || name === "status") && showPage._last && showPage._last !== name){
+    loadFans().then(()=>{ if(name === "fans") renderFans(); else renderStatus(); }).catch(()=>{});
+  }
   const hash = "#/"+name+(name==="settings" ? "/"+(sub || showSettingsTab._last || "general") : "");
   if(location.hash !== hash) location.hash = hash;
   if(showPage._last && showPage._last !== name) window.scrollTo({top:0});
@@ -981,8 +1003,8 @@ function renderFans(){
       </div>
       ${curve ? `
       <div class="note">${curveEntryStatus && curveEntryStatus.temp_c!=null
-          ? `${curve.name} · ${Math.round(curveEntryStatus.temp_c)}°C &rarr; ${curveEntryStatus.duty}%`
-          : `${curve.name} · waiting on temperature&hellip;`}</div>
+          ? `${esc(curve.name)} · ${Math.round(curveEntryStatus.temp_c)}°C &rarr; ${curveEntryStatus.duty}%`
+          : `${esc(curve.name)} · waiting on temperature&hellip;`}</div>
       ` : `
       <div class="fan-card-duty">
         <input type="range" min="0" max="100" value="${dutyVal}" id="duty-${ch}"
@@ -994,7 +1016,7 @@ function renderFans(){
       `}
       <select class="fan-group-select" style="width:100%;margin-top:10px" onchange="setFanGroup('${ch}', this.value)">
         <option value="" ${!groupId?"selected":""}>Fixed</option>
-        ${curveProfiles.map(c=>`<option value="${c.id}" ${groupId===c.id?"selected":""}>${c.name}</option>`).join("")}
+        ${curveProfiles.map(c=>`<option value="${c.id}" ${groupId===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}
       </select>
     </div>`;
   }).join("");
@@ -1121,7 +1143,7 @@ function renderCurveList(){
     const statusText = curveStatusText(curve);
     return `<div class="curve-card">
       <div class="curve-card-top">
-        <input type="text" class="curve-name-input" value="${curve.name}"
+        <input type="text" class="curve-name-input" value="${esc(curve.name)}"
           onchange="renameCurve('${curve.id}', this.value)">
         <button class="btn sec sm curve-del" onclick="deleteCurve('${curve.id}')" title="Delete">&times;</button>
       </div>
@@ -1303,7 +1325,7 @@ function renderRamSticks(){
       <div class="rgb-card-top">
         <div class="rgb-swatch" id="ramSwatch-${s.index}" style="background:${color}"></div>
         <div><div class="rgb-card-name">Stick ${s.index+1}</div>
-          <div class="rgb-card-sub">${s.name} &middot; ${s.leds} LED</div></div>
+          <div class="rgb-card-sub">${esc(s.name)} &middot; ${s.leds} LED</div></div>
       </div>
       <div class="row">
         <input type="color" id="ramStickColor-${s.index}" value="${color}"
@@ -1448,7 +1470,7 @@ function drawAdvancedCase(){
     const colors = info ? ledColorArray(u, info) : null;
     const topY = Math.min(...leds.map(l=>shapeY(u,l)));
     out += `<text x="${shapeX(u,leds[0])-10}" y="${topY-14}"
-      font-family="monospace" font-size="10" fill="var(--ink-soft)">${u.name}</text>`;
+      font-family="monospace" font-size="10" fill="var(--ink-soft)">${esc(u.name)}</text>`;
     leds.forEach(l=>{
       const x = shapeX(u,l), y = shapeY(u,l);
       const sel = selectedLeds.has(ledKey(u.id, l.index));
@@ -1488,7 +1510,7 @@ function syncAdvancedDisplayPreview(){
   const x = svgX(unit.x), y = svgY(unit.y);
   const w = 132, h = 84;
   layer.innerHTML = `<text x="${x-w/2}" y="${y-h/2-10}"
-    font-family="monospace" font-size="10" fill="var(--ink-soft)">${unit.name}</text>
+    font-family="monospace" font-size="10" fill="var(--ink-soft)">${esc(unit.name)}</text>
     <foreignObject x="${x-w/2}" y="${y-h/2}" width="${w}" height="${h}">
       <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;background:#000;
         border:2px solid var(--ink-soft);border-radius:5px;overflow:hidden;display:flex;
@@ -1497,11 +1519,19 @@ function syncAdvancedDisplayPreview(){
           ? (isVideoItem(item)
               ? `<video src="/api/panorama/gallery/${item.id}/original" autoplay muted loop playsinline
                   style="width:100%;height:100%;object-fit:cover"></video>`
-              : `<img src="/api/panorama/gallery/${item.id}/original" alt="${item.name}"
+              : `<img src="/api/panorama/gallery/${item.id}/original" alt="${esc(item.name)}"
                   style="width:100%;height:100%;object-fit:cover">`)
           : `<span style="color:#5a5f66;font:10px monospace">no signal</span>`}
       </div>
     </foreignObject>`;
+  // Built while another page is showing (e.g. after Apply on Display):
+  // autoplay would start decoding in the background - showPage resumes it
+  // on arriving at Advanced.
+  const video = layer.querySelector("video");
+  if(video && !document.getElementById("page-advanced").classList.contains("active")){
+    video.autoplay = false;
+    video.pause();
+  }
 }
 
 /* ---------- Advanced canvas: click / click-drag LED selection ----------
@@ -1598,7 +1628,7 @@ function renderAdvancedLedProps(){
     if(!u || !info){ selectedLeds.clear(); box.innerHTML = `<div class="note">Select an LED.</div>`; return; }
     const colors = ledColorArray(u, info);
     box.innerHTML = `
-      <div class="card-title">${u.name} &middot; LED ${index}</div>
+      <div class="card-title">${esc(u.name)} &middot; LED ${index}</div>
       <div class="prop"><label>Colour</label>
         <input type="color" id="ledColorInput" value="${colors[index]}"></div>
       <div class="adv-props-actions">
@@ -1749,7 +1779,7 @@ function renderEffectPresets(){
   }
   box.innerHTML = effectPresets.map(p=>`
     <span class="preset-chip" onclick="loadEffectPreset('${p.id}')">
-      ${p.name}
+      ${esc(p.name)}
       <button onclick="event.stopPropagation(); deleteEffectPreset('${p.id}')" title="Delete preset">&times;</button>
     </span>`).join("");
 }
@@ -2288,17 +2318,17 @@ function renderPanorama(){
   document.getElementById("panoNote").textContent = panoStatus.connected ? "connected" : "not connected";
   const info = panoStatus.info || {};
   document.getElementById("panoInfo").innerHTML = panoStatus.connected ? `
-    Product: ${info.product||"?"}<br>
-    Model: ${info.model||"?"}<br>
-    Firmware: ${info.firmware||"?"}<br>
-    Serial: ${info.serial||"?"}<br>
+    Product: ${esc(info.product||"?")}<br>
+    Model: ${esc(info.model||"?")}<br>
+    Firmware: ${esc(info.firmware||"?")}<br>
+    Serial: ${esc(info.serial||"?")}<br>
     Resolution: ${info.width||"?"} &times; ${info.height||"?"}
   ` : `<span class="note">Panel not connected.</span>`;
 
   document.getElementById("panoMediaTable").innerHTML = panoMedia.length ? `
     <thead><tr><th>Path</th><th>Suffix</th><th>Size</th></tr></thead>
     <tbody>${panoMedia.map(m=>`
-      <tr><td>${m.path||"--"}</td><td>${m.suffix||"--"}</td><td>${m.size!=null?m.size:"--"}</td></tr>`).join("")}</tbody>
+      <tr><td>${esc(m.path||"--")}</td><td>${esc(m.suffix||"--")}</td><td>${m.size!=null?m.size:"--"}</td></tr>`).join("")}</tbody>
   ` : `<tbody><tr><td class="note">No media listed.</td></tr></tbody>`;
 }
 
@@ -2388,11 +2418,11 @@ function renderGallery(){
       onclick="focusGalleryCard('${item.id}')"
       onmouseenter="galleryCardHoverStart(this,'${item.id}')" onmouseleave="galleryCardHoverEnd(this,'${item.id}')">
       ${item.has_thumb
-        ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${item.name}">`
+        ? `<img class="gallery-thumb" src="/api/panorama/gallery/${item.id}/thumb" alt="${esc(item.name)}">`
         : ``}
       ${isVideoItem(item) ? `<div class="kanali-card-play">&#9654;</div>` : ""}
       <div class="kanali-card-overlay">
-        ${item.id===lastGalleryId ? `<span class="kanali-card-dot"></span>` : ``}<span>${item.name}</span>
+        ${item.id===lastGalleryId ? `<span class="kanali-card-dot"></span>` : ``}<span>${esc(item.name)}</span>
       </div>
       ${isCenter ? `<div class="kanali-card-actions">
         <button class="btn sm" onclick="event.stopPropagation(); doApplyGalleryItem('${item.id}')">Apply</button>
@@ -2538,8 +2568,8 @@ function renderScan(){
 
   document.getElementById("scanRgbSummary").innerHTML = (scanState.mobo || (scanState.ram||[]).length) ? `
     <div class="note" style="line-height:1.8">
-      ${scanState.mobo ? `Motherboard: ${scanState.mobo.name} · ${scanState.mobo.leds} LED<br>` : ""}
-      ${(scanState.ram||[]).map(r=>`RAM: ${r.name} · ${r.leds} LED`).join("<br>")}
+      ${scanState.mobo ? `Motherboard: ${esc(scanState.mobo.name)} · ${scanState.mobo.leds} LED<br>` : ""}
+      ${(scanState.ram||[]).map(r=>`RAM: ${esc(r.name)} · ${r.leds} LED`).join("<br>")}
     </div>` : `<div class="note">Run a scan.</div>`;
 }
 
@@ -2600,7 +2630,7 @@ function renderSetup(){
 
   document.getElementById("unitList").innerHTML = layoutData.units.length ? layoutData.units.map(u=>`
     <div class="unit-row" aria-selected="${selectedUnit===u.id}" onclick="selectUnit('${u.id}')">
-      <span class="grow">${u.name}</span>
+      <span class="grow">${esc(u.name)}</span>
       <span class="note">${u.kind}${u.model?" · "+u.model:""}${u.leds!=null?" · "+u.leds+" LED":""}</span>
     </div>`).join("") : `<div class="note">No units yet - adopt from the last scan.</div>`;
 
@@ -2632,7 +2662,7 @@ function drawSetupCase(){
         fill="${sel?'rgba(92,138,255,.10)':'transparent'}"
         stroke="${sel?'var(--accent)':'var(--ink-soft)'}" stroke-width="${sel?2:1}" opacity="${sel?.95:.5}"/>
       <text x="${x0}" y="${y0-6}" font-family="monospace" font-size="10"
-        fill="${sel?'var(--accent)':'var(--ink-soft)'}">${u.name}</text>
+        fill="${sel?'var(--accent)':'var(--ink-soft)'}">${esc(u.name)}</text>
       ${leds.map((l,i)=>`<circle id="setupLed-${u.id}-${l.index}" cx="${pts[i][0]}" cy="${pts[i][1]}" r="3"
         fill="${sel?'var(--accent)':'var(--rule)'}"/>`).join("")}
     </g>`;
@@ -2676,7 +2706,7 @@ function renderUnitProps(){
   box.innerHTML = `
     <div class="card-title">Selected unit</div>
     <div class="prop"><label>Name</label>
-      <input type="text" value="${u.name}" onchange="editUnit('name', this.value)"></div>
+      <input type="text" value="${esc(u.name)}" onchange="editUnit('name', this.value)"></div>
     <div class="prop"><label>Across / down</label>
       <div class="row">
         <input type="number" id="prop-x" step="0.01" min="0" max="1" value="${u.x.toFixed(3)}" style="width:48%"
@@ -2832,10 +2862,10 @@ function renderSettings(){
   const {hub, openrgb, panorama} = status_;
   document.getElementById("connections").innerHTML = `
     <div class="note" style="line-height:1.9">
-      <strong style="color:var(--ink)">Hub</strong> — ${hub.connected?(hub.description||"connected"):hub.error}<br>
+      <strong style="color:var(--ink)">Hub</strong> — ${esc(hub.connected?(hub.description||"connected"):hub.error)}<br>
       fan channels: ${(hub.channels&&hub.channels.fan||[]).join(", ")||"none"}<br>
       led channels: ${(hub.channels&&hub.channels.led||[]).join(", ")||"none"}<br><br>
-      <strong style="color:var(--ink)">OpenRGB</strong> — ${openrgb.connected?"connected":openrgb.error}<br><br>
+      <strong style="color:var(--ink)">OpenRGB</strong> — ${esc(openrgb.connected?"connected":openrgb.error)}<br><br>
       <strong style="color:var(--ink)">Panorama</strong> — ${panorama.connected?"connected":"not connected"}
     </div>`;
   renderHubSizes();
@@ -2927,7 +2957,10 @@ async function refresh(){
 setInterval(async ()=>{
   try{
     status_ = await api("/api/status");
-    await loadFans();
+    // Every /api/fans read is a whole liquidctl process on the backend -
+    // only worth it while a page that shows fan readings is open.
+    if(document.getElementById("page-status").classList.contains("active")
+       || document.getElementById("page-fans").classList.contains("active")) await loadFans();
     if(document.getElementById("page-status").classList.contains("active")) await loadSensors();
     renderDevices(); renderStatus();
     if(document.getElementById("page-fans").classList.contains("active")) renderFans();
@@ -2949,7 +2982,7 @@ async function checkConflicts(){
     const key = running.slice().sort().join("|");
     if(running.length && key !== dismissedConflictKey){
       document.getElementById("conflictList").innerHTML =
-        running.map(name=>`<li>${name}</li>`).join("");
+        running.map(name=>`<li>${esc(name)}</li>`).join("");
       document.getElementById("conflictModal").style.display = "flex";
     }
   }catch(e){}
@@ -2980,6 +3013,8 @@ async function loadSystemInfo(){
 }
 
 async function loadResourceUsage(){
+  // Only shown on the Settings page; each read walks the process list.
+  if(!document.getElementById("page-settings").classList.contains("active")) return;
   try{
     const r = await api("/api/system/resources");
     renderResourceUsage(r);

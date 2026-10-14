@@ -45,7 +45,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
 
 from app.panorama import (
-    PanoramaUSB, PanoramaPrint, Media,
+    Media,
     find_usb_panel, find_print_panel, find_usbprint_path,
     usb_probe, build_ping_frame,
 )

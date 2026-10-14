@@ -193,6 +193,19 @@ def gpu() -> dict:
 _lhm_temp_warned: set[str] = set()
 
 
+def _parse_celsius(value: str) -> float | None:
+    """"45.3 °C", "45,3°C" -> 45.3. LibreHardwareMonitor (and older
+    SensorHelper builds) format with the Windows display culture, so on a
+    German/most-European-locale machine the decimal separator is a comma -
+    float("45,3") raised, every reading counted as "no match", and CPU
+    temperature (and with it every CPU fan curve) stayed unavailable."""
+    text = value.replace("°C", "").replace("\u00a0", " ").strip().replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def lhm_temp(url: str, match: str, config_key: str = "cpu_sensor_match") -> float | None:
     """Walks LibreHardwareMonitor's data.json sensor tree for the first
     leaf whose Text contains `match` (case-insensitive) and has a °C
@@ -232,10 +245,9 @@ def lhm_temp(url: str, match: str, config_key: str = "cpu_sensor_match") -> floa
         text = str(node.get("Text", ""))
         value = node.get("Value")
         if match.lower() in text.lower() and isinstance(value, str) and "°C" in value:
-            try:
-                return float(value.replace("°C", "").strip())
-            except ValueError:
-                pass
+            parsed = _parse_celsius(value)
+            if parsed is not None:
+                return parsed
         for child in node.get("Children", []) or []:
             found = walk(child)
             if found is not None:

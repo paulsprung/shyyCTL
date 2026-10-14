@@ -21,6 +21,7 @@
 // the configured port and absolutely no trace of why - exactly the
 // "still shows -- degC, no idea why" situation this exists to prevent.
 
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -189,15 +190,18 @@ static string FormatValue(float value, SensorType type)
     // Only Temperature actually matters to app/sensors.py's lhm_temp()
     // (it only ever looks for a "°C" substring) - the rest are formatted
     // anyway so this JSON is genuinely useful if inspected directly,
-    // same spirit as the real LHM data.json.
+    // same spirit as the real LHM data.json. Invariant culture: plain
+    // string interpolation follows the Windows display locale, which on a
+    // German system writes "45,3°C" - not a number Python's float() reads.
+    var inv = CultureInfo.InvariantCulture;
     return type switch
     {
-        SensorType.Temperature => $"{value:0.0}°C",
-        SensorType.Load => $"{value:0.0}%",
-        SensorType.Clock => $"{value:0}MHz",
-        SensorType.Voltage => $"{value:0.000}V",
-        SensorType.Fan => $"{value:0}RPM",
-        SensorType.Power => $"{value:0.0}W",
-        _ => $"{value:0.0}",
+        SensorType.Temperature => value.ToString("0.0", inv) + "°C",
+        SensorType.Load => value.ToString("0.0", inv) + "%",
+        SensorType.Clock => value.ToString("0", inv) + "MHz",
+        SensorType.Voltage => value.ToString("0.000", inv) + "V",
+        SensorType.Fan => value.ToString("0", inv) + "RPM",
+        SensorType.Power => value.ToString("0.0", inv) + "W",
+        _ => value.ToString("0.0", inv),
     };
 }

@@ -13,6 +13,52 @@ Run:
     python main.py
 """
 
+import sys
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--liquidctl":
+    # The installed exe doubles as the bundled liquidctl CLI (see
+    # app/hub.py's _liquidctl_command): `shyyctl.exe --liquidctl <args>`
+    # runs exactly what `liquidctl <args>` would, in its own short-lived
+    # process like the real CLI. Handled before anything else in this
+    # module runs - none of the server setup below (log redirection/
+    # rotation, config, hardware objects) may happen in this child. The
+    # frozen exe is a windowed build, so stdout/stderr can be None; they
+    # are rebuilt from the pipes the parent passed in, forced to utf-8
+    # (liquidctl prints box-drawing characters).
+    import os
+
+    def _std_stream(fd: int, handle_id: int):
+        try:
+            return os.fdopen(os.dup(fd), "w", encoding="utf-8", errors="replace", buffering=1)
+        except OSError:
+            pass
+        try:
+            import ctypes
+            import msvcrt
+            get_std_handle = ctypes.windll.kernel32.GetStdHandle
+            get_std_handle.restype = ctypes.c_void_p
+            handle = get_std_handle(handle_id)
+            if handle not in (None, ctypes.c_void_p(-1).value):
+                return open(msvcrt.open_osfhandle(handle, 0), "w", encoding="utf-8",
+                            errors="replace", buffering=1)
+        except Exception:
+            pass
+        return open(os.devnull, "w")
+
+    for _name, _fd, _handle_id in (("stdout", 1, -11), ("stderr", 2, -12)):
+        _stream = getattr(sys, _name)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        else:
+            setattr(sys, _name, _std_stream(_fd, _handle_id))
+
+    from liquidctl.cli import main as _liquidctl_main
+    sys.argv = ["liquidctl"] + sys.argv[2:]
+    _code = _liquidctl_main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(_code)
+
 import asyncio
 import colorsys
 import contextlib
@@ -24,10 +70,10 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
@@ -37,7 +83,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -160,6 +206,34 @@ ambient_sampler = AmbientSampler()
 _panorama = None
 _panorama_info: dict | None = None
 _panorama_lock = asyncio.Lock()
+# Handshake retries for a connection whose first handshake got no device
+# info back - capped and spaced out (see get_panorama), not one per request.
+_panorama_handshake_retries = 0
+_panorama_handshake_next = 0.0
+_PANORAMA_HANDSHAKE_MAX_RETRIES = 3
+_PANORAMA_HANDSHAKE_RETRY_S = 30.0
+
+
+def _drop_panorama(panel) -> None:
+    """Forget a connection that just failed AND close its OS handle.
+    Dropping only the reference (as every failure path used to) left the
+    usbprint.sys handle and its event object open for the rest of the
+    process's life - one leaked handle pair per drop, and real logs show
+    a drop every few minutes, so hundreds over a day, some still pointing
+    at a device instance that had re-enumerated. Only clears the global if
+    it's still this same object, so a newer connection is never thrown
+    away by a late failure report about an older one."""
+    global _panorama, _panorama_info
+    if panel is not None:
+        try:
+            panel.disconnect()
+        except Exception as exc:
+            log.debug("closing dropped panel connection failed: %s", exc)
+    if _panorama is panel:
+        _panorama = None
+        _panorama_info = None
+
+
 _keepalive_task: asyncio.Task | None = None
 _curve_task: asyncio.Task | None = None
 _curve_status: dict = {"curves": []}
@@ -350,10 +424,12 @@ async def get_panorama():
     repeat call after the first was always going to come back empty. Not a
     concurrency bug (already fixed separately with _panorama_lock around
     every panel call) - this was a protocol misuse bug underneath it."""
-    global _panorama, _panorama_info
+    global _panorama, _panorama_info, _panorama_handshake_retries, _panorama_handshake_next
     async with _panorama_lock:
         if _panorama is not None and _panorama.connected:
-            if _panorama_info is None:
+            if (_panorama_info is None
+                    and _panorama_handshake_retries < _PANORAMA_HANDSHAKE_MAX_RETRIES
+                    and time.monotonic() >= _panorama_handshake_next):
                 # The one handshake attempt for this connection didn't
                 # stick yet (e.g. it raced the device's own startup, or a
                 # reply timed out) - retry here instead of returning the
@@ -361,13 +437,24 @@ async def get_panorama():
                 # lifetime. Confirmed against a real run this was a
                 # genuine regression: once _panorama_info was None, every
                 # later call hit this fast path and never tried again.
+                # Capped and spaced out though: this path runs on every
+                # /api/status poll (every 3s per open tab), and each retry
+                # re-sends the whole registration burst KANALI only ever
+                # sends once per connection, while holding the lock the
+                # keepalive ping needs for up to the handshake's timeout.
+                _panorama_handshake_retries += 1
+                _panorama_handshake_next = time.monotonic() + _PANORAMA_HANDSHAKE_RETRY_S
                 try:
                     _panorama_info = await asyncio.to_thread(_panorama.handshake)
                 except Exception as exc:
                     log.warning("panorama handshake retry failed: %s", exc)
             return _panorama
+        if _panorama is not None:
+            _drop_panorama(_panorama)
         _panorama = await asyncio.to_thread(_find_panorama)
         _panorama_info = None
+        _panorama_handshake_retries = 0
+        _panorama_handshake_next = time.monotonic() + _PANORAMA_HANDSHAKE_RETRY_S
         if _panorama is not None:
             try:
                 _panorama_info = await asyncio.to_thread(_panorama.handshake)
@@ -464,37 +551,42 @@ async def _keepalive_loop():
     # recurring USB-level dropout apart from a shyyctl-side bug from the
     # log alone.
     was_connected = False
+    lost_at = None
     while True:
         try:
             panel = _panorama
-            if panel is None:
+            if panel is None or not panel.connected:
                 await get_panorama()
                 if _panorama is not None and _panorama.connected:
-                    log.info("panorama keepalive: reconnected")
+                    if lost_at is not None:
+                        log.info("panorama keepalive: reconnected after %.0fs", time.monotonic() - lost_at)
+                    else:
+                        log.info("panorama keepalive: reconnected")
                     was_connected = True
-            elif panel.connected:
+                    lost_at = None
+            else:
                 async with _panorama_lock:
-                    await asyncio.to_thread(panel.ping)
+                    try:
+                        await asyncio.to_thread(panel.ping)
+                    except PanoramaError:
+                        # A real protocol-level failure (not just "nothing
+                        # plugged in yet") - the device went away under
+                        # this handle (re-enumerated, or something else
+                        # grabbed it). connected (app/panorama.py) is only
+                        # a Python-side flag, never a live check, so it
+                        # would otherwise stay True forever. Dropped (and
+                        # its handle closed) while still holding the lock,
+                        # so no other request can be mid-I/O on it; the
+                        # next tick (~2s away) reconnects.
+                        _drop_panorama(panel)
+                        raise
                 if not was_connected:
                     log.info("panorama keepalive: ping succeeding again")
                 was_connected = True
-        except PanoramaError as exc:
-            # A real protocol-level failure (not just "nothing plugged in
-            # yet") - most likely something else (KANALI) grabbed the
-            # device out from under this already-open handle. connected
-            # (app/panorama.py) is only a Python-side flag, never a live
-            # check, so it would otherwise stay True forever and every
-            # future request would keep reusing and re-breaking the same
-            # handle. Dropping it here means this same loop's own next
-            # tick (~2s away) retries get_panorama() itself, on top of
-            # whatever a real request would trigger anyway.
-            if was_connected:
-                log.info("panorama keepalive: connection lost (%s) - retrying every 2s", exc)
-            _panorama = None
-            was_connected = False
         except Exception as exc:
             if was_connected:
                 log.info("panorama keepalive: connection lost (%s) - retrying every 2s", exc)
+                lost_at = time.monotonic()
             was_connected = False
         await asyncio.sleep(2)
 
@@ -1132,6 +1224,78 @@ async def _lite_service_main():
 app = FastAPI(title="shyyctl", lifespan=lifespan)
 
 
+# -- local-only request guard ------------------------------------------------
+#
+# Binding to 127.0.0.1 keeps other machines out, but not other *websites*
+# open in the same browser: any page can fire a cross-origin POST at
+# http://127.0.0.1:<port>/... without the user noticing. Forms and
+# multipart uploads never trigger a CORS preflight, so e.g. a hostile page
+# could upload a gallery item whose filename carries markup (stored in the
+# gallery manifest, rendered by the Display page), stop OpenRGB/
+# SensorHelper, quit shyyctl mid fan-curve, or start a full scan - and via
+# DNS rebinding (attacker's hostname re-pointed at 127.0.0.1) it could even
+# read responses and drive /api/system/update-apply, which downloads and
+# runs an installer. Two cheap checks close all of that: the Host header
+# must name this machine (defeats rebinding), and state-changing requests
+# must come from this app's own origin (defeats cross-site posts). Plain
+# non-browser clients (curl, the single-instance probe below) send no
+# Origin header at all and are unaffected.
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _allowed_hostnames() -> set[str]:
+    names = {"127.0.0.1", "localhost", "::1"}
+    configured = str(CONFIG.get("server", {}).get("host", "")).strip("[]").lower()
+    if configured and configured not in ("0.0.0.0", "::"):
+        names.add(configured)
+    return names
+
+
+_ALLOWED_HOSTNAMES = _allowed_hostnames()
+
+
+def _hostname_of(netloc: str) -> str | None:
+    try:
+        return urllib.parse.urlsplit("//" + netloc).hostname
+    except ValueError:
+        return None
+
+
+def _request_rejection(method: str, headers: dict[str, str]) -> str | None:
+    host = _hostname_of(headers.get("host", ""))
+    if host is not None and host not in _ALLOWED_HOSTNAMES:
+        return f"unexpected Host header {headers.get('host')!r}"
+    if method in _SAFE_METHODS:
+        return None
+    if headers.get("sec-fetch-site") == "cross-site":
+        return "cross-site request refused"
+    origin = headers.get("origin")
+    if origin is not None:
+        parts = urllib.parse.urlsplit(origin)
+        if parts.scheme not in ("http", "https") or parts.hostname not in _ALLOWED_HOSTNAMES:
+            return f"request from origin {origin!r} refused"
+    return None
+
+
+class _LocalOnlyMiddleware:
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+            reason = _request_rejection(scope["method"], headers)
+            if reason:
+                log.warning("refused %s %s: %s", scope["method"], scope.get("path"), reason)
+                await JSONResponse({"detail": reason}, status_code=403)(scope, receive, send)
+                return
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_LocalOnlyMiddleware)
+
+
 def _hex_to_rgb(value: str) -> tuple[int, int, int]:
     value = value.lstrip("#")
     if len(value) != 6:
@@ -1191,9 +1355,8 @@ async def reconnect_all():
     cached state; this is what actually re-probes."""
     hub_ok = await asyncio.to_thread(hub.connect)
     openrgb_ok = await asyncio.to_thread(openrgb.connect)
-    global _panorama
     async with _panorama_lock:
-        _panorama = None
+        _drop_panorama(_panorama)
     panel = await get_panorama()
     return {
         "hub": {"connected": hub_ok, "error": hub.last_error},
@@ -1417,6 +1580,25 @@ class UpdateApplyRequest(BaseModel):
     download_url: str
 
 
+def _is_release_asset_url(url: str) -> bool:
+    """This endpoint downloads and silently runs whatever it's pointed at,
+    so it only ever accepts what update-check itself hands out: an .exe
+    attached to a release of UPDATE_REPO on github.com. Case-insensitive
+    on owner/repo (the API answers with the repo's own casing, e.g.
+    "shyyCTL"), no dot segments or percent-escapes that could walk the
+    path into another repository."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    path = parts.path
+    return (parts.scheme == "https" and parts.netloc.lower() == "github.com"
+            and not parts.query and not parts.fragment
+            and "%" not in path and "/../" not in path and "/./" not in path
+            and path.lower().startswith(f"/{UPDATE_REPO.lower()}/releases/download/")
+            and path.lower().endswith(".exe"))
+
+
 @app.post("/api/system/update-apply")
 async def apply_update(body: UpdateApplyRequest):
     """Downloads the installer .exe an update-check response pointed at
@@ -1435,6 +1617,8 @@ async def apply_update(body: UpdateApplyRequest):
     has no installer.exe concept for this to drive."""
     if not getattr(sys, "frozen", False):
         raise HTTPException(400, "updating only works for the installed app, not a dev run")
+    if not _is_release_asset_url(body.download_url):
+        raise HTTPException(400, "download_url must be an .exe asset of this project's own GitHub releases")
     tmp_path = Path(tempfile.gettempdir()) / "shyyctl-update-setup.exe"
     try:
         await asyncio.to_thread(urllib.request.urlretrieve, body.download_url, tmp_path)
@@ -1482,6 +1666,7 @@ class DutyRequest(BaseModel):
 async def set_fan_duty(channel: str, body: DutyRequest):
     if not hub.connected:
         raise HTTPException(503, "hub not connected")
+    _curve_written.pop(channel, None)
     try:
         applied = await asyncio.to_thread(hub.set_fan, channel, body.duty)
     except HubError as exc:
@@ -1580,6 +1765,12 @@ def _combine_temp(cpu_t: float | None, gpu_t: float | None) -> float | None:
     return max(vals) if vals else None
 
 
+# channel -> (duty, monotonic time) of the last duty _curve_loop actually
+# wrote; see the write-skipping in _curve_loop. Any other writer of a fan's
+# duty (manual slider, scan) clears the entry so the curve re-asserts.
+_curve_written: dict[str, tuple[int, float]] = {}
+
+
 async def _curve_loop():
     """Polls every few seconds rather than reacting to a temp change
     event - there isn't one to react to (CPU/GPU temp are only ever read
@@ -1620,6 +1811,15 @@ async def _curve_loop():
         gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
         temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
         fan_channels = hub.channels.get("fan", []) if hub.connected else []
+        # A running scan drives fans itself (0% to find the start duty,
+        # 100% for max rpm) - writing curve duties in between used to
+        # undo those probes within 4s and skew what the scan measured.
+        # Once it's done, every curve channel gets re-asserted, since the
+        # scan leaves them at its own restore duty.
+        scanning = scan.running
+        if scanning:
+            _curve_written.clear()
+        now = time.monotonic()
         for curve in curves:
             temp_c = temps.get(curve.get("source"))
             channels = [c for c in curve.get("channels", []) if c in fan_channels and c not in scan.absent]
@@ -1627,11 +1827,22 @@ async def _curve_loop():
             if temp_c is not None and channels:
                 duty = _curve_duty_for_temp(
                     curve.get("points") or [], CONFIG["curve"].get("min_duty", 20), temp_c)
-                if hub.connected:
+                if hub.connected and not scanning:
                     for channel in channels:
+                        # The hub keeps a duty until told otherwise, so an
+                        # unchanged value isn't re-sent every 4s - every
+                        # write is a whole liquidctl process plus HID
+                        # traffic. Still re-asserted every minute in case
+                        # something else (a hub reset, another tool)
+                        # changed it behind our back.
+                        last = _curve_written.get(channel)
+                        if last is not None and last[0] == duty and now - last[1] < 60:
+                            continue
                         try:
                             await asyncio.to_thread(hub.set_fan, channel, duty)
+                            _curve_written[channel] = (duty, now)
                         except Exception as exc:
+                            _curve_written.pop(channel, None)
                             log.warning("curve %s: could not set %s to %s%%: %s",
                                        curve.get("id"), channel, duty, exc)
             statuses.append({"id": curve.get("id"), "temp_c": temp_c, "duty": duty})
@@ -2409,9 +2620,25 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             start = time.monotonic()
             hub_failures = 0
             bridge_failures = 0
+            # target -> (frame, monotonic time) of the last successful
+            # write. A frame identical to the one already on the hardware
+            # isn't sent again (static effects, breathing/strobe plateaus,
+            # ambient between its 2fps samples, LEDs outside a selection)
+            # - every write is real work for OpenRGB, RAM especially (each
+            # one is a series of slow SMBus transactions), which showed up
+            # as OpenRGB sitting near a full core while an effect ran. Still
+            # re-sent every 2s so a device that reset or lost a write
+            # comes back on its own.
+            last_sent: dict[tuple, tuple[list, float]] = {}
+
+            def unchanged(key, frame, now):
+                prev = last_sent.get(key)
+                return prev is not None and prev[0] == frame and now - prev[1] < 2.0
+
             while not _effect_stop.is_set():
                 if moving:
                     phase[0] = ((time.monotonic() - start) / period_s) % 1.0
+                now = time.monotonic()
 
                 if shape == "ambient" and time.monotonic() - last_ambient_check > 2.0:
                     # Cheap enough to just do every couple seconds
@@ -2431,7 +2658,10 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             unit_leds, frame = frame_colors(u)
                             if len(unit_leds) != zone.leds_count:
                                 continue
+                            if unchanged(("hub", u["id"]), frame, now):
+                                continue
                             raw.set_zone_colors(ctrl.index, zone.index, frame)
+                            last_sent[("hub", u["id"])] = (frame, now)
                             hub_failures = 0
                         except Exception as exc:
                             # A single bad write here (e.g. a transient
@@ -2471,14 +2701,18 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                                 raw.select_mode(ctrl, "direct")
                             log.info("effect: reconnected to the hub after repeated write failures")
                             hub_failures = 0
+                            last_sent.clear()
                         except Exception as exc:
                             log.debug("effect: hub reconnect failed: %s", exc)
                             hub_failures = 2
 
                 for u, device in ram_targets:
                     _, frame = frame_colors(u)
+                    if unchanged(("ram", u["id"]), frame, now):
+                        continue
                     try:
                         openrgb.set_zone_colors_by_index(device, 0, frame)
+                        last_sent[("ram", u["id"])] = (frame, now)
                         bridge_failures = 0
                     except Exception as exc:
                         log.debug("effect: RAM write failed for %s: %s", u["id"], exc)
@@ -2487,12 +2721,14 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 if mobo_target is not None:
                     u, device, zone_index = mobo_target
                     _, frame = frame_colors(u)
-                    try:
-                        openrgb.set_zone_colors_by_index(device, zone_index, frame)
-                        bridge_failures = 0
-                    except Exception as exc:
-                        log.debug("effect: motherboard write failed: %s", exc)
-                        bridge_failures += 1
+                    if not unchanged(("mobo", u["id"]), frame, now):
+                        try:
+                            openrgb.set_zone_colors_by_index(device, zone_index, frame)
+                            last_sent[("mobo", u["id"])] = (frame, now)
+                            bridge_failures = 0
+                        except Exception as exc:
+                            log.debug("effect: motherboard write failed: %s", exc)
+                            bridge_failures += 1
 
                 if bridge_failures >= 3 and (ram_targets or mobo_target is not None):
                     # Same reasoning as the hub reconnect above, for
@@ -2516,6 +2752,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             openrgb.select_mode(mobo_target[1], "direct")
                         log.info("effect: reconnected to OpenRGB after repeated RAM/mobo write failures")
                         bridge_failures = 0
+                        last_sent.clear()
                     except Exception as exc:
                         log.debug("effect: OpenRGB reconnect failed: %s", exc)
                         bridge_failures = 2
@@ -2844,12 +3081,11 @@ async def _call_panel(fn, *args, **kwargs):
     get_panorama()'s normal reconnect path instead of reusing the same
     broken handle and crashing identically every time until the whole
     server restarts."""
-    global _panorama
     try:
         return await asyncio.to_thread(fn, *args, **kwargs)
     except PanoramaError as exc:
         log.warning("panel command failed, dropping the cached connection: %s", exc)
-        _panorama = None
+        _drop_panorama(getattr(fn, "__self__", None) or _panorama)
         raise HTTPException(503, f"lost the panel connection mid-command ({exc}) - "
                                   "another program (KANALI?) may have grabbed it; try again")
 
@@ -2926,6 +3162,18 @@ async def panorama_brightness(body: BrightnessRequest):
 # actions on a gallery tile, same as they were as separate buttons
 # before, just scoped to one cached item instead of one ad-hoc upload.
 
+_GALLERY_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _gallery_item_dir(item_id: str) -> Path:
+    """Gallery ids are generated here (uuid hex) - anything else, in
+    particular ".." (a legal single path segment), is refused before it
+    gets joined onto GALLERY_DIR."""
+    if not _GALLERY_ID_RE.fullmatch(item_id):
+        raise HTTPException(404, "no such gallery item")
+    return GALLERY_DIR / item_id
+
+
 @app.get("/api/panorama/gallery")
 async def gallery_list():
     return _load_gallery()
@@ -2937,9 +3185,15 @@ async def gallery_upload(file: UploadFile = File(...)):
     item_id = uuid.uuid4().hex[:12]
     item_dir = GALLERY_DIR / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(file.filename or "upload").suffix or ".png"
+    suffix = Path(file.filename or "upload").suffix.lower() or ".png"
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        suffix = ".bin"
     original_path = item_dir / f"original{suffix}"
-    original_path.write_bytes(await file.read())
+    # Streamed to disk in chunks rather than file.read() into one bytes
+    # object - a gallery video can be hundreds of MB.
+    with original_path.open("wb") as out:
+        while chunk := await file.read(1024 * 1024):
+            out.write(chunk)
     has_thumb = await asyncio.to_thread(
         generate_thumbnail, str(original_path), str(item_dir / "thumb.jpg"))
     entry = {
@@ -2954,7 +3208,7 @@ async def gallery_upload(file: UploadFile = File(...)):
 
 @app.get("/api/panorama/gallery/{item_id}/thumb")
 async def gallery_thumb(item_id: str):
-    thumb_path = GALLERY_DIR / item_id / "thumb.jpg"
+    thumb_path = _gallery_item_dir(item_id) / "thumb.jpg"
     if not thumb_path.is_file():
         raise HTTPException(404, "no thumbnail")
     return FileResponse(thumb_path, media_type="image/jpeg")
@@ -2962,7 +3216,7 @@ async def gallery_thumb(item_id: str):
 
 @app.get("/api/panorama/gallery/{item_id}/original")
 async def gallery_original(item_id: str):
-    item_dir = GALLERY_DIR / item_id
+    item_dir = _gallery_item_dir(item_id)
     if not item_dir.is_dir():
         raise HTTPException(404, "no such item")
     original = next(item_dir.glob("original.*"), None)
@@ -2974,7 +3228,7 @@ async def gallery_original(item_id: str):
 
 
 async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
-    item_dir = GALLERY_DIR / item_id
+    item_dir = _gallery_item_dir(item_id)
     original = next(item_dir.glob("original.*"), None) if item_dir.is_dir() else None
     if original is None:
         raise HTTPException(404, "no such gallery item")
@@ -3030,6 +3284,7 @@ async def gallery_set_boot(item_id: str):
 
 @app.delete("/api/panorama/gallery/{item_id}")
 async def gallery_delete(item_id: str):
+    _gallery_item_dir(item_id)
     items = _load_gallery()
     remaining = [i for i in items if i["id"] != item_id]
     if len(remaining) == len(items):

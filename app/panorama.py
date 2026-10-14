@@ -75,7 +75,6 @@ import logging
 import random
 import struct
 import subprocess
-import time
 from pathlib import Path
 
 from app.procflags import NO_WINDOW
@@ -482,7 +481,14 @@ def encode_to_h264(local_path: str, width: int = MEDIA_WIDTH, height: int = MEDI
         "-f", "h264", "-",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+        # 60s used to be the cap here - fine for a looped still image, but
+        # a real video gets re-encoded in full at 2240x1080/crf 18, which
+        # for anything past roughly half a minute of footage regularly
+        # takes longer than that on a normal desktop CPU, so longer clips
+        # simply failed with "media encode failed". This runs off the
+        # panel lock (see build_encoded_media_container), so a long encode
+        # no longer blocks anything else either.
+        result = subprocess.run(cmd, capture_output=True, timeout=900, creationflags=NO_WINDOW)
     except FileNotFoundError:
         log.error("ffmpeg not found (checked vendor/ffmpeg.exe and PATH) - "
                   "run tools/setup_vendor.py or install ffmpeg manually")
@@ -1240,7 +1246,6 @@ def find_usb_panel(timeout: float = 1.0) -> "PanoramaUSB | None":
 # this the same as everything else ported from documentation rather than
 # a live test in this codebase.
 
-import ctypes
 from ctypes import wintypes
 
 GUID_DEVINTERFACE_USBPRINT = "{28D78FAD-5A12-11D1-AE5B-0000F803A8C2}"

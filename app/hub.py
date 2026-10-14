@@ -28,7 +28,10 @@ Facts confirmed against real hardware, not assumptions:
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
+import threading
 import time
 
 from app.procflags import NO_WINDOW
@@ -41,6 +44,38 @@ FIRMWARE_MODES = ("off", "fixed", "fading", "spectrum-wave",
 # Windows consoles default to cp1252; forcing utf-8 on the child avoids a
 # UnicodeEncodeError crash when liquidctl prints box-drawing characters.
 _ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+# One liquidctl process at a time, ever. Every call here is a separate
+# liquidctl subprocess opening the hub's HID interface on its own, and
+# several callers run concurrently (the Fans/Status poll, the fan-curve
+# loop setting duties, a scan, a manual slider, more than one browser
+# tab) - two processes talking to the same HID device at once read each
+# other's replies, which is exactly liquidctl's "missing messages
+# (attempts=12, missing=1)" failure seen hundreds of times in real logs.
+_LIQUIDCTL_LOCK = threading.Lock()
+
+_liquidctl_cmd: list[str] | None = None
+
+
+def _liquidctl_command() -> list[str]:
+    """liquidctl on PATH if there is one (unchanged behaviour for anyone
+    who installed it themselves), otherwise the copy bundled into this
+    build: the installed exe re-invokes itself with --liquidctl (see the
+    top of main.py), a dev checkout uses `python -m liquidctl`. Before
+    this, the installed app silently depended on a separate Python +
+    liquidctl install being on PATH - without one, every fan call failed
+    with "liquidctl not found" even though liquidctl is bundled."""
+    global _liquidctl_cmd
+    if _liquidctl_cmd is None:
+        found = shutil.which("liquidctl")
+        if found:
+            _liquidctl_cmd = [found]
+        elif getattr(sys, "frozen", False):
+            _liquidctl_cmd = [sys.executable, "--liquidctl"]
+        else:
+            _liquidctl_cmd = [sys.executable, "-m", "liquidctl"]
+        log.info("using liquidctl via: %s", " ".join(_liquidctl_cmd))
+    return _liquidctl_cmd
 
 
 class HubError(Exception):
@@ -56,6 +91,7 @@ class Hub:
         self.channels: dict[str, list[str]] = {"fan": [], "led": []}
         self.modes = list(FIRMWARE_MODES)
         self.supports_per_led = False  # confirmed: super-fixed unsupported
+        self._status_cache: tuple[float, list[dict]] | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -93,6 +129,7 @@ class Hub:
 
     def set_fan(self, channel: str, duty: int) -> int:
         duty = max(0, min(100, int(duty)))
+        self._status_cache = None  # the next status()/rpm() must see the new speed
         if self._run("set", channel, "speed", str(duty), match=self.match) is None:
             raise HubError(f"Could not set {channel} to {duty}%.")
         return duty
@@ -107,8 +144,19 @@ class Hub:
         than anything liquidctl retries internally, so a couple of retries
         here (not just liquidctl's own) are worth it before actually
         reporting no readings."""
+        # Several pollers ask for this every few seconds (the Fans/Status
+        # pages, one per open tab) - each answer used to cost a whole
+        # liquidctl process. A reading a second or two old is still current
+        # for a fan, and set_fan() clears this so a fresh duty is never
+        # masked (scan.py's start-duty probing depends on that).
+        cached = self._status_cache
+        if cached is not None and time.monotonic() - cached[0] < 1.5:
+            return [dict(r) for r in cached[1]]
         out = self._run("status", "--verbose", match=self.match, retries=3, retry_delay=0.3)
-        return self._parse_status(out) if out is not None else []
+        readings = self._parse_status(out) if out is not None else []
+        if readings:
+            self._status_cache = (time.monotonic(), readings)
+        return [dict(r) for r in readings]
 
     def rpm(self, channel: str) -> int | None:
         if not channel.startswith("fan"):
@@ -152,18 +200,19 @@ class Hub:
         from liquidctl.driver.control_hub import ControlHub
 
         ids: dict[str, int] = {}
-        for device in ControlHub.find_supported_devices():
-            if self.match.lower() not in device.description.lower():
-                continue
-            device.connect()
-            try:
-                for key, value, _unit in device.initialize():
-                    found = re.match(r"LED (\d+) accessory 1$", key)
-                    if found:
-                        ids[f"led{found.group(1)}"] = getattr(value, "value", value)
-            finally:
-                device.disconnect()
-            break
+        with _LIQUIDCTL_LOCK:
+            for device in ControlHub.find_supported_devices():
+                if self.match.lower() not in device.description.lower():
+                    continue
+                device.connect()
+                try:
+                    for key, value, _unit in device.initialize():
+                        found = re.match(r"LED (\d+) accessory 1$", key)
+                        if found:
+                            ids[f"led{found.group(1)}"] = getattr(value, "value", value)
+                finally:
+                    device.disconnect()
+                break
         return ids
 
     # -- internals -----------------------------------------------------
@@ -184,7 +233,7 @@ class Hub:
         command's stdout instead of None meant those checks could never
         actually catch a real liquidctl error, only a missing binary or a
         hang."""
-        cmd = ["liquidctl"] + (["-m", match] if match else []) + list(args)
+        cmd = _liquidctl_command() + (["-m", match] if match else []) + list(args)
         for attempt in range(retries):
             try:
                 # encoding="utf-8" explicitly, not just text=True: the child
@@ -193,11 +242,12 @@ class Hub:
                 # platform default (cp1252 on Windows) and mangles every
                 # box-drawing character, which then breaks every
                 # downstream regex silently.
-                result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                                         errors="replace", timeout=30, env=_ENV,
-                                         creationflags=NO_WINDOW)
+                with _LIQUIDCTL_LOCK:
+                    result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                             errors="replace", timeout=30, env=_ENV,
+                                             creationflags=NO_WINDOW)
             except FileNotFoundError:
-                log.error("liquidctl not found on PATH")
+                log.error("liquidctl not found (%s)", cmd[0])
                 return None
             except subprocess.TimeoutExpired:
                 log.error("liquidctl timed out: %s", " ".join(cmd))

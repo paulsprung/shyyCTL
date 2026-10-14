@@ -16,6 +16,7 @@ rather than reopening it constantly.
 import logging
 import subprocess
 import threading
+import time
 
 from .panorama import resolve_ffmpeg_path
 from .procflags import NO_WINDOW
@@ -35,12 +36,18 @@ SAMPLE_FPS = 2  # LEDs don't need video frame rate, just to track big colour cha
 
 class AmbientSampler:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # guards _zones
+        self._state_lock = threading.Lock()  # guards source switching below
         self._zones = {"top": (0, 0, 0), "bottom": (0, 0, 0), "left": (0, 0, 0), "right": (0, 0, 0)}
         self._path: str | None = None
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+        # One Event per started source rather than one shared flag: a
+        # shared flag was cleared again by the very next set_source(), so
+        # an old decode thread that hadn't noticed its stop yet kept
+        # running (and kept overwriting zones) alongside the new one.
+        self._run_stop: threading.Event | None = None
+        self._started_at = 0.0
 
     def zones(self) -> dict[str, tuple[int, int, int]]:
         with self._lock:
@@ -51,31 +58,51 @@ class AmbientSampler:
         seconds from the effect loop (see main.py's _run_position_effect)
         to notice the human switching what's applied to the panel while
         ambient is running, without restarting the decode on every one
-        of those checks when nothing actually changed."""
-        if path == self._path:
-            return
-        self.stop()
-        self._path = path
-        self._stop.clear()
-        if is_video:
-            self._thread = threading.Thread(target=self._decode_loop, args=(path,), daemon=True)
+        of those checks when nothing actually changed. A video decoder
+        that has died (ffmpeg crashed, file briefly unreadable) is
+        restarted on one of these calls instead of leaving the colours
+        frozen for the rest of the effect - at most every 10s, so a file
+        ffmpeg can't decode at all doesn't respawn it every 2s."""
+        with self._state_lock:
+            if path == self._path:
+                alive = self._thread is not None and self._thread.is_alive()
+                if not is_video or alive or time.monotonic() - self._started_at < 10:
+                    return
+            self._stop_locked()
+            self._path = path
+            stop = threading.Event()
+            self._run_stop = stop
+            self._started_at = time.monotonic()
+            target = self._decode_loop if is_video else self._sample_image_once
+            self._thread = threading.Thread(target=target, args=(path, stop), daemon=True)
             self._thread.start()
-        else:
-            threading.Thread(target=self._sample_image_once, args=(path,), daemon=True).start()
 
     def stop(self):
-        self._stop.set()
-        if self._proc is not None:
+        with self._state_lock:
+            self._stop_locked()
+
+    def _stop_locked(self):
+        if self._run_stop is not None:
+            self._run_stop.set()
+            self._run_stop = None
+        proc, self._proc = self._proc, None
+        if proc is not None:
             try:
-                self._proc.kill()
+                proc.kill()
             except Exception:
                 pass
-            self._proc = None
         self._path = None
+        self._thread = None
 
-    def _decode_loop(self, path: str):
+    def _decode_loop(self, path: str, stop: threading.Event):
         ffmpeg_path = resolve_ffmpeg_path()
-        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-stream_loop", "-1", "-i", path,
+        # -re: read the input at its native frame rate. Without it ffmpeg
+        # decodes as fast as the CPU allows - and with this loop pulling
+        # each 48-byte frame immediately there's no back-pressure at all,
+        # so it burned a full core re-decoding the (2240px-wide) video
+        # over and over, with the sampled colours racing far ahead of
+        # what the panel was actually showing.
+        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-re", "-stream_loop", "-1", "-i", path,
                "-vf", f"scale={GRID_W}:{GRID_H}", "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-r", str(SAMPLE_FPS), "-"]
         try:
@@ -87,26 +114,30 @@ class AmbientSampler:
         except Exception as exc:
             log.warning("ambient: could not start ffmpeg for %s: %s", path, exc)
             return
-        # self._proc is only for stop()'s external kill of "whatever's
-        # current" - this thread's own read loop and cleanup use the local
-        # `proc` throughout, so a fast media switch (stop() starting a new
-        # thread and thus a new self._proc while this thread is still
-        # unwinding) can't make this thread's finally-block kill the *new*
-        # process instead of its own already-dead one.
-        self._proc = proc
+        # Registered for stop() under the same lock stop() takes, and only
+        # if this run wasn't already stopped while Popen was starting -
+        # otherwise nothing would ever kill this process.
+        with self._state_lock:
+            if stop.is_set():
+                proc.kill()
+                return
+            self._proc = proc
         try:
-            while not self._stop.is_set():
+            while not stop.is_set():
                 data = proc.stdout.read(FRAME_BYTES)
                 if not data or len(data) < FRAME_BYTES:
-                    break  # video ended without -stream_loop looping (or the process died) - stop quietly
+                    break  # the process died or was killed - set_source restarts it if still wanted
+                if stop.is_set():
+                    break
                 self._update_zones_from_frame(data)
         finally:
             try:
                 proc.kill()
+                proc.wait(timeout=2)
             except Exception:
                 pass
 
-    def _sample_image_once(self, path: str):
+    def _sample_image_once(self, path: str, stop: threading.Event):
         """A static image never changes frame to frame - one decode, not
         a persistent process left running to redundantly redecode the
         same pixels every 0.5s."""
@@ -117,7 +148,7 @@ class AmbientSampler:
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     timeout=10, creationflags=NO_WINDOW)
-            if len(result.stdout) >= FRAME_BYTES:
+            if len(result.stdout) >= FRAME_BYTES and not stop.is_set():
                 self._update_zones_from_frame(result.stdout[:FRAME_BYTES])
         except Exception as exc:
             log.warning("ambient: could not sample image %s: %s", path, exc)
