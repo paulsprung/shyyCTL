@@ -2835,10 +2835,16 @@ async function startLedOrderTest(unitId){
   const start = performance.now();
   function frame(now){
     const step = Math.floor((now - start) / 1000 / LED_TEST_STEP_S) % n;
+    // Same as main.py's _chase_level: full white for the leading LED,
+    // halving behind it, black elsewhere - brightness only, no hue.
     for(const l of leds){
-      const on = ((step - l.index + n) % n) < LED_TEST_WINDOW;
+      const back = (step - l.index + n) % n;
       const el = document.getElementById(`setupLed-${unitId}-${l.index}`);
-      if(el) el.setAttribute("fill", on ? "#ffffff" : "var(--rule)");
+      if(!el) continue;
+      const v = back < LED_TEST_WINDOW ? (255 >> back) : 0;
+      el.setAttribute("fill", `rgb(${v},${v},${v})`);
+      el.setAttribute("stroke", "#000");
+      el.setAttribute("r", back === 0 ? "5" : "3");
     }
     ledTestRaf = requestAnimationFrame(frame);
   }

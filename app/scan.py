@@ -477,7 +477,17 @@ class Scan:
             return
         try:
             mobo = self.openrgb.motherboard()
-            self.mobo = {"name": mobo[0].name, "leds": len(mobo[0].leds)} if mobo else None
+            # The real zone's LEDs, not the whole device's: on the X870-F
+            # that's 3 ('Aura Mainboard') rather than 27 - the other 24 are
+            # the empty ARGB headers, and the effect writes the real zone
+            # only (see OpenRgbBridge.real_zone_index).
+            if mobo:
+                zone_index = self.openrgb.real_zone_index(mobo[0])
+                count = (len(mobo[0].zones[zone_index].leds) if zone_index is not None
+                         else len(mobo[0].leds))
+                self.mobo = {"name": mobo[0].name, "leds": count}
+            else:
+                self.mobo = None
         except Exception as exc:
             log.warning("Could not read motherboard from OpenRGB: %s", exc)
         if self._cancel.is_set():

@@ -1031,19 +1031,20 @@ def _set_autostart(enabled: bool):
                 pass
 
 
-async def _reapply_rgb_state():
+async def _reapply_rgb_state(hub_only: bool = False):
     """Pushes every colour saved by _save_rgb_state_entry back to the
     hardware. Called unconditionally on every launch, same reasoning as
     the saved position effect and Panorama's last-applied media/
     brightness: OpenRGB gives no way to read a device's actual current
     colour back, so there's no "only if not already set" check possible -
     only "always re-apply, best effort, one target's failure doesn't
-    block the rest"."""
+    block the rest". hub_only skips motherboard and RAM (see
+    _reapply_hub_rgb_state_delayed)."""
     state = _load_rgb_state()
     if not state:
         return
 
-    mobo = state.get("mobo", {}).get("0")
+    mobo = None if hub_only else state.get("mobo", {}).get("0")
     if mobo:
         try:
             devices = await asyncio.to_thread(openrgb.motherboard)
@@ -1053,7 +1054,7 @@ async def _reapply_rgb_state():
         except Exception as exc:
             log.warning("could not reapply saved motherboard colour: %s", exc)
 
-    ram_state = state.get("ram", {})
+    ram_state = {} if hub_only else state.get("ram", {})
     if ram_state:
         try:
             devices = await asyncio.to_thread(openrgb.ram)
@@ -1094,11 +1095,23 @@ async def _reapply_hub_rgb_state_delayed():
     reapplying hub channel colours immediately after connecting would
     silently skip all of them. Waits long enough for a "quick" scan to
     realistically have finished before trying, rather than blocking
-    server startup on it."""
+    server startup on it.
+
+    Hub channels only, and not at all while an effect runs or is about to
+    be resumed: this used to re-apply motherboard and RAM too, right as a
+    resumed effect started - switching both back to a static mode the
+    effect never leaves again (it selects Direct once, at its start), so
+    the board stayed dark for the whole effect. Direct hub control needs
+    none of this - its channels are sized without a scan, so the first
+    reapply already reached them."""
+    if HUB_DIRECT:
+        return
     await asyncio.sleep(10)
+    if _effect_status.get("running") or EFFECT_STATE_FILE.is_file():
+        return
     state = _load_rgb_state()
     if state.get("hub"):
-        await _reapply_rgb_state()
+        await _reapply_rgb_state(hub_only=True)
 
 
 async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
@@ -2456,6 +2469,17 @@ SHAPES = ("wave", "breathing", "strobe", "pulse", "sweep", "sparkle", "fire", "c
           "wipe", "pulse_ring", "meteor", "ambient")
 
 
+def _fit_frame(frame: list, count: int) -> list:
+    """A frame resampled to the LED count of the zone it is written to.
+    Layouts scanned before scan.py counted only the motherboard's real zone
+    hold the whole device's LED count (27 on the X870-F, 3 of them real),
+    and OpenRGB rejects a zone write whose length doesn't match - the board
+    stayed dark through every effect."""
+    if len(frame) == count or not frame:
+        return frame
+    return [frame[min(len(frame) - 1, int((i + 0.5) * len(frame) / count))] for i in range(count)]
+
+
 def _resolve_effect_targets():
     """Every real per-LED write target the position effect can drive,
     resolved once (not per-frame - re-resolving RAM/mobo every frame
@@ -3012,6 +3036,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 if mobo_target is not None:
                     u, device, zone_index = mobo_target
                     _, frame = frame_colors(u)
+                    frame = _fit_frame(frame, len(device.zones[zone_index].leds))
                     if not unchanged(("mobo", u["id"]), frame, now):
                         try:
                             openrgb.set_zone_colors_by_index(device, zone_index, frame)
@@ -3056,6 +3081,15 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     _end_effect(stop)
 
 
+def _chase_level(back: int, window: int) -> tuple[int, int, int]:
+    """White at full brightness for the leading LED (back == 0), halving
+    for each LED behind it, off outside the window."""
+    if back >= window:
+        return (0, 0, 0)
+    v = 255 >> back
+    return (v, v, v)
+
+
 def _run_chase_effect(channel: str, window: int, step_s: float,
                       stop: threading.Event | None = None):
     """A calibration tool, not a look - lights a sliding window of `window`
@@ -3081,10 +3115,13 @@ def _run_chase_effect(channel: str, window: int, step_s: float,
                 return
             step = 0
             while not stop.is_set():
-                colors = [
-                    (255, 255, 255) if (step - i) % n < window else (0, 0, 0)
-                    for i in range(n)
-                ]
+                # A bright leading LED with a dimming tail on black - the
+                # canvas draws the same, so start point and direction read
+                # by brightness alone, no colour needed (see
+                # startLedOrderTest; hue cues are useless to a
+                # colour-blind user, and all-white on the canvas's
+                # light-grey off dots was barely visible).
+                colors = [_chase_level((step - i) % n, window) for i in range(n)]
                 leds.write(channel, colors)
                 step = (step + 1) % n
                 stop.wait(step_s)
