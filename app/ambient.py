@@ -8,17 +8,20 @@ line from the display's centre towards the LED leaves the picture - so
 the fans to the right of the panel glow in what's at its right edge,
 those above in what's at its top, and so on round the case.
 
-One long-lived ffmpeg subprocess per source (not re-invoked per frame) -
-video decode overhead should happen once regardless of how many frames
-the effect loop consumes from it, same reasoning app/openrgb_raw.py's
-docstring gives for holding one hub connection open for a whole effect
-rather than reopening it constantly.
+A video is decoded once, not continuously: the first time it's used, its
+32x16 frames (at the sampling rate) go into a small file next to it
+(_build_frames), and from then on they're simply stepped through in time -
+no ffmpeg running at all. Decoding the panel's 2240x1080 video live for a
+32x16 edge cost ~10% of a core and ~70MB for as long as the effect ran.
+Only a video too long for that (see MAX_CACHED_FRAMES) is still decoded
+live, cheaply, by one long-lived ffmpeg process.
 """
 
 import logging
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 from .panorama import resolve_ffmpeg_path
 from .procflags import NO_WINDOW
@@ -39,6 +42,9 @@ FRAME_BYTES = GRID_W * GRID_H * 3  # rgb24
 SAMPLE_FPS = 10
 # The panel's picture (2240x1080) - the shape the edge is projected from.
 MEDIA_ASPECT = 2240 / 1080
+# Videos longer than this many sampled frames (~20 minutes at 10 fps, ~20MB
+# of 32x16 frames) aren't precomputed but decoded live (_live_decode_loop).
+MAX_CACHED_FRAMES = 13_000
 
 _BLACK_EDGES = {"top": [(0, 0, 0)] * GRID_W, "bottom": [(0, 0, 0)] * GRID_W,
                 "left": [(0, 0, 0)] * GRID_H, "right": [(0, 0, 0)] * GRID_H}
@@ -121,7 +127,7 @@ class AmbientSampler:
             stop = threading.Event()
             self._run_stop = stop
             self._started_at = time.monotonic()
-            target = self._decode_loop if is_video else self._sample_image_once
+            target = self._play_video if is_video else self._sample_image_once
             self._thread = threading.Thread(target=target, args=(path, stop), daemon=True)
             self._thread.start()
 
@@ -142,7 +148,93 @@ class AmbientSampler:
         self._path = None
         self._thread = None
 
-    def _decode_loop(self, path: str, stop: threading.Event):
+    def _play_video(self, path: str, stop: threading.Event):
+        """Steps through the video's precomputed 32x16 frames in time,
+        looping like the panel does; decodes live only if the video is too
+        long to precompute (or precomputing failed)."""
+        frames = self._cached_frames(path, stop)
+        if stop.is_set():
+            return
+        if not frames:
+            self._live_decode_loop(path, stop)
+            return
+        count = len(frames) // FRAME_BYTES
+        start = time.monotonic()
+        shown = -1
+        while not stop.is_set():
+            index = int((time.monotonic() - start) * self._fps) % count
+            if index != shown:
+                self._update_zones_from_frame(frames[index * FRAME_BYTES:(index + 1) * FRAME_BYTES])
+                shown = index
+            stop.wait(1 / self._fps / 2)
+
+    def _cache_file(self, path: str) -> Path:
+        source = Path(path)
+        return source.with_name(f"{source.name}.edges-{GRID_W}x{GRID_H}-{self._fps}fps.rgb")
+
+    def _cached_frames(self, path: str, stop: threading.Event) -> bytes | None:
+        cache = self._cache_file(path)
+        try:
+            if cache.stat().st_mtime >= Path(path).stat().st_mtime:
+                data = cache.read_bytes()
+                if data and len(data) % FRAME_BYTES == 0:
+                    return data
+        except OSError:
+            pass
+        data = self._build_frames(path, stop)
+        if data:
+            try:
+                tmp = cache.with_name(cache.name + ".tmp")
+                tmp.write_bytes(data)
+                tmp.replace(cache)
+            except OSError as exc:
+                log.debug("ambient: could not keep %s: %s", cache, exc)
+        return data
+
+    def _build_frames(self, path: str, stop: threading.Event) -> bytes | None:
+        """Every frame of the video at the sampling rate, scaled to 32x16 -
+        one ffmpeg run as fast as it can go (a second or two for a short
+        clip). None if it fails or the video is too long to keep."""
+        cmd = [resolve_ffmpeg_path(), "-nostdin", "-loglevel", "error", "-skip_loop_filter", "all",
+               "-flags2", "fast", "-i", path, "-an", "-sn", "-dn",
+               "-vf", f"scale={GRID_W}:{GRID_H}:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-r", str(self._fps), "-"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW)
+        except Exception as exc:
+            log.warning("ambient: could not start ffmpeg for %s: %s", path, exc)
+            return None
+        with self._state_lock:
+            if stop.is_set():
+                proc.kill()
+                return None
+            self._proc = proc
+        chunks, size = [], 0
+        try:
+            while not stop.is_set():
+                block = proc.stdout.read(FRAME_BYTES * 64)
+                if not block:
+                    break
+                chunks.append(block)
+                size += len(block)
+                if size > MAX_CACHED_FRAMES * FRAME_BYTES:
+                    log.info("ambient: %s is too long to precompute - decoding it live", path)
+                    return None
+        finally:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        data = b"".join(chunks)
+        data = data[:len(data) - len(data) % FRAME_BYTES]
+        if stop.is_set() or not data:
+            return None
+        log.info("ambient: %s precomputed - %d frames", Path(path).name, len(data) // FRAME_BYTES)
+        return data
+
+    def _live_decode_loop(self, path: str, stop: threading.Event):
         ffmpeg_path = resolve_ffmpeg_path()
         # -re: read the input at its native frame rate. Without it ffmpeg
         # decodes as fast as the CPU allows - and with this loop pulling
