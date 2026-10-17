@@ -612,6 +612,12 @@ class _PanoramaBase:
         self.last_brightness: int = 100
         self.last_poweron_media: str = DEFAULT_POWERON_MEDIA
         self.last_standby_media: str = DEFAULT_STANDBY_MEDIA
+        # time.monotonic() when the panel last started its media from the
+        # beginning, as far as shyyctl can tell: a switch to another file,
+        # or the first screen config on a fresh connection (the panel had
+        # gone back to its own content). There's no playback position to
+        # read back - the ambient effect runs its timeline from this.
+        self.media_started_at: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -861,7 +867,10 @@ class _PanoramaBase:
             poweron_media = self.last_poweron_media
         if standby_media is None:
             standby_media = self.last_standby_media
+        restarts = self.media_started_at is None or active_media != self.last_media
         self._write(build_screen_config_frame(active_media, brightness, poweron_media, standby_media))
+        if restarts:
+            self.media_started_at = time.monotonic()
         ok = self._read_reply(600, timeout_s) is not None
         self._write(build_commit_frame())
         # Confirmed against real captured traffic: the device replies to

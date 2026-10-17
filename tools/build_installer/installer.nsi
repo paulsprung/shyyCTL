@@ -152,8 +152,12 @@ Section "Uninstall"
   ; Starting OpenRGB/SensorHelper without a UAC prompt, if it was set up
   ; (Settings): its scheduled tasks and the protected copies under
   ; Program Files - only removable with admin rights, so one prompt.
+  ; Left to shyyctl.exe itself (the same code as Settings' "Undo"): an
+  ; uninstaller that starts PowerShell hidden, elevated and with the
+  ; execution policy bypassed is what Defender's machine-learning
+  ; detection reported as Trojan:Win32/Bearfoos.A!ml for v1.0.9/v1.0.10.
   IfFileExists "$PROGRAMFILES64\shyyctl\helpers\*.*" 0 no_elevated_helpers
-    ExecShellWait "runas" "powershell.exe" '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\_internal\elevated_helpers.ps1" -Action remove' SW_HIDE
+    ExecWait '"$INSTDIR\shyyctl.exe" --remove-elevated-helpers'
   no_elevated_helpers:
 
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\shyyctl"

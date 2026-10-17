@@ -300,6 +300,19 @@
   }
   @media (max-width:640px){.effects-side .effect-grid-3{grid-template-columns:1fr}}
 
+  /* RGB > Effects > Ambient: the frame the light is taken at, drawn over
+     the video itself */
+  .amb-frame{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:8px;
+    overflow:hidden;touch-action:none;user-select:none;box-shadow:inset 0 0 0 1px var(--rule)}
+  .amb-frame-media,.amb-frame-media > *{position:absolute;inset:0;width:100%;height:100%}
+  .amb-frame-media > video,.amb-frame-media > img{object-fit:fill}
+  .amb-frame-media > span{display:flex;align-items:center;justify-content:center;color:#8a8f96;
+    font:11px var(--mono);padding:12px;text-align:center;box-sizing:border-box}
+  .amb-frame-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .amb-sliders{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;
+    font-size:11.5px;color:var(--ink-soft)}
+  .amb-sliders output{font-family:var(--mono);font-size:11px;color:var(--ink);min-width:58px;text-align:right}
+
   /* Status > overview */
   .overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
   .ov-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:16px;
@@ -499,7 +512,33 @@
             <div class="row" id="effectColorsRow" style="flex-wrap:wrap;gap:14px"></div>
           </div>
 
-          <div class="effect-grid" style="align-items:end;margin-bottom:0">
+          <div class="prop" id="ambientFrameProp" style="display:none">
+            <label>Where the light is taken from</label>
+            <div class="amb-frame" id="ambFrameBox" onpointerdown="ambFramePointerDown(event)"
+              onpointermove="ambFramePointerMove(event)" onpointerup="ambFramePointerUp(event)"
+              onpointercancel="ambFramePointerUp(event)">
+              <div class="amb-frame-media" id="ambFrameMedia"></div>
+              <svg class="amb-frame-overlay" id="ambFrameOverlay" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
+            </div>
+            <div class="note" style="margin:7px 0 12px">The bright line is the edge the fans continue; the
+              striped band inside it is averaged. Drag a side of the frame, or use the sliders.</div>
+            <div class="amb-sliders">
+              <span>Left</span><input type="range" id="ambLeft" min="0" max="45" step="1" oninput="ambFrameInput()"><output id="ambLeftV"></output>
+              <span>Right</span><input type="range" id="ambRight" min="0" max="45" step="1" oninput="ambFrameInput()"><output id="ambRightV"></output>
+              <span>Top</span><input type="range" id="ambTop" min="0" max="45" step="1" oninput="ambFrameInput()"><output id="ambTopV"></output>
+              <span>Bottom</span><input type="range" id="ambBottom" min="0" max="45" step="1" oninput="ambFrameInput()"><output id="ambBottomV"></output>
+              <span>Depth</span><input type="range" id="ambDepth" min="2" max="50" step="1" oninput="ambFrameInput()"><output id="ambDepthV"></output>
+              <span>Timing</span><input type="range" id="ambOffset" min="-1500" max="1500" step="10" oninput="ambFrameInput()"><output id="ambOffsetV"></output>
+            </div>
+            <div class="note" style="margin-top:6px">Timing: if the light trails the picture, move it to the right
+              (earlier); if it runs ahead, to the left.</div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn sec sm" onclick="resetAmbientFrame()">Whole picture</button>
+              <span class="note" id="ambFrameNote"></span>
+            </div>
+          </div>
+
+          <div class="effect-grid" id="effectSpeedRow" style="align-items:end;margin-bottom:0">
             <label class="inline">speed <input type="number" id="effectPeriod" value="4" min="0.5"
               step="0.5" style="width:64px"> s</label>
             <div class="seg" id="effectMovingSeg">
@@ -977,6 +1016,7 @@ function effectsTabVisible(){
 // as long as it exists in the DOM, which is always (just hidden via CSS
 // elsewhere) - left running it'd decode video in the background forever.
 function syncCanvasVideo(){
+  syncAmbientFrameMedia();
   const video = document.querySelector("#advDisplayLayer video");
   if(!video) return;
   if(effectsTabVisible()){ if(video.paused) video.play().catch(()=>{}); }
@@ -1742,6 +1782,7 @@ function drawAdvancedCase(){
   const ledLayer = document.getElementById("advLedLayer");
   if(!svg || !ledLayer) return;
   syncAdvancedDisplayPreview();
+  syncAmbientFrameMedia();
   if(!layoutData || !layoutData.units.length){
     ledLayer.innerHTML = `<text x="20" y="34" font-family="monospace" font-size="12"
       fill="var(--ink-soft)">No units yet - place them in Settings &gt; Placement first.</text>`;
@@ -2178,9 +2219,18 @@ function updateEffectShapeUi(){
   for(const id of ["effectPaletteProp", "effectColorsProp"]){
     const el = document.getElementById(id);
     if(!el) continue;
+    // ambient has a section of its own instead - no greyed-out palette
+    // controls above it
+    el.style.display = effectShape === "ambient" ? "none" : "";
     el.style.opacity = usesPalette ? "1" : "0.4";
     el.style.pointerEvents = usesPalette ? "auto" : "none";
   }
+  const frameProp = document.getElementById("ambientFrameProp");
+  if(frameProp) frameProp.style.display = effectShape === "ambient" ? "" : "none";
+  // ambient runs at the video's own pace - speed and moving/static mean nothing there
+  const speedRow = document.getElementById("effectSpeedRow");
+  if(speedRow) speedRow.style.display = effectShape === "ambient" ? "none" : "";
+  syncAmbientFrameMedia();
 }
 
 function setPressed(segId, value){
@@ -2401,14 +2451,25 @@ function effectBounds(leds){
 }
 
 /* ---------- ambient preview sampling ----------
-   Mirrors app/ambient.py: the video scaled to 32x16, the colours along
-   its edge averaged 2 cells deep, and each LED taking the edge colour
-   where a line from the panel's centre towards it leaves the picture
-   (main.py's _ambient_directions for the direction). Sampled from the
-   same <video> drawAdvancedCase renders for the display unit rather than
-   a separate decode - the same file the panel plays, so the preview
-   tracks the real LEDs closely, if not frame-exactly. */
-const AMB_W = 32, AMB_H = 16, AMB_DEPTH = 2;
+   Mirrors app/ambient.py: the framed part of the video (ambientFrame)
+   scaled to 32x16, the colours along its edge averaged as deep as the
+   frame's depth, and each LED taking the edge colour where a line from
+   the panel's centre towards it leaves the picture (main.py's
+   _ambient_directions for the direction). Sampled from the same <video>
+   drawAdvancedCase renders for the display unit (or the frame editor's)
+   rather than a separate decode - the same file the panel plays, so the
+   preview tracks the real LEDs closely, if not frame-exactly. */
+const AMB_W = 32, AMB_H = 16;
+// main.py's AmbientFrame: percent cut off each side, depth in percent
+const AMBIENT_FRAME_DEFAULT = {left: 0, top: 0, right: 0, bottom: 0, depth: 10, offset_ms: 0};
+let ambientFrame = {...AMBIENT_FRAME_DEFAULT};
+
+// app/ambient.py's depth_cells: rows for top/bottom, columns for left/right
+function ambDepthCells(depth){
+  const rows = Math.max(1, Math.min(AMB_H/2, Math.round(depth/100 * AMB_H)));
+  const cols = Math.max(1, Math.min(AMB_W/2, Math.round(depth/100 * AMB_W)));
+  return [rows, cols];
+}
 const MEDIA_ASPECT = 2240 / 1080;
 const CANVAS_STEP_ASPECT = (900 - 48) / (600 - 48);  // CANVAS_W/H less padding (declared further down), as main.py's _CANVAS_ASPECT
 let ambientEdges = null;
@@ -2454,25 +2515,207 @@ function updateAmbientZones(){
   // every other page too, so skip it there rather than running a
   // getImageData every 500ms forever regardless of what's on screen.
   if(!effectsTabVisible()) return;
-  const video = document.querySelector("#advancedCase video");
-  const img = document.querySelector("#advancedCase img[alt]"); // the display unit's own preview <img>, when the applied media is a still image
-  const source = (video && video.readyState >= 2) ? video : (img && img.complete ? img : null);
+  // the display unit's own preview <video>/<img> (an <img> when the
+  // applied media is a still image), or the frame editor's
+  const playing = v => v && v.readyState >= 2;
+  const video = [document.querySelector("#advancedCase video"), document.querySelector("#ambFrameMedia video")].find(playing);
+  const img = [document.querySelector("#advancedCase img[alt]"), document.querySelector("#ambFrameMedia img")]
+    .find(i => i && i.complete && i.naturalWidth);
+  const source = video || img || null;
   if(!source) return;
   try{
-    _ambientCtx.drawImage(source, 0, 0, AMB_W, AMB_H);
+    const vw = source.videoWidth || source.naturalWidth, vh = source.videoHeight || source.naturalHeight;
+    const f = ambientFrame;
+    const sw = Math.max(0.05, 1 - (f.left + f.right)/100), sh = Math.max(0.05, 1 - (f.top + f.bottom)/100);
+    _ambientCtx.drawImage(source, vw*f.left/100, vh*f.top/100, vw*sw, vh*sh, 0, 0, AMB_W, AMB_H);
     const {data} = _ambientCtx.getImageData(0, 0, AMB_W, AMB_H);
     const px = (x,y) => { const i = (y*AMB_W+x)*4; return [data[i], data[i+1], data[i+2]]; };
     const avg = pts => [0,1,2].map(c => Math.round(pts.reduce((t,p)=>t+p[c],0)/pts.length));
-    const depth = [...Array(AMB_DEPTH).keys()];
+    const [rows, cols] = ambDepthCells(f.depth);
+    const rowsIn = [...Array(rows).keys()], colsIn = [...Array(cols).keys()];
     ambientEdges = {
-      top: [...Array(AMB_W).keys()].map(x => avg(depth.map(d => px(x, d)))),
-      bottom: [...Array(AMB_W).keys()].map(x => avg(depth.map(d => px(x, AMB_H-1-d)))),
-      left: [...Array(AMB_H).keys()].map(y => avg(depth.map(d => px(d, y)))),
-      right: [...Array(AMB_H).keys()].map(y => avg(depth.map(d => px(AMB_W-1-d, y)))),
+      top: [...Array(AMB_W).keys()].map(x => avg(rowsIn.map(d => px(x, d)))),
+      bottom: [...Array(AMB_W).keys()].map(x => avg(rowsIn.map(d => px(x, AMB_H-1-d)))),
+      left: [...Array(AMB_H).keys()].map(y => avg(colsIn.map(d => px(d, y)))),
+      right: [...Array(AMB_H).keys()].map(y => avg(colsIn.map(d => px(AMB_W-1-d, y)))),
     };
   }catch(e){ /* cross-origin or not-yet-decoded frame - keep the last good sample */ }
 }
 setInterval(updateAmbientZones, 100);
+
+/* ---------- ambient frame editor ----------
+   Which part of the picture the light continues (main.py's AmbientFrame,
+   /api/rgb/ambient-frame): drawn over the applied video itself - outside
+   the frame darkened, the averaged band striped, the frame's edge a solid
+   bright line (brightness and pattern, not colour, tell them apart).
+   Every change is saved a moment later and a running ambient effect
+   takes it up straight away. */
+const AMB_SIDES = ["left", "right", "top", "bottom"];
+let ambFrameMediaKey = undefined;
+let ambFrameDrag = null;
+let ambFrameSaveTimer = null;
+
+function ambFrameVisible(){
+  return effectsTabVisible() && effectShape === "ambient";
+}
+
+function syncAmbientFrameMedia(){
+  const box = document.getElementById("ambFrameMedia");
+  if(!box) return;
+  const visible = ambFrameVisible();
+  const item = currentPanoramaMediaItem();
+  const key = !item ? "none" : (visible ? item.id : "hidden");
+  if(key !== ambFrameMediaKey){
+    ambFrameMediaKey = key;
+    if(!item){
+      box.innerHTML = `<span>Apply a video or picture on the Display page first - the light follows what the panel shows.</span>`;
+    }else if(!visible){
+      box.innerHTML = "";  // nothing decoding while it can't be seen
+    }else if(isVideoItem(item)){
+      box.innerHTML = `<video src="/api/panorama/gallery/${item.id}/original" autoplay muted loop playsinline></video>`;
+      const v = box.querySelector("video");
+      v.addEventListener("loadedmetadata", () => ambFrameAspect(v.videoWidth, v.videoHeight));
+    }else{
+      box.innerHTML = `<img src="/api/panorama/gallery/${item.id}/original" alt="">`;
+      const i = box.querySelector("img");
+      i.addEventListener("load", () => ambFrameAspect(i.naturalWidth, i.naturalHeight));
+    }
+  }
+  drawAmbientFrame();
+}
+
+function ambFrameAspect(w, h){
+  const el = document.getElementById("ambFrameBox");
+  if(el && w && h) el.style.aspectRatio = `${w} / ${h}`;
+}
+
+function drawAmbientFrame(){
+  const svg = document.getElementById("ambFrameOverlay");
+  if(!svg) return;
+  const f = ambientFrame;
+  const x0 = f.left, y0 = f.top, x1 = 100 - f.right, y1 = 100 - f.bottom;
+  const [rows, cols] = ambDepthCells(f.depth);
+  const bx = (x1 - x0) * cols / AMB_W, by = (y1 - y0) * rows / AMB_H;
+  const ix0 = x0 + bx, iy0 = y0 + by, ix1 = x1 - bx, iy1 = y1 - by;
+  const rect = (a, b, c, d) => `M${a} ${b}H${c}V${d}H${a}Z`;
+  const line = 'vector-effect="non-scaling-stroke"';
+  // grips in the middle of each side, drawn as short thick strokes
+  const grip = (xa, ya, xb, yb) => `<path d="M${xa} ${ya}L${xb} ${yb}" stroke="#000" stroke-width="9" stroke-linecap="round" ${line}/>`
+    + `<path d="M${xa} ${ya}L${xb} ${yb}" stroke="#fff" stroke-width="5" stroke-linecap="round" ${line}/>`;
+  const my = (y0 + y1) / 2, mx = (x0 + x1) / 2, gy = Math.min(8, (y1 - y0) / 4), gx = Math.min(5, (x1 - x0) / 4);
+  svg.innerHTML = `
+    <defs><pattern id="ambStripes" width="2.4" height="2.4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="0.9" height="2.4" fill="#fff" opacity=".6"/></pattern></defs>
+    <path d="${rect(0, 0, 100, 100)} ${rect(x0, y0, x1, y1)}" fill="#000" fill-opacity=".62" fill-rule="evenodd"/>
+    <path d="${rect(x0, y0, x1, y1)} ${rect(ix0, iy0, ix1, iy1)}" fill="url(#ambStripes)" fill-rule="evenodd"/>
+    <path d="${rect(ix0, iy0, ix1, iy1)}" fill="none" stroke="#fff" stroke-width="1" stroke-dasharray="4 3" ${line}/>
+    <path d="${rect(x0, y0, x1, y1)}" fill="none" stroke="#000" stroke-width="4" ${line}/>
+    <path d="${rect(x0, y0, x1, y1)}" fill="none" stroke="#fff" stroke-width="2" ${line}/>
+    ${grip(x0, my - gy, x0, my + gy)}${grip(x1, my - gy, x1, my + gy)}
+    ${grip(mx - gx, y0, mx + gx, y0)}${grip(mx - gx, y1, mx + gx, y1)}`;
+}
+
+function renderAmbientFrameControls(){
+  const f = ambientFrame;
+  const set = (id, v, text) => {
+    document.getElementById(id).value = v;
+    document.getElementById(id + "V").textContent = text;
+  };
+  for(const side of AMB_SIDES){
+    const id = "amb" + side[0].toUpperCase() + side.slice(1);
+    set(id, f[side], `${Math.round(f[side])} %`);
+  }
+  set("ambDepth", f.depth, `${Math.round(f.depth)} %`);
+  const ms = Math.round(f.offset_ms);
+  set("ambOffset", ms, ms === 0 ? "in step" : `${ms > 0 ? "+" : ""}${ms} ms`);
+  drawAmbientFrame();
+}
+
+// the frame always leaves at least a tenth of the picture
+function clampAmbientFrame(f){
+  const out = {...f};
+  for(const side of AMB_SIDES) out[side] = Math.max(0, Math.min(45, Number(out[side]) || 0));
+  if(out.left + out.right > 90) out.right = 90 - out.left;
+  if(out.top + out.bottom > 90) out.bottom = 90 - out.top;
+  out.depth = Math.max(2, Math.min(50, Number(out.depth) || AMBIENT_FRAME_DEFAULT.depth));
+  out.offset_ms = Math.max(-1500, Math.min(1500, Number(out.offset_ms) || 0));
+  return out;
+}
+
+function ambFrameInput(){
+  const num = id => parseFloat(document.getElementById(id).value) || 0;
+  ambientFrame = clampAmbientFrame({left: num("ambLeft"), right: num("ambRight"), top: num("ambTop"),
+    bottom: num("ambBottom"), depth: num("ambDepth"), offset_ms: num("ambOffset")});
+  renderAmbientFrameControls();
+  saveAmbientFrameSoon();
+}
+
+function resetAmbientFrame(){
+  ambientFrame = {...AMBIENT_FRAME_DEFAULT, offset_ms: ambientFrame.offset_ms};
+  renderAmbientFrameControls();
+  saveAmbientFrameSoon();
+}
+
+function saveAmbientFrameSoon(){
+  clearTimeout(ambFrameSaveTimer);
+  document.getElementById("ambFrameNote").textContent = "";
+  ambFrameSaveTimer = setTimeout(async () => {
+    try{
+      ambientFrame = clampAmbientFrame(await api("/api/rgb/ambient-frame",
+        {method: "POST", body: JSON.stringify(ambientFrame)}));
+      if(!ambFrameDrag) renderAmbientFrameControls();
+      document.getElementById("ambFrameNote").textContent = "saved - a running ambient effect uses it now";
+    }catch(e){ say(e.message, "error"); }
+  }, 400);
+}
+
+async function loadAmbientFrame(){
+  try{ ambientFrame = clampAmbientFrame({...AMBIENT_FRAME_DEFAULT, ...await api("/api/rgb/ambient-frame")}); }
+  catch(e){ ambientFrame = {...AMBIENT_FRAME_DEFAULT}; }
+  renderAmbientFrameControls();
+}
+
+// pointer position in percent of the picture
+function ambFramePoint(e){
+  const r = document.getElementById("ambFrameBox").getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width * 100, (e.clientY - r.top) / r.height * 100, r];
+}
+
+// the frame side nearest the pointer, measured on screen
+function ambNearestSide(x, y, r){
+  const f = ambientFrame;
+  const dist = {
+    left: Math.abs(x - f.left) * r.width, right: Math.abs(x - (100 - f.right)) * r.width,
+    top: Math.abs(y - f.top) * r.height, bottom: Math.abs(y - (100 - f.bottom)) * r.height,
+  };
+  return AMB_SIDES.reduce((a, b) => dist[a] <= dist[b] ? a : b);
+}
+
+function ambFramePointerDown(e){
+  const [x, y, r] = ambFramePoint(e);
+  ambFrameDrag = ambNearestSide(x, y, r);
+  e.currentTarget.setPointerCapture(e.pointerId);
+  ambFramePointerMove(e);
+}
+
+function ambFramePointerMove(e){
+  const [x, y, r] = ambFramePoint(e);
+  const box = e.currentTarget;
+  if(!ambFrameDrag){
+    const side = ambNearestSide(x, y, r);
+    box.style.cursor = side === "left" || side === "right" ? "ew-resize" : "ns-resize";
+    return;
+  }
+  const v = {left: x, right: 100 - x, top: y, bottom: 100 - y}[ambFrameDrag];
+  ambientFrame = clampAmbientFrame({...ambientFrame, [ambFrameDrag]: Math.round(v)});
+  renderAmbientFrameControls();
+}
+
+function ambFramePointerUp(e){
+  if(!ambFrameDrag) return;
+  ambFrameDrag = null;
+  saveAmbientFrameSoon();
+}
 
 // Backend equivalent: PositionEffectRequest.led_selection / _run_position_effect's
 // led_selection param. A dict of {unit: [index,...]} (the shape sent over the
@@ -3298,6 +3541,7 @@ async function previewStartupAnimation(){
 }
 
 loadStartupAnimation();
+loadAmbientFrame();
 
 /* ---------- settings ---------- */
 

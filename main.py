@@ -106,7 +106,7 @@ from app.hub import DirectHub, Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
-from app.ambient import AmbientSampler
+from app.ambient import SAMPLE_FPS as AMBIENT_FPS, AmbientSampler
 from app.panorama import (DEFAULT_POWERON_MEDIA, KANALI_DEFAULT_POWERON_MEDIA, PanoramaError,
                           build_encoded_media_container, find_print_panel,
                           find_usb_panel, generate_thumbnail)
@@ -159,6 +159,7 @@ LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
 EFFECT_STATE_FILE = ROOT / "effect_state.json"
 STARTUP_ANIM_FILE = ROOT / "startup_animation.json"
+AMBIENT_FRAME_FILE = ROOT / "ambient_frame.json"
 RGB_STATE_FILE = ROOT / "rgb_state.json"
 EFFECT_PRESETS_FILE = ROOT / "effect_presets.json"
 GALLERY_DIR = ROOT / "media_gallery"
@@ -1568,8 +1569,10 @@ def _play_ambient_show(show: _Show) -> dict | None:
             previous = _call_on_loop(_panel_show_media(remote), timeout=10)
         except Exception as exc:
             log.warning("startup animation: could not show the video on the panel: %s", exc)
-    sampler = AmbientSampler(fps=12)
-    sampler.set_source(str(original), original.suffix.lower() in _VIDEO_SUFFIXES)
+    sampler = AmbientSampler()
+    _configure_ambient(sampler)
+    sampler.set_source(str(original), original.suffix.lower() in _VIDEO_SUFFIXES,
+                       started_at=_panel_media_started_at() if previous is not None else None)
     dirs = _ambient_directions([l for r in rings for l in r["leds"]])
     frames = {}
     start = time.monotonic()
@@ -2310,6 +2313,7 @@ _LITE_EXPORT_FILES: list[tuple[str, "Path"]] = [
     ("effect_state.json", EFFECT_STATE_FILE),
     ("effect_presets.json", EFFECT_PRESETS_FILE),
     ("startup_animation.json", STARTUP_ANIM_FILE),
+    ("ambient_frame.json", AMBIENT_FRAME_FILE),
     ("panorama_state.json", PANORAMA_STATE_FILE),
 ]
 
@@ -3238,6 +3242,70 @@ def _fit_frame(frame: list, count: int) -> list:
 _CANVAS_ASPECT = (900 - 48) / (600 - 48)
 
 
+class AmbientFrame(BaseModel):
+    """Where in the picture the ambient light takes its edge (see
+    AmbientSampler.configure), in percent: how much is cut off each side,
+    and how deep inwards from that frame the colour is averaged. offset_ms
+    moves the light ahead of the panel's picture (negative: behind it)."""
+    left: float = 0.0
+    top: float = 0.0
+    right: float = 0.0
+    bottom: float = 0.0
+    depth: float = 10.0
+    offset_ms: int = 0
+
+
+def _checked_ambient_frame(body: AmbientFrame) -> AmbientFrame:
+    sides = {k: min(max(float(getattr(body, k)), 0.0), 45.0) for k in ("left", "top", "right", "bottom")}
+    if sides["left"] + sides["right"] > 90 or sides["top"] + sides["bottom"] > 90:
+        raise HTTPException(400, "the frame leaves nothing of the picture")
+    return body.model_copy(update={**sides, "depth": min(max(float(body.depth), 2.0), 50.0),
+                                   "offset_ms": min(max(int(body.offset_ms), -3000), 3000)})
+
+
+def _load_ambient_frame() -> AmbientFrame:
+    try:
+        return _checked_ambient_frame(
+            AmbientFrame.model_validate_json(AMBIENT_FRAME_FILE.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return AmbientFrame()
+    except Exception as exc:
+        log.warning("could not read %s (%s) - taking the ambient light from the whole picture",
+                    AMBIENT_FRAME_FILE.name, exc)
+        return AmbientFrame()
+
+
+def _configure_ambient(sampler: AmbientSampler, frame: AmbientFrame | None = None):
+    frame = frame or _load_ambient_frame()
+    sampler.configure((frame.left / 100, frame.top / 100, frame.right / 100, frame.bottom / 100),
+                      frame.depth / 100, frame.offset_ms / 1000)
+
+
+_configure_ambient(ambient_sampler)
+
+
+def _panel_media_started_at() -> float | None:
+    """When the panel started what it's showing (see app/panorama.py's
+    media_started_at) - the ambient timeline's zero."""
+    panel = _panorama
+    return panel.media_started_at if panel is not None and panel.connected else None
+
+
+@app.get("/api/rgb/ambient-frame")
+async def get_ambient_frame():
+    return _load_ambient_frame().model_dump()
+
+
+@app.post("/api/rgb/ambient-frame")
+async def set_ambient_frame(body: AmbientFrame):
+    """Saves where the ambient light takes its colours and applies it to a
+    running ambient effect straight away."""
+    frame = _checked_ambient_frame(body)
+    AMBIENT_FRAME_FILE.write_text(frame.model_dump_json(), encoding="utf-8")
+    _configure_ambient(ambient_sampler, frame)
+    return frame.model_dump()
+
+
 def _ambient_directions(leds: list[dict]) -> dict[tuple, tuple[float, float]]:
     """(unit id, LED index) -> the direction from the Panorama's centre
     to that LED, in the panel's own frame (its rotation in the layout
@@ -3696,7 +3764,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     def refresh_ambient_source():
         media = _current_panorama_media_path()
         if media is not None:
-            ambient_sampler.set_source(*media)
+            ambient_sampler.set_source(*media, started_at=_panel_media_started_at())
         else:
             ambient_sampler.stop()
 
@@ -3755,6 +3823,13 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
             def unchanged(key, frame, now):
                 prev = last_sent.get(key)
                 return prev is not None and prev[0] == frame and now - prev[1] < 2.0
+
+            # Ambient runs at the panel's frame rate, so the fans change
+            # with every picture - but RAM and board keep the usual pace:
+            # each of their writes is a series of slow SMBus/USB
+            # transactions inside OpenRGB.
+            frame_s = 1 / AMBIENT_FPS if shape == "ambient" else (0.08 if moving else 1.0)
+            last_bridge_at = 0.0
 
             while not stop.is_set():
                 if moving:
@@ -3841,7 +3916,11 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                             log.debug("effect: hub reconnect failed: %s", exc)
                             hub_failures = 2
 
-                for u, device in ram_targets:
+                bridge_due = now - last_bridge_at >= 0.075
+                if bridge_due:
+                    last_bridge_at = now
+
+                for u, device in (ram_targets if bridge_due else ()):
                     _, frame = frame_colors(u)
                     if unchanged(("ram", u["id"]), frame, now):
                         continue
@@ -3853,7 +3932,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         log.debug("effect: RAM write failed for %s: %s", u["id"], exc)
                         bridge_failures += 1
 
-                if mobo_target is not None:
+                if mobo_target is not None and bridge_due:
                     u, device, zone_index = mobo_target
                     _, frame = frame_colors(u)
                     frame = _fit_frame(frame, len(device.zones[zone_index].leds))
@@ -3893,7 +3972,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         log.debug("effect: OpenRGB reconnect failed: %s", exc)
                         bridge_failures = 2
 
-                stop.wait(0.08 if moving else 1.0)
+                stop.wait(frame_s)
     except Exception as exc:
         log.warning("position effect stopped: %s", exc)
         _end_effect(stop, str(exc))
@@ -4530,6 +4609,14 @@ def _already_running(host: str, port: int) -> bool:
 
 
 if __name__ == "__main__":
+    if "--remove-elevated-helpers" in sys.argv:
+        # The uninstaller's way of undoing "Start without UAC prompts" (see
+        # tools/build_installer/installer.nsi) - exactly what Settings'
+        # "Undo" does, then exit.
+        log.info("removing the prompt-free helper start: %s",
+                 _run_elevated_helpers_script("remove").get("message"))
+        sys.exit(0)
+
     _host = CONFIG["server"]["host"]
     _port = CONFIG["server"]["port"]
 

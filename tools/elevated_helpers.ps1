@@ -1,8 +1,8 @@
 <#
 Sets up (or removes) starting OpenRGB and SensorHelper with admin rights
 without a UAC prompt at every login - run once, elevated, from shyyctl's
-Settings page (main.py's /api/system/elevated-helpers), or by the
-uninstaller with -Action remove.
+Settings page (main.py's /api/system/elevated-helpers), or with -Action
+remove for the uninstaller (shyyctl.exe --remove-elevated-helpers).
 
 Both helpers need admin rights (RAM RGB over SMBus, CPU temperatures -
 both through the PawnIO driver). Starting them silently with those rights
