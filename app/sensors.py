@@ -40,6 +40,8 @@ should still show whatever it *can* read, not a blank page):
 import json
 import logging
 import subprocess
+import threading
+import time
 import urllib.request
 
 from app.procflags import NO_WINDOW
@@ -163,10 +165,29 @@ def process_resources() -> dict:
     }
 
 
+_gpu_cache: tuple[float, dict] | None = None
+_gpu_lock = threading.Lock()
+
+
 def gpu() -> dict:
     """First NVIDIA GPU's utilisation/memory/temperature via nvidia-smi.
     None across the board (not an exception) on a box with no NVIDIA GPU or
-    no driver on PATH - that's a normal, expected shape, not a failure."""
+    no driver on PATH - that's a normal, expected shape, not a failure.
+
+    Both the fan-curve loop (every 4s) and the Status page (every 3s) ask
+    for this - one nvidia-smi process answers both if they land within 2s
+    of each other, instead of one each."""
+    global _gpu_cache
+    with _gpu_lock:
+        cached = _gpu_cache
+        if cached is not None and time.monotonic() - cached[0] < 2.0:
+            return dict(cached[1])
+        result = _gpu_read()
+        _gpu_cache = (time.monotonic(), result)
+        return dict(result)
+
+
+def _gpu_read() -> dict:
     empty = {"name": None, "load_percent": None, "mem_used_mb": None, "mem_total_mb": None, "temp_c": None}
     try:
         out = subprocess.run(

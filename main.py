@@ -52,6 +52,12 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--liquidctl"
         else:
             setattr(sys, _name, _std_stream(_fd, _handle_id))
 
+    try:
+        from app.hub import patch_liquidctl_reads
+        patch_liquidctl_reads()
+    except Exception:
+        pass
+
     from liquidctl.cli import main as _liquidctl_main
     sys.argv = ["liquidctl"] + sys.argv[2:]
     _code = _liquidctl_main()
@@ -1818,6 +1824,35 @@ def _combine_temp(cpu_t: float | None, gpu_t: float | None) -> float | None:
 # duty (manual slider, scan) clears the entry so the curve re-asserts.
 _curve_written: dict[str, tuple[int, float]] = {}
 
+# Ryzen's Tctl (the 9950X3D's "Core (Tctl/Tdie)" this curve runs on) jumps
+# 10-20°C for a second or two on any short burst of load - opening a
+# program, a browser tab - and drops straight back. Fed into the curve
+# unfiltered, every such blip spun the fans up and back down again within
+# a few seconds, audibly, and cost a liquidctl write each way. The curve
+# now follows a smoothed temperature: rises are taken in at 40% per 4s
+# tick (a sustained load is fully reflected within ~15s, which a water-
+# cooled CPU's thermal mass easily covers), falls at 20%, and fans spin
+# down by at most _CURVE_STEP_DOWN percent per tick. At _CURVE_PANIC_C or
+# above the raw reading is used directly - real heat is never smoothed away.
+_CURVE_RISE = 0.4
+_CURVE_FALL = 0.2
+_CURVE_PANIC_C = 90.0
+_CURVE_STEP_DOWN = 5
+_curve_temp_smooth: dict[str, float] = {}
+
+
+def _smoothed_temp(source: str, raw: float | None) -> float | None:
+    if raw is None:
+        _curve_temp_smooth.pop(source, None)
+        return None
+    prev = _curve_temp_smooth.get(source)
+    if prev is None or raw >= _CURVE_PANIC_C:
+        value = raw
+    else:
+        value = prev + (raw - prev) * (_CURVE_RISE if raw > prev else _CURVE_FALL)
+    _curve_temp_smooth[source] = value
+    return value
+
 
 async def _curve_loop():
     """Polls every few seconds rather than reacting to a temp change
@@ -1857,7 +1892,8 @@ async def _curve_loop():
             sensors_cfg.get("cpu_sensor_match", "CPU Package"),
         )
         gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
-        temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
+        raw_temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
+        temps = {source: _smoothed_temp(source, t) for source, t in raw_temps.items()}
         fan_channels = hub.channels.get("fan", []) if hub.connected else []
         # A running scan drives fans itself (0% to find the start duty,
         # 100% for max rpm) - writing curve duties in between used to
@@ -1882,18 +1918,25 @@ async def _curve_loop():
                         # write is a whole liquidctl process plus HID
                         # traffic. Still re-asserted every minute in case
                         # something else (a hub reset, another tool)
-                        # changed it behind our back.
+                        # changed it behind our back. A 1% wobble isn't
+                        # worth a write either.
                         last = _curve_written.get(channel)
-                        if last is not None and last[0] == duty and now - last[1] < 60:
+                        target = duty
+                        if last is not None and target < last[0]:
+                            target = max(target, last[0] - _CURVE_STEP_DOWN)
+                        if last is not None and abs(target - last[0]) < 2 and now - last[1] < 60:
                             continue
                         try:
-                            await _hub_call(hub.set_fan, channel, duty)
-                            _curve_written[channel] = (duty, now)
+                            await _hub_call(hub.set_fan, channel, target)
+                            _curve_written[channel] = (target, now)
                         except Exception as exc:
                             _curve_written.pop(channel, None)
                             log.warning("curve %s: could not set %s to %s%%: %s",
-                                       curve.get("id"), channel, duty, exc)
-            statuses.append({"id": curve.get("id"), "temp_c": temp_c, "duty": duty})
+                                       curve.get("id"), channel, target, exc)
+            raw_t = raw_temps.get(curve.get("source"))
+            statuses.append({"id": curve.get("id"),
+                             "temp_c": round(temp_c, 1) if temp_c is not None else None,
+                             "temp_raw_c": raw_t, "duty": duty})
         _curve_status = {"curves": statuses}
         await asyncio.sleep(4)
 

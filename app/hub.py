@@ -54,26 +54,71 @@ _ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 # (attempts=12, missing=1)" failure seen hundreds of times in real logs.
 _LIQUIDCTL_LOCK = threading.Lock()
 
+# liquidctl's Control Hub driver reads at most 12 HID reports while
+# looking for the one it wants (status: the 0x67 0x02 fan report) and then
+# fails with "missing messages (attempts=12, missing=1)". While a
+# host-driven effect runs, OpenRGB streams LED frames to this same hub and
+# the extra reports that traffic produces fill those 12 reads before the
+# fan report comes round - fan readings failed almost every time an effect
+# was on. Reading further is all it takes; each read returns as soon as a
+# report arrives, so a larger budget costs nothing when the hub is quiet.
+HUB_READ_ATTEMPTS = 96
+
+
+def patch_liquidctl_reads() -> None:
+    """Raise the Control Hub driver's read budget (see HUB_READ_ATTEMPTS).
+    Applied in this process (accessory_ids) and in every bundled liquidctl
+    child (main.py's --liquidctl entry) - not possible for a separately
+    installed liquidctl on PATH, which is why the bundled copy is preferred
+    in the installed app (see _liquidctl_command)."""
+    try:
+        from liquidctl.driver.control_hub import ControlHub
+    except Exception:
+        return
+    if getattr(ControlHub, "_MAX_READ_ATTEMPTS", 0) < HUB_READ_ATTEMPTS:
+        ControlHub._MAX_READ_ATTEMPTS = HUB_READ_ATTEMPTS
+
+
 _liquidctl_cmd: list[str] | None = None
 
 
+def _bundled_liquidctl_works(cmd: list[str]) -> bool:
+    try:
+        result = subprocess.run(cmd + ["--version"], capture_output=True, encoding="utf-8",
+                                errors="replace", timeout=30, env=_ENV, creationflags=NO_WINDOW)
+    except Exception as exc:
+        log.warning("bundled liquidctl unusable (%s)", exc)
+        return False
+    if result.returncode != 0:
+        log.warning("bundled liquidctl unusable (exit %s): %s",
+                    result.returncode, (result.stderr or result.stdout).strip()[-300:])
+        return False
+    return True
+
+
 def _liquidctl_command() -> list[str]:
-    """liquidctl on PATH if there is one (unchanged behaviour for anyone
-    who installed it themselves), otherwise the copy bundled into this
-    build: the installed exe re-invokes itself with --liquidctl (see the
-    top of main.py), a dev checkout uses `python -m liquidctl`. Before
-    this, the installed app silently depended on a separate Python +
-    liquidctl install being on PATH - without one, every fan call failed
-    with "liquidctl not found" even though liquidctl is bundled."""
+    """Installed app: the copy bundled into this build - the exe
+    re-invokes itself with --liquidctl (see the top of main.py) - as long
+    as that actually runs, since only it carries patch_liquidctl_reads();
+    a liquidctl on PATH is the fallback. Dev checkout: liquidctl on PATH
+    first (whatever the developer installed), else `python main.py
+    --liquidctl`. Before the bundled copy existed, the installed app
+    silently depended on a separate Python + liquidctl install being on
+    PATH - without one, every fan call failed with "liquidctl not found"."""
     global _liquidctl_cmd
     if _liquidctl_cmd is None:
         found = shutil.which("liquidctl")
-        if found:
+        if getattr(sys, "frozen", False):
+            bundled = [sys.executable, "--liquidctl"]
+            if found and not _bundled_liquidctl_works(bundled):
+                _liquidctl_cmd = [found]
+            else:
+                _liquidctl_cmd = bundled
+        elif found:
             _liquidctl_cmd = [found]
-        elif getattr(sys, "frozen", False):
-            _liquidctl_cmd = [sys.executable, "--liquidctl"]
         else:
-            _liquidctl_cmd = [sys.executable, "-m", "liquidctl"]
+            main_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+            _liquidctl_cmd = [sys.executable, main_py, "--liquidctl"]
         log.info("using liquidctl via: %s", " ".join(_liquidctl_cmd))
     return _liquidctl_cmd
 
@@ -177,9 +222,14 @@ class Hub:
             out = self._run("status", "--verbose", match=self.match, retries=3, retry_delay=0.3)
             readings = self._parse_status(out) if out is not None else []
             done = time.monotonic()
-            self._status_last = (done, gen, readings)
             if readings:
                 self._status_cache = (done, gen, readings)
+            elif cached is not None and cached[1] == gen and done - cached[0] < 10:
+                # A failed read right after a good one: the last good
+                # reading (same duties, a few seconds old) beats the Fans
+                # page blanking every rpm to "--" over a single hiccup.
+                readings = cached[2]
+            self._status_last = (done, gen, readings)
             return [dict(r) for r in readings]
 
     def rpm(self, channel: str) -> int | None:
@@ -222,6 +272,7 @@ class Hub:
         exposed the piece needed for it.
         """
         from liquidctl.driver.control_hub import ControlHub
+        patch_liquidctl_reads()
 
         ids: dict[str, int] = {}
         with _LIQUIDCTL_LOCK:
