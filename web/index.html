@@ -2954,18 +2954,24 @@ async function refresh(){
   checkConflicts();
 })();
 
-setInterval(async ()=>{
-  try{
-    status_ = await api("/api/status");
-    // Every /api/fans read is a whole liquidctl process on the backend -
-    // only worth it while a page that shows fan readings is open.
-    if(document.getElementById("page-status").classList.contains("active")
-       || document.getElementById("page-fans").classList.contains("active")) await loadFans();
-    if(document.getElementById("page-status").classList.contains("active")) await loadSensors();
-    renderDevices(); renderStatus();
-    if(document.getElementById("page-fans").classList.contains("active")) renderFans();
-  }catch(e){}
-}, 3000);
+// The next refresh is scheduled only once this one has finished (not a
+// fixed setInterval): a slow /api/fans answer - the hub busy while an
+// effect runs - must not have new requests stacking up behind it.
+(function refreshLoop(){
+  setTimeout(async ()=>{
+    try{
+      status_ = await api("/api/status");
+      // Every /api/fans read is a whole liquidctl process on the backend -
+      // only worth it while a page that shows fan readings is open.
+      if(document.getElementById("page-status").classList.contains("active")
+         || document.getElementById("page-fans").classList.contains("active")) await loadFans();
+      if(document.getElementById("page-status").classList.contains("active")) await loadSensors();
+      renderDevices(); renderStatus();
+      if(document.getElementById("page-fans").classList.contains("active")) renderFans();
+    }catch(e){}
+    refreshLoop();
+  }, 3000);
+})();
 
 /* ---------- other controller detection ----------
    Polled far less often than /api/status - listing every running

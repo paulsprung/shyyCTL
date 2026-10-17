@@ -91,7 +91,13 @@ class Hub:
         self.channels: dict[str, list[str]] = {"fan": [], "led": []}
         self.modes = list(FIRMWARE_MODES)
         self.supports_per_led = False  # confirmed: super-fixed unsupported
-        self._status_cache: tuple[float, list[dict]] | None = None
+        # status() bookkeeping - see status(). _status_gen is bumped by every
+        # set_fan(), so no reading taken before a duty change is ever
+        # handed out after it.
+        self._status_lock = threading.Lock()
+        self._status_gen = 0
+        self._status_cache: tuple[float, int, list[dict]] | None = None
+        self._status_last: tuple[float, int, list[dict]] | None = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -129,7 +135,8 @@ class Hub:
 
     def set_fan(self, channel: str, duty: int) -> int:
         duty = max(0, min(100, int(duty)))
-        self._status_cache = None  # the next status()/rpm() must see the new speed
+        self._status_gen += 1  # the next status()/rpm() must see the new speed
+        self._status_cache = None
         if self._run("set", channel, "speed", str(duty), match=self.match) is None:
             raise HubError(f"Could not set {channel} to {duty}%.")
         return duty
@@ -149,14 +156,31 @@ class Hub:
         # liquidctl process. A reading a second or two old is still current
         # for a fan, and set_fan() clears this so a fresh duty is never
         # masked (scan.py's start-duty probing depends on that).
-        cached = self._status_cache
-        if cached is not None and time.monotonic() - cached[0] < 1.5:
-            return [dict(r) for r in cached[1]]
-        out = self._run("status", "--verbose", match=self.match, retries=3, retry_delay=0.3)
-        readings = self._parse_status(out) if out is not None else []
-        if readings:
-            self._status_cache = (time.monotonic(), readings)
-        return [dict(r) for r in readings]
+        #
+        # Callers that arrive while a read is already running wait for it
+        # and share its answer - failed reads included - instead of each
+        # queueing a full read of their own. While an effect runs, OpenRGB
+        # keeps the hub busy and reads fail with "missing messages", each
+        # one taking several seconds of retries; with every poll queueing
+        # its own read, waiting calls piled up without bound and tied up
+        # the worker threads everything else (effect start, OpenRGB,
+        # Panorama) runs on - effects showed "running" but never moved.
+        asked = time.monotonic()
+        with self._status_lock:
+            gen = self._status_gen
+            cached = self._status_cache
+            if cached is not None and cached[1] == gen and time.monotonic() - cached[0] < 1.5:
+                return [dict(r) for r in cached[2]]
+            last = self._status_last
+            if last is not None and last[1] == gen and last[0] >= asked:
+                return [dict(r) for r in last[2]]
+            out = self._run("status", "--verbose", match=self.match, retries=3, retry_delay=0.3)
+            readings = self._parse_status(out) if out is not None else []
+            done = time.monotonic()
+            self._status_last = (done, gen, readings)
+            if readings:
+                self._status_cache = (done, gen, readings)
+            return [dict(r) for r in readings]
 
     def rpm(self, channel: str) -> int | None:
         if not channel.startswith("fan"):

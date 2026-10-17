@@ -62,6 +62,7 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--liquidctl"
 import asyncio
 import colorsys
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -78,6 +79,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -241,12 +243,58 @@ _curve_status: dict = {"curves": []}
 # Host-driven, position-aware hub effects (Advanced RGB view) - see
 # _run_position_effect below. A plain threading.Event rather than an asyncio
 # primitive because the effect body is a tight blocking-socket loop run
-# via asyncio.to_thread on a worker thread, not a coroutine; setting the
+# on its own thread (_start_effect_thread), not a coroutine; setting the
 # event from a request handler's own thread is safe without a lock, it's
 # just a one-way "stop now" flag.
+#
+# Each run gets a fresh Event (see _new_effect_stop) instead of the one
+# shared Event being cleared again: a previous run that didn't exit within
+# _stop_effect's timeout (stuck in a slow write) used to see the cleared
+# flag and carry on, two loops then fighting over the same LEDs.
 _effect_stop = threading.Event()
-_effect_task: asyncio.Task | None = None
+_effect_task: asyncio.Future | None = None
 _effect_status: dict = {"running": False, "kind": None, "error": None}
+
+
+def _new_effect_stop() -> threading.Event:
+    global _effect_stop
+    _effect_stop = threading.Event()
+    return _effect_stop
+
+
+def _start_effect_thread(fn, *args) -> asyncio.Future:
+    """Effect loops run for as long as the effect does, so each gets a
+    thread of its own instead of permanently occupying a slot of the
+    default pool (and having to wait for a free one to start at all).
+    The returned future resolves once the loop has exited."""
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def finished():
+        if not done.done():
+            done.set_result(None)
+
+    def run():
+        try:
+            fn(*args)
+        finally:
+            loop.call_soon_threadsafe(finished)
+
+    threading.Thread(target=run, name="effect", daemon=True).start()
+    return done
+
+
+# liquidctl calls (hub.*) run on their own threads rather than the default
+# pool asyncio.to_thread shares with everything else. Each one can block for
+# seconds (one liquidctl process at a time, retries on "missing messages"),
+# and a pile of them waiting there once starved the effect loop, OpenRGB
+# and Panorama calls of threads altogether.
+_hub_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="liquidctl")
+
+
+async def _hub_call(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(
+        _hub_executor, functools.partial(fn, *args))
 
 
 def _find_panorama():
@@ -1021,7 +1069,7 @@ async def lifespan(app: FastAPI):
     # queued behind them.
     panorama_task = asyncio.create_task(get_panorama())
 
-    if not await asyncio.to_thread(hub.connect):
+    if not await _hub_call(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
 
     try:
@@ -1160,7 +1208,7 @@ async def _lite_service_main():
     global _curve_task, _keepalive_task
     log.info("Starting in --lite mode: RGB effects + fan curves + Panorama display, no web UI.")
 
-    if not await asyncio.to_thread(hub.connect):
+    if not await _hub_call(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
 
     saved_effect = _load_effect_state()
@@ -1353,7 +1401,7 @@ async def reconnect_all():
     something in, restarting OpenRGB, or the panel dropping off USB -
     without restarting shyyctl itself. /api/status only ever reports
     cached state; this is what actually re-probes."""
-    hub_ok = await asyncio.to_thread(hub.connect)
+    hub_ok = await _hub_call(hub.connect)
     openrgb_ok = await asyncio.to_thread(openrgb.connect)
     async with _panorama_lock:
         _drop_panorama(_panorama)
@@ -1637,7 +1685,7 @@ async def apply_update(body: UpdateApplyRequest):
 async def list_fans():
     if not hub.connected:
         raise HTTPException(503, "hub not connected")
-    readings = await asyncio.to_thread(hub.status)
+    readings = await _hub_call(hub.status)
     # A channel a full/quick scan actually confirmed nothing responds to
     # (scan.absent - see scan.py's _scan()) is left out here entirely,
     # not just hidden from Setup - there's no point offering a duty
@@ -1668,7 +1716,7 @@ async def set_fan_duty(channel: str, body: DutyRequest):
         raise HTTPException(503, "hub not connected")
     _curve_written.pop(channel, None)
     try:
-        applied = await asyncio.to_thread(hub.set_fan, channel, body.duty)
+        applied = await _hub_call(hub.set_fan, channel, body.duty)
     except HubError as exc:
         raise HTTPException(500, str(exc))
     return {"channel": channel, "duty": applied}
@@ -1839,7 +1887,7 @@ async def _curve_loop():
                         if last is not None and last[0] == duty and now - last[1] < 60:
                             continue
                         try:
-                            await asyncio.to_thread(hub.set_fan, channel, duty)
+                            await _hub_call(hub.set_fan, channel, duty)
                             _curve_written[channel] = (duty, now)
                         except Exception as exc:
                             _curve_written.pop(channel, None)
@@ -2294,11 +2342,23 @@ def _sample_palette(palette: str, colors: list[tuple], t: float, cyclic: bool) -
     return tuple(round(a[k] + (b[k] - a[k]) * w) for k in range(3))
 
 
+def _end_effect(stop: threading.Event, error: str | None = None):
+    """Marks the effect finished - unless a newer run has already replaced
+    this one (see _new_effect_stop): an old run exiting late must not
+    report the new one as stopped or stop its ambient sampler."""
+    global _effect_status
+    if stop is not _effect_stop:
+        return
+    ambient_sampler.stop()
+    _effect_status = {"running": False, "kind": None, "error": error}
+
+
 def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                          period_s: float, moving: bool, shape: str = "wave",
-                         led_selection: dict[str, set[int]] | None = None):
-    """Runs until _effect_stop is set, on its own worker thread (via
-    asyncio.to_thread) - one raw hub connection held for the whole effect
+                         led_selection: dict[str, set[int]] | None = None,
+                         stop: threading.Event | None = None):
+    """Runs until `stop` is set, on its own thread (see
+    _start_effect_thread) - one raw hub connection held for the whole effect
     rather than reopened per frame (see openrgb_raw.py's docstring on
     this hub's server-side instability under repeated
     REQUEST_CONTROLLER_DATA hammering). Drives every fan channel, RAM
@@ -2333,7 +2393,8 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     writing once and exiting - phase just never advances - so Stop keeps
     working the same way for every effect kind, at the cost of a few
     harmless redundant identical writes a second instead of one."""
-    global _effect_status
+    if stop is None:
+        stop = _effect_stop
     leds_by_unit, fan_units, ram_targets, mobo_target = _resolve_effect_targets()
 
     driven_ids = {u["id"] for u in fan_units} | {u["id"] for u, _ in ram_targets}
@@ -2343,9 +2404,8 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     if led_selection is not None:
         all_leds = [led for led in all_leds if led["index"] in led_selection.get(led["unit"], ())]
     if not all_leds:
-        _effect_status = {"running": False, "kind": None,
-                           "error": "no LEDs selected" if led_selection is not None
-                           else "no units placed in Setup yet"}
+        _end_effect(stop, "no LEDs selected" if led_selection is not None
+                    else "no units placed in Setup yet")
         return
     xs = [l["x"] for l in all_leds]
     ys = [l["y"] for l in all_leds]
@@ -2635,7 +2695,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 prev = last_sent.get(key)
                 return prev is not None and prev[0] == frame and now - prev[1] < 2.0
 
-            while not _effect_stop.is_set():
+            while not stop.is_set():
                 if moving:
                     phase[0] = ((time.monotonic() - start) / period_s) % 1.0
                 now = time.monotonic()
@@ -2757,17 +2817,16 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         log.debug("effect: OpenRGB reconnect failed: %s", exc)
                         bridge_failures = 2
 
-                _effect_stop.wait(0.08 if moving else 1.0)
+                stop.wait(0.08 if moving else 1.0)
     except Exception as exc:
         log.warning("position effect stopped: %s", exc)
-        _effect_status = {"running": False, "kind": None, "error": str(exc)}
-        ambient_sampler.stop()
+        _end_effect(stop, str(exc))
         return
-    ambient_sampler.stop()
-    _effect_status = {"running": False, "kind": None, "error": None}
+    _end_effect(stop)
 
 
-def _run_chase_effect(channel: str, window: int, step_s: float):
+def _run_chase_effect(channel: str, window: int, step_s: float,
+                      stop: threading.Event | None = None):
     """A calibration tool, not a look - lights a sliding window of `window`
     consecutive LEDs (in the strip's own wiring order, index 0..n-1) and
     advances it one step at a time: LED 0 on, LED 1 on, ... once the
@@ -2781,35 +2840,34 @@ def _run_chase_effect(channel: str, window: int, step_s: float):
     - flagged there as an inferred, never-walked placeholder for F360X)
     actually matches the hardware, rather than guessing from a static
     colour."""
-    global _effect_status
+    if stop is None:
+        stop = _effect_stop
     try:
         with _open_hub_raw() as raw:
             ctrl = raw.find_controller("NZXT")
             if ctrl is None:
-                _effect_status = {"running": False, "kind": None,
-                                   "error": "no hub RGB device found"}
+                _end_effect(stop, "no hub RGB device found")
                 return
             zone = raw.zone_for_channel(ctrl, channel)
             if zone is None or zone.leds_count == 0:
-                _effect_status = {"running": False, "kind": None,
-                                   "error": f"channel '{channel}' has no sized LEDs"}
+                _end_effect(stop, f"channel '{channel}' has no sized LEDs")
                 return
             n = zone.leds_count
             raw.select_mode(ctrl, "direct")
             step = 0
-            while not _effect_stop.is_set():
+            while not stop.is_set():
                 colors = [
                     (255, 255, 255) if (step - i) % n < window else (0, 0, 0)
                     for i in range(n)
                 ]
                 raw.set_zone_colors(ctrl.index, zone.index, colors)
                 step = (step + 1) % n
-                _effect_stop.wait(step_s)
+                stop.wait(step_s)
     except Exception as exc:
         log.warning("LED order test stopped: %s", exc)
-        _effect_status = {"running": False, "kind": None, "error": str(exc)}
+        _end_effect(stop, str(exc))
         return
-    _effect_status = {"running": False, "kind": None, "error": None}
+    _end_effect(stop)
 
 
 async def _stop_effect():
@@ -2838,10 +2896,10 @@ async def start_chase_effect(channel: str, body: ChaseEffectRequest):
     global _effect_task, _effect_status
     await _stop_effect()
     _clear_effect_state()
-    _effect_stop.clear()
+    stop = _new_effect_stop()
     _effect_status = {"running": True, "kind": "chase", "channel": channel, "error": None}
-    _effect_task = asyncio.create_task(
-        asyncio.to_thread(_run_chase_effect, channel, max(body.window, 1), max(body.step_s, 0.1)))
+    _effect_task = _start_effect_thread(
+        _run_chase_effect, channel, max(body.window, 1), max(body.step_s, 0.1), stop)
     return {"ok": True}
 
 
@@ -2883,7 +2941,7 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
     rgb_colors = [_hex_to_rgb(c) for c in body.colors] or [(255, 255, 255)]
     period_s = max(body.period_s, 0.5)
     await _stop_effect()
-    _effect_stop.clear()
+    stop = _new_effect_stop()
     selection = ({uid: set(idxs) for uid, idxs in body.led_selection.items()}
                  if body.led_selection else None)
     # started_at (wall-clock, not the loop's own time.monotonic() reference)
@@ -2898,9 +2956,9 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
         "moving": body.moving, "shape": body.shape, "led_selection": body.led_selection,
         "started_at": time.time(), "error": None,
     }
-    _effect_task = asyncio.create_task(
-        asyncio.to_thread(_run_position_effect, body.direction, body.palette,
-                          rgb_colors, period_s, body.moving, body.shape, selection))
+    _effect_task = _start_effect_thread(
+        _run_position_effect, body.direction, body.palette,
+        rgb_colors, period_s, body.moving, body.shape, selection, stop)
     if persist:
         _save_effect_state(body)
 
