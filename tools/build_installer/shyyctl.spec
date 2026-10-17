@@ -32,7 +32,10 @@ REPO_ROOT = Path(SPECPATH).resolve().parent.parent
 
 # Optional: Use a custom icon if it exists at tools/build_installer/shyyctl.ico
 # To create from an image, run: python tools/build_installer/create_icon.py your_image.png
-ICON_PATH = Path(SPECPATH).resolve().parent / "shyyctl.ico"
+# SPECPATH is this spec's own folder (tools/build_installer) - the icon sits
+# right in it. Looking one level up (tools/) found nothing, and every build
+# silently fell back to PyInstaller's default icon.
+ICON_PATH = Path(SPECPATH).resolve() / "shyyctl.ico"
 ICON = str(ICON_PATH) if ICON_PATH.exists() else None
 
 extra_datas = [
