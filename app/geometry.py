@@ -135,6 +135,11 @@ def expected_leds(fans: int) -> int | None:
 # per-gap span an actual cluster occupies - small enough that the group
 # reads as "bunched", not smeared back into a uniform spread.
 CLUSTER_FRACTION = 0.2
+# A corner cluster: how far out from the fan centre (the frame's corner is
+# at sqrt(2) fan radii, its rounded edge a little inside that), and the
+# angle its four LEDs fan out over.
+CORNER_RADIUS = 1.25
+CORNER_SPREAD = 0.5
 
 
 def led_positions(model: Model, radius: float = 1.0,
@@ -161,18 +166,19 @@ def led_positions(model: Model, radius: float = 1.0,
     pts: list[tuple[float, float]] = []
 
     def arc(ox: float, oy: float, a0: float, a1: float):
-        # CAP_LEDS splits into two corner clusters, one bunched near a0
-        # and one near a1, instead of one smooth sweep across the whole
-        # a0..a1 range - each end of a fan has its own real corner.
+        # CAP_LEDS splits into two clusters, one in each of this end's
+        # two frame corners (45 degrees in from a0 and from a1), fanned
+        # around the corner. They used to sit just off the middle of the
+        # fan's sides, which put every corner LED visibly in the wrong
+        # place - and anything working from positions (the startup
+        # snake's "closest point to the next fan") with it.
         half = CAP_LEDS // 2
-        full_span = a1 - a0
-        cluster = full_span * CLUSTER_FRACTION
-        for i in range(half):
-            t = a0 + cluster * ((i + 0.5) / half)
-            pts.append((ox + cos(t) * radius, oy + sin(t) * radius))
-        for i in range(half):
-            t = a1 - cluster * ((half - i - 0.5) / half)
-            pts.append((ox + cos(t) * radius, oy + sin(t) * radius))
+        quarter = (a1 - a0) / 4
+        for corner in (a0 + quarter, a1 - quarter):
+            for i in range(half):
+                t = corner + CORNER_SPREAD * ((i + 0.5) / half - 0.5) * (1 if quarter > 0 else -1)
+                pts.append((ox + cos(t) * radius * CORNER_RADIUS,
+                            oy + sin(t) * radius * CORNER_RADIUS))
 
     def line(x0: float, y0: float, x1: float, y1: float):
         # One tight cluster of side_per_gap LEDs per fan-to-fan seam,

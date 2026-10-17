@@ -1182,16 +1182,15 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
 
 class StartupAnimation(BaseModel):
     enabled: bool = True
-    style: str = "snake"                # startup_anim.STYLES
-    direction: str = "bottom_to_top"    # snake/cascade: startup_anim.DIRECTIONS
-    reverse: bool = False               # rings counter-clockwise
+    style: str = "case_spin"            # startup_anim.STYLES
+    start_unit: str = ""                # fan unit the turn starts at; "" = the left-most
+    reverse: bool = True                # counter-clockwise (on the canvas)
     palette: str = "solid"              # startup_anim.PALETTES
     color: str = "#ffffff"
-    color2: str = "#4c79ff"             # gradient: the tail end
+    color2: str = "#4c79ff"             # gradient: the second colour
     brightness: int = 100               # %
-    lap_s: float = 1.5                  # one fan ring's worth of travel
-    laps: int = 1                       # chase/cascade: times round each ring
-    tail: int = 10                      # LEDs the tail fades over
+    lap_s: float = 1.5                  # one turn
+    laps: int = 2                       # turns before a ring is fully lit
     ambient_source: str = ""            # gallery item id; "" = the power-on video
     ambient_on_display: bool = True     # the panel plays that video meanwhile
     show_s: float = 8.0                 # ambient: how long
@@ -1201,7 +1200,10 @@ class StartupAnimation(BaseModel):
 
 def _load_startup_animation() -> StartupAnimation:
     try:
-        return StartupAnimation.model_validate_json(STARTUP_ANIM_FILE.read_text(encoding="utf-8"))
+        cfg = StartupAnimation.model_validate_json(STARTUP_ANIM_FILE.read_text(encoding="utf-8"))
+        if cfg.style not in startup_anim.STYLES:
+            cfg = cfg.model_copy(update={"style": "case_spin"})  # snake/cascade/chase/fill were dropped
+        return cfg
     except FileNotFoundError:
         return StartupAnimation()
     except Exception as exc:
@@ -1211,8 +1213,7 @@ def _load_startup_animation() -> StartupAnimation:
 
 
 def _checked_startup_animation(body: StartupAnimation) -> StartupAnimation:
-    for field, allowed in (("style", startup_anim.STYLES), ("direction", startup_anim.DIRECTIONS),
-                           ("palette", startup_anim.PALETTES)):
+    for field, allowed in (("style", startup_anim.STYLES), ("palette", startup_anim.PALETTES)):
         if getattr(body, field) not in allowed:
             raise HTTPException(400, f"unknown {field} {getattr(body, field)!r} - must be one of {allowed}")
     _hex_to_rgb(body.color)
@@ -1223,7 +1224,6 @@ def _checked_startup_animation(body: StartupAnimation) -> StartupAnimation:
         "brightness": min(max(body.brightness, 5), 100),
         "lap_s": min(max(body.lap_s, 0.3), 10.0),
         "laps": min(max(body.laps, 1), 5),
-        "tail": min(max(body.tail, 1), 40),
         "show_s": min(max(body.show_s, 2.0), 30.0),
         "fade_s": min(max(body.fade_s, 0.0), 10.0),
     })
@@ -1288,59 +1288,48 @@ def _startup_rings(reverse: bool = False) -> list[dict]:
     return rings
 
 
-def _play_ring_laps(show: _Show) -> dict:
-    """chase / fill / cascade: each ring its own run - all at once, or
-    (cascade) one after another in travel order."""
+def _play_case_spin(show: _Show) -> dict:
+    """The whole case turns as one ring: every fan LED placed by its angle
+    round the centre of all the fans (startup_anim.case_turns), so the
+    light sweeps from fan to fan round the case, `laps` times, its tail
+    growing until everything is lit. Ends with every ring fully lit."""
     cfg, rings = show.cfg, show.rings
-    delays = {r["id"]: 0.0 for r in rings}
-    if cfg.style == "cascade":
-        order = startup_anim.unit_order([(r["id"], r["leds"]) for r in rings], cfg.direction)
-        delays = {uid: i * cfg.lap_s * startup_anim.CASCADE_STAGGER for i, uid in enumerate(order)}
-    total = max(delays[r["id"]] + startup_anim.duration(cfg.style, cfg.lap_s, cfg.tail, r["count"], cfg.laps)
-                for r in rings)
+    turns = startup_anim.case_turns([(r["id"], r["leds"]) for r in rings], cfg.start_unit, cfg.reverse)
+    places = {r["id"]: turns.get(r["id"]) or r["places"] for r in rings}
+    total = startup_anim.spin_duration(cfg.lap_s, cfg.laps)
     start = time.monotonic()
     while not show.stop.is_set():
         t = time.monotonic() - start
-        show.write({r["id"]: startup_anim.frame(cfg.style, r["places"], t - delays[r["id"]], cfg.lap_s,
-                                                 cfg.tail, cfg.palette, show.colors, cfg.laps)
+        show.write({r["id"]: startup_anim.spin_frame(places[r["id"]], t, cfg.lap_s, cfg.laps,
+                                                      startup_anim.CASE_TAIL_START, cfg.palette, show.colors)
                     for r in rings})
         if t >= total:
             break
         show.tick()
-    return {r["id"]: startup_anim.end_frame(cfg.style, r["places"], cfg.palette, show.colors, show.t())
-            for r in rings}
+    return {r["id"]: startup_anim.full_frame(places[r["id"]], cfg.palette, show.colors, show.t()) for r in rings}
 
 
-def _play_snake(show: _Show) -> dict:
-    """One snake along a path through every ring in travel order (see
-    startup_anim.snake_path), at one ring's length per lap_s."""
+def _play_spin(show: _Show) -> dict:
+    """Every ring spins `laps` times on its own, its tail growing until the
+    whole ring is lit - the rings starting one after another in their
+    order round the case (from start_unit, in the turn's direction), each
+    next one half a turn later. Ends with every ring fully lit."""
     cfg, rings = show.cfg, show.rings
-    path = startup_anim.snake_path([(r["id"], r["leds"]) for r in rings if r["leds"]],
-                                   cfg.direction, cfg.reverse)
-    # rings without positions still get their turn, in strip order
-    path += [(r["id"], i) for r in rings if not r["leds"] for i in range(r["count"])]
-    if not path:
-        return {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
-    speed = (sum(r["count"] for r in rings) / len(rings)) / cfg.lap_s  # LEDs per second
-    total = (len(path) + cfg.tail) / speed
+    order = startup_anim.unit_sequence([(r["id"], r["leds"]) for r in rings], cfg.start_unit, cfg.reverse)
+    order += [r["id"] for r in rings if r["id"] not in order]
+    delays = {uid: i * cfg.lap_s * startup_anim.SPIN_STAGGER for i, uid in enumerate(order)}
+    total = max(delays.values()) + startup_anim.spin_duration(cfg.lap_s, cfg.laps)
     start = time.monotonic()
     while not show.stop.is_set():
         t = time.monotonic() - start
-        head = t * speed
-        frames = {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
-        for step, at in enumerate(path):
-            if at is startup_anim.GAP:
-                continue
-            behind = head - step
-            level = startup_anim.tail_level(behind, cfg.tail)
-            if level:
-                u = behind / cfg.tail if cfg.palette != "rainbow" else step / len(path)
-                frames[at[0]][at[1]] = startup_anim.scale(show.paint(u), level)
-        show.write(frames)
+        show.write({r["id"]: startup_anim.spin_frame(
+            r["places"], t - delays[r["id"]], cfg.lap_s, cfg.laps,
+            startup_anim.SPIN_TAIL_START_LEDS / r["count"], cfg.palette, show.colors)
+            for r in rings})
         if t >= total:
             break
         show.tick()
-    return {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
+    return {r["id"]: startup_anim.full_frame(r["places"], cfg.palette, show.colors, show.t()) for r in rings}
 
 
 def _call_on_loop(coro, timeout: float):
@@ -1390,7 +1379,7 @@ def _play_ambient_show(show: _Show) -> dict | None:
     source = _ambient_source(cfg)
     if source is None:
         log.info("startup animation: ambient needs a gallery video (or a custom power-on video) - "
-                 "playing the snake instead")
+                 "playing the case spin instead")
         return None
     original, remote = source
     previous = None
@@ -1456,30 +1445,23 @@ def _finale_targets():
 
 
 def _play_finale(show: _Show, end: dict) -> tuple[dict, list]:
-    """RAM and motherboard join in: once OpenRGB is up (the rings breathe
-    softly while it starts), the RAM sticks fill from the bottom, the
-    board and the rings ramp up, and everything ends lit. Returns the end
-    frames of everything it lit, and the RAM/board targets."""
+    """RAM and motherboard join in once the rings are lit: as soon as
+    OpenRGB is up (the rings hold meanwhile, at most
+    _FINALE_OPENRGB_WAIT_S), the RAM sticks fill from the bottom and the
+    board lights up. Returns the end frames of everything lit, and the
+    RAM/board targets."""
     rings, stop = show.rings, show.stop
     full = {r["id"]: [show.paint(p) for p in r["places"]] for r in rings}
     deadline = time.monotonic() + _FINALE_OPENRGB_WAIT_S
-    start = time.monotonic()
-    waited = False
     while not openrgb.connected and time.monotonic() < deadline and not stop.is_set():
-        waited = True
-        t = time.monotonic() - start
-        level = 0.12 + 0.1 * (1 - math.cos(t * math.pi)) / 2
-        show.write({r["id"]: startup_anim.blend(end[r["id"]], [startup_anim.scale(c, level) for c in full[r["id"]]],
-                                                 min(1.0, t / 0.6)) for r in rings})
-        show.tick()
+        stop.wait(0.2)
     targets = []
     if openrgb.connected:
         try:
             targets = _finale_targets()
         except Exception as exc:
             log.warning("startup animation: RAM/motherboard unavailable for the finale: %s", exc)
-    ring_start = {r["id"]: ([startup_anim.scale(c, 0.12) for c in full[r["id"]]] if waited else end[r["id"]])
-                  for r in rings}
+    ring_start = {r["id"]: end[r["id"]] for r in rings}
     finale_color = startup_anim.scale(show.paint(0.0), show.level)
     start = time.monotonic()
     while not stop.is_set():
@@ -1522,7 +1504,7 @@ def _run_startup_animation(cfg: StartupAnimation, fade_to_saved_colours: bool,
         if cfg.style == "ambient":
             end = _play_ambient_show(show)
         if end is None:
-            end = _play_snake(show) if cfg.style in ("snake", "ambient") else _play_ring_laps(show)
+            end = _play_spin(show) if cfg.style == "spin" else _play_case_spin(show)
         targets = []
         if cfg.finale and not stop.is_set():
             end, targets = _play_finale(show, end)

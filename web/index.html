@@ -385,61 +385,52 @@
 
       <section id="startupAnimSection">
         <div class="section-head"><h2>Startup animation</h2><div class="rule"></div>
-          <span class="note">plays on the fan rings when shyyctl starts, then fades into your effect</span></div>
+          <span class="note">plays when shyyctl starts, then switches to your effect / colours</span></div>
         <div class="card">
           <div class="row" style="margin-bottom:14px">
             <label class="inline"><input type="checkbox" id="startupEnabled"> play at startup</label>
           </div>
 
           <div class="effect-grid-3" style="margin-bottom:14px">
-            <div class="prop"><label>Style</label>
+            <div class="prop"><label>Animation</label>
               <div class="select-wrap"><select id="startupStyle" onchange="updateStartupProps()">
-                <option value="snake">Snake through the case</option>
-                <option value="cascade">Cascade, ring by ring</option>
-                <option value="chase">Running light, all rings</option>
-                <option value="fill">Fill rings</option>
-                <option value="ambient">Ambient from a video</option>
+                <option value="case_spin">Whole case turns</option>
+                <option value="spin">Each fan spins up</option>
+                <option value="ambient">Ambient light from a video</option>
               </select></div>
             </div>
-            <div class="prop" data-for="snake cascade"><label>Direction through the case</label>
-              <div class="select-wrap"><select id="startupDirection">
-                <option value="bottom_to_top">Bottom&uarr;Top</option>
-                <option value="top_to_bottom">Top&darr;Bottom</option>
-                <option value="left_to_right">Left&rarr;Right</option>
-                <option value="right_to_left">Right&larr;Left</option>
-              </select></div>
+            <div class="prop" data-for="case_spin spin"><label>Starts at</label>
+              <div class="select-wrap"><select id="startupStartUnit"></select></div>
             </div>
-            <div class="prop" data-for="snake cascade chase fill"><label>Around each ring</label>
+            <div class="prop" data-for="case_spin spin"><label>Turning</label>
               <div class="select-wrap"><select id="startupReverse">
-                <option value="false">Clockwise</option>
                 <option value="true">Counter-clockwise</option>
+                <option value="false">Clockwise</option>
               </select></div>
             </div>
           </div>
 
-          <div class="effect-grid-3" style="margin-bottom:14px" data-for="snake cascade chase fill finale">
+          <div class="effect-grid-3" style="margin-bottom:14px" data-for="case_spin spin finale">
             <div class="prop"><label>Colours</label>
               <div class="select-wrap"><select id="startupPalette" onchange="updateStartupProps()">
                 <option value="solid">One colour</option>
-                <option value="gradient">Gradient (head &rarr; tail)</option>
+                <option value="gradient">Gradient around the turn</option>
                 <option value="rainbow">Rainbow</option>
               </select></div>
             </div>
             <div class="prop" data-for="palette-solid palette-gradient"><label>Colour</label>
               <input type="color" id="startupColor" value="#ffffff">
             </div>
-            <div class="prop" data-for="palette-gradient"><label>Tail colour</label>
+            <div class="prop" data-for="palette-gradient"><label>Second colour</label>
               <input type="color" id="startupColor2" value="#4c79ff">
             </div>
           </div>
 
           <div class="effect-grid-3" style="align-items:end;margin-bottom:14px">
-            <label class="inline" data-for="snake cascade chase fill">speed: one ring per
+            <label class="inline" data-for="case_spin spin">turns
+              <input type="number" id="startupLaps" min="1" max="5" step="1" value="2" style="width:64px"></label>
+            <label class="inline" data-for="case_spin spin">one turn
               <input type="number" id="startupLap" min="0.3" max="10" step="0.1" value="1.5" style="width:64px"> s</label>
-            <label class="inline" data-for="snake cascade chase">tail
-              <input type="number" id="startupTail" min="1" max="40" step="1" value="10" style="width:64px"> LEDs</label>
-            <label class="inline" data-for="cascade chase">laps
-              <input type="number" id="startupLaps" min="1" max="5" step="1" value="1" style="width:64px"></label>
             <label class="inline">brightness
               <input type="number" id="startupBrightness" min="5" max="100" step="5" value="100" style="width:64px"> %</label>
           </div>
@@ -455,12 +446,12 @@
 
           <div class="effect-grid" style="align-items:end;margin-bottom:0">
             <label class="inline"><input type="checkbox" id="startupFinale" checked onchange="updateStartupProps()">
-              finale: RAM and board join, everything lights up</label>
-            <label class="inline">fade into effect <input type="number" id="startupFade" min="0" max="10"
+              RAM and board light up at the end</label>
+            <label class="inline">switch to your effect over <input type="number" id="startupFade" min="0" max="10"
               step="0.1" value="1.5" style="width:64px"> s</label>
           </div>
           <div class="note" data-for="ambient" style="margin-top:10px">
-            The rings follow the video's colours by their place in the case. The TRYX default
+            The fans follow the video's colours by their place in the case. The TRYX default
             animations only exist on the panel itself, so pick a video from your gallery.</div>
 
           <div class="row" style="margin-top:14px">
@@ -2988,15 +2979,14 @@ function startupAnimForm(){
   return {
     enabled: document.getElementById("startupEnabled").checked,
     style: val("startupStyle"),
-    direction: val("startupDirection"),
+    start_unit: val("startupStartUnit"),
     reverse: val("startupReverse") === "true",
     palette: val("startupPalette"),
     color: val("startupColor"),
     color2: val("startupColor2"),
     brightness: parseInt(val("startupBrightness")) || 100,
     lap_s: parseFloat(val("startupLap")) || 1.5,
-    laps: parseInt(val("startupLaps")) || 1,
-    tail: parseInt(val("startupTail")) || 10,
+    laps: parseInt(val("startupLaps")) || 2,
     ambient_source: val("startupAmbientSource"),
     ambient_on_display: document.getElementById("startupAmbientDisplay").checked,
     show_s: parseFloat(val("startupShow")) || 8,
@@ -3018,6 +3008,14 @@ function updateStartupProps(){
   });
 }
 
+function fillStartupStartUnits(selected){
+  const box = document.getElementById("startupStartUnit");
+  const fans = (layoutData ? layoutData.units : []).filter(u=>u.kind==="fan");
+  box.innerHTML = `<option value="">The left-most fan</option>` +
+    fans.map(u=>`<option value="${u.id}">${esc(u.name)}${u.model ? " · " + esc(u.model) : ""}</option>`).join("");
+  box.value = fans.some(u=>u.id===selected) ? selected : "";
+}
+
 function fillStartupAmbientSources(selected){
   const box = document.getElementById("startupAmbientSource");
   const videos = galleryItems.filter(i=>isVideoItem(i));
@@ -3032,7 +3030,8 @@ async function loadStartupAnimation(){
     const set = (id, v) => document.getElementById(id).value = v;
     document.getElementById("startupEnabled").checked = c.enabled;
     set("startupStyle", c.style);
-    set("startupDirection", c.direction);
+    if(!layoutData) await loadLayout();
+    fillStartupStartUnits(c.start_unit);
     set("startupReverse", String(c.reverse));
     set("startupPalette", c.palette);
     set("startupColor", c.color);
@@ -3040,7 +3039,6 @@ async function loadStartupAnimation(){
     set("startupBrightness", c.brightness);
     set("startupLap", c.lap_s);
     set("startupLaps", c.laps);
-    set("startupTail", c.tail);
     set("startupShow", c.show_s);
     document.getElementById("startupAmbientDisplay").checked = c.ambient_on_display;
     document.getElementById("startupFinale").checked = c.finale;
