@@ -18,3 +18,4 @@ build/
 dist/
 shyyctl.log
 tools/build_installer/*.exe
+startup_animation.json

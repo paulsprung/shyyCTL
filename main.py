@@ -106,6 +106,7 @@ from app.panorama import (PanoramaError, build_encoded_media_container, find_pri
 from app.procflags import NO_WINDOW
 from app.scan import Scan
 from app import geometry
+from app import startup_anim
 from app import sensors as sensors_mod
 
 # ROOT is where persistent, writable state lives (config.yaml, curve.json,
@@ -150,6 +151,7 @@ CURVE_FILE = ROOT / "curve.json"
 LAYOUT_FILE = ROOT / "layout.json"
 PANORAMA_STATE_FILE = ROOT / "panorama_state.json"
 EFFECT_STATE_FILE = ROOT / "effect_state.json"
+STARTUP_ANIM_FILE = ROOT / "startup_animation.json"
 RGB_STATE_FILE = ROOT / "rgb_state.json"
 EFFECT_PRESETS_FILE = ROOT / "effect_presets.json"
 GALLERY_DIR = ROOT / "media_gallery"
@@ -1068,6 +1070,15 @@ async def _reapply_rgb_state(hub_only: bool = False):
             log.warning("could not reapply saved RAM colours: %s", exc)
 
     hub_state = state.get("hub", {})
+    if hub_state:
+        await _wait_startup_animation()
+        if HUB_DIRECT and EFFECT_STATE_FILE.is_file():
+            # A saved effect is about to take these rings over, fading in
+            # from where the startup animation left them - a static colour
+            # in between would flash.
+            driven = {u.get("led_channel") for u in layout.load().get("units", [])
+                      if u.get("kind") == "fan"}
+            hub_state = {ch: e for ch, e in hub_state.items() if ch not in driven}
     for channel, entry in hub_state.items():
         try:
             rgb = _hex_to_rgb(entry["color"])
@@ -1128,15 +1139,148 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
     the scan takes a while, this is just about not racing the effect
     against it. Capped at ~30s in case the scan never finishes (nothing
     to scan, or something's genuinely stuck) - the effect still starts
-    at the cap either way rather than never running at all."""
-    for _ in range(150):
-        if not scan.running:
-            break
-        await asyncio.sleep(0.2)
+    at the cap either way rather than never running at all.
+
+    With direct hub control nothing waits on the scan - channel sizes come
+    from the layout - so the effect starts as soon as the startup
+    animation is over, fading in from where it ended."""
+    if not HUB_DIRECT:
+        for _ in range(150):
+            if not scan.running:
+                break
+            await asyncio.sleep(0.2)
+    played = await _wait_startup_animation()
     try:
-        await _do_start_position_effect(saved_effect, persist=False)
+        await _do_start_position_effect(saved_effect, persist=False, fade_in=played)
     except Exception as exc:
         log.warning("Could not resume saved effect: %s", exc)
+
+
+# -- startup animation ------------------------------------------------------
+#
+# The hub keeps nothing across a power-off (every LED comes up white -
+# confirmed on the real hardware), so the first thing the fan rings show
+# that shyyctl chose is this: played on the hub alone, right after shyyctl
+# has it, then faded into the saved effect or the saved static colours.
+# Frames: app/startup_anim.py.
+
+class StartupAnimation(BaseModel):
+    enabled: bool = True
+    style: str = "chase"         # startup_anim.STYLES
+    color: str = "#ffffff"
+    lap_s: float = 1.5           # one lap around a ring
+    tail: int = 4                # chase only: LEDs the tail fades over
+    fade_s: float = 1.5          # into the saved effect / colours
+
+
+def _load_startup_animation() -> StartupAnimation:
+    try:
+        return StartupAnimation.model_validate_json(STARTUP_ANIM_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return StartupAnimation()
+    except Exception as exc:
+        log.warning("could not read %s (%s) - using the default startup animation",
+                    STARTUP_ANIM_FILE.name, exc)
+        return StartupAnimation()
+
+
+def _checked_startup_animation(body: StartupAnimation) -> StartupAnimation:
+    if body.style not in startup_anim.STYLES:
+        raise HTTPException(400, f"unknown style {body.style!r} - must be one of {startup_anim.STYLES}")
+    _hex_to_rgb(body.color)
+    return body.model_copy(update={
+        "lap_s": min(max(body.lap_s, 0.3), 10.0),
+        "tail": min(max(body.tail, 1), 16),
+        "fade_s": min(max(body.fade_s, 0.0), 10.0),
+    })
+
+
+_startup_anim_task: asyncio.Future | None = None
+_startup_anim_fade: tuple[str, tuple[int, int, int]] | None = None  # (style, colour) the rings ended on
+_STARTUP_FRAME_S = 0.04
+
+
+def _startup_rings() -> list[tuple[str, list[float]]]:
+    """(led channel, place of each strip LED along its ring) for every
+    placed fan unit the hub drives. Units without positions in the layout
+    run in strip order."""
+    data = layout.with_leds()
+    rings = []
+    for u in data["units"]:
+        channel = u.get("led_channel")
+        if u.get("kind") != "fan" or not channel or channel not in hub.channels.get("led", []):
+            continue
+        count = _hub_channel_led_count(channel)
+        if not count:
+            continue
+        places = startup_anim.ring_order([l for l in data["leds"] if l["unit"] == u["id"]])
+        if len(places) != count:
+            places = [i / count for i in range(count)]
+        rings.append((channel, places))
+    return rings
+
+
+def _run_startup_animation(cfg: StartupAnimation, fade_to_saved_colours: bool,
+                           stop: threading.Event):
+    """Plays the animation once on every fan ring (blocking, ~lap_s),
+    then - when no effect follows - fades into the saved static colours.
+    A following effect does its own fade (see _run_position_effect)."""
+    global _startup_anim_fade
+    rings = _startup_rings()
+    if not rings:
+        return
+    color = _hex_to_rgb(cfg.color)
+    total = max(startup_anim.duration(cfg.style, cfg.lap_s, cfg.tail, len(pl)) for _, pl in rings)
+    start = time.monotonic()
+    try:
+        while not stop.is_set():
+            t = time.monotonic() - start
+            for channel, places in rings:
+                hub.set_leds(channel, startup_anim.frame(cfg.style, places, t, cfg.lap_s, cfg.tail, color))
+            if t >= total:
+                break
+            stop.wait(_STARTUP_FRAME_S)
+        _startup_anim_fade = (cfg.style, color)
+        if stop.is_set() or not fade_to_saved_colours:
+            return
+        saved = _load_rgb_state().get("hub", {})
+        ends = {ch: startup_anim.end_frame(cfg.style, len(pl), color) for ch, pl in rings}
+        targets = {ch: [_hex_to_rgb(saved[ch]["color"]) if ch in saved else (0, 0, 0)] * len(pl)
+                   for ch, pl in rings}
+        fade_start = time.monotonic()
+        while not stop.is_set():
+            k = (time.monotonic() - fade_start) / cfg.fade_s if cfg.fade_s > 0 else 1.0
+            for channel, _ in rings:
+                hub.set_leds(channel, startup_anim.blend(ends[channel], targets[channel], k))
+            if k >= 1:
+                break
+            stop.wait(_STARTUP_FRAME_S)
+    except Exception as exc:
+        log.warning("startup animation stopped: %s", exc)
+
+
+def _start_startup_animation():
+    """Called once, right after the hub connected at launch."""
+    global _startup_anim_task
+    if not (HUB_DIRECT and hub.connected):
+        return
+    cfg = _load_startup_animation()
+    if not cfg.enabled:
+        return
+    _startup_anim_task = asyncio.ensure_future(asyncio.to_thread(
+        _run_startup_animation, cfg, _load_effect_state() is None, threading.Event()))
+
+
+async def _wait_startup_animation() -> bool:
+    """Waits for a running startup animation to finish; whether one ran."""
+    task = _startup_anim_task
+    if task is None:
+        return False
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=30)
+    except Exception as exc:
+        log.warning("startup animation did not finish cleanly: %s", exc)
+    return _startup_anim_fade is not None
 
 
 @asynccontextmanager
@@ -1155,6 +1299,7 @@ async def lifespan(app: FastAPI):
 
     if not await _hub_call(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
+    _start_startup_animation()
     await _sync_openrgb_hub_detection()
 
     try:
@@ -1295,6 +1440,7 @@ async def _lite_service_main():
 
     if not await _hub_call(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
+    _start_startup_animation()
 
     saved_effect = _load_effect_state()
     rgb_state = _load_rgb_state()
@@ -1594,6 +1740,7 @@ _LITE_EXPORT_FILES: list[tuple[str, "Path"]] = [
     ("rgb_state.json", RGB_STATE_FILE),
     ("effect_state.json", EFFECT_STATE_FILE),
     ("effect_presets.json", EFFECT_PRESETS_FILE),
+    ("startup_animation.json", STARTUP_ANIM_FILE),
     ("panorama_state.json", PANORAMA_STATE_FILE),
 ]
 
@@ -2603,7 +2750,8 @@ def _end_effect(stop: threading.Event, error: str | None = None):
 def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                          period_s: float, moving: bool, shape: str = "wave",
                          led_selection: dict[str, set[int]] | None = None,
-                         stop: threading.Event | None = None):
+                         stop: threading.Event | None = None,
+                         fade_in: tuple[float, tuple[int, int, int] | None, set] | None = None):
     """Runs until `stop` is set, on its own thread (see
     _start_effect_thread) - one raw hub connection held for the whole effect
     rather than reopened per frame (see openrgb_raw.py's docstring on
@@ -2890,6 +3038,25 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                           for led, c in zip(unit_leds, colors_out)]
 
         return unit_leds, colors_out
+
+    if fade_in is not None:
+        # (seconds, colour the fan rings start from or None for dark, ids
+        # of those rings) - after the startup animation the effect blends
+        # in over the first few seconds instead of cutting in; everything
+        # else fades up from dark.
+        fade_s, fade_color, faded_ids = fade_in
+        effect_frame_colors = frame_colors
+        fade_started = [None]
+
+        def frame_colors(u):
+            unit_leds, colors_out = effect_frame_colors(u)
+            if fade_started[0] is None:
+                fade_started[0] = time.monotonic()
+            k = (time.monotonic() - fade_started[0]) / fade_s if fade_s > 0 else 1.0
+            if k < 1:
+                base = fade_color if fade_color is not None and u["id"] in faded_ids else (0, 0, 0)
+                colors_out = startup_anim.blend([base] * len(colors_out), colors_out, k)
+            return unit_leds, colors_out
 
     def refresh_ambient_source():
         media = _current_panorama_media_path()
@@ -3184,7 +3351,8 @@ class PositionEffectRequest(BaseModel):
     led_selection: dict[str, list[int]] | None = None
 
 
-async def _do_start_position_effect(body: PositionEffectRequest, persist: bool = True):
+async def _do_start_position_effect(body: PositionEffectRequest, persist: bool = True,
+                                     fade_in: bool = False):
     """Shared by the route below and lifespan's on-launch resume - both
     need to validate, stop whatever's running, and kick off the same
     background loop. persist=False on the resume path: the state file
@@ -3218,11 +3386,55 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
         "moving": body.moving, "shape": body.shape, "led_selection": body.led_selection,
         "started_at": time.time(), "error": None,
     }
+    fade = None
+    if fade_in and _startup_anim_fade is not None:
+        style, color = _startup_anim_fade
+        fan_ids = {u["id"] for u in layout.load().get("units", []) if u.get("kind") == "fan"}
+        fade = (_load_startup_animation().fade_s, color if style == "fill" else None, fan_ids)
     _effect_task = _start_effect_thread(
         _run_position_effect, body.direction, body.palette,
-        rgb_colors, period_s, body.moving, body.shape, selection, stop)
+        rgb_colors, period_s, body.moving, body.shape, selection, stop, fade)
     if persist:
         _save_effect_state(body)
+
+
+@app.get("/api/rgb/startup-animation")
+async def get_startup_animation():
+    return {**_load_startup_animation().model_dump(), "styles": list(startup_anim.STYLES),
+            "available": HUB_DIRECT}
+
+
+@app.post("/api/rgb/startup-animation")
+async def set_startup_animation(body: StartupAnimation):
+    cfg = _checked_startup_animation(body)
+    STARTUP_ANIM_FILE.write_text(cfg.model_dump_json(), encoding="utf-8")
+    return cfg.model_dump()
+
+
+@app.post("/api/rgb/startup-animation/preview")
+async def preview_startup_animation(body: StartupAnimation):
+    """Plays the given (not necessarily saved) animation now, the way it
+    runs at launch: whatever was running stops, the animation plays, then
+    the saved effect resumes with its fade - or the saved colours fade in."""
+    global _effect_task, _effect_status, _startup_anim_fade
+    if not HUB_DIRECT:
+        raise HTTPException(400, "the startup animation needs hub.control: direct")
+    if not hub.ensure_connected():
+        raise HTTPException(503, f"hub not connected: {hub.last_error}")
+    cfg = _checked_startup_animation(body)
+    saved = _load_effect_state()
+    await _stop_effect()
+    stop = _new_effect_stop()
+    _startup_anim_fade = None
+    _effect_status = {"running": True, "kind": "startup", "error": None}
+    _effect_task = _start_effect_thread(_run_startup_animation, cfg, saved is None, stop)
+    await _effect_task
+    if stop is not _effect_stop:
+        return {"ok": True}  # something else was started meanwhile
+    _end_effect(stop)
+    if saved is not None:
+        await _do_start_position_effect(saved, persist=False, fade_in=True)
+    return {"ok": True}
 
 
 @app.post("/api/rgb/effects/position/start")

@@ -383,6 +383,41 @@
         <div id="hubRgbList" class="rgb-grid"></div>
       </section>
 
+      <section id="startupAnimSection">
+        <div class="section-head"><h2>Startup animation</h2><div class="rule"></div>
+          <span class="note">plays on the fan rings when shyyctl starts, then fades into your effect</span></div>
+        <div class="card">
+          <div class="row" style="margin-bottom:14px">
+            <label class="inline"><input type="checkbox" id="startupEnabled"> play at startup</label>
+          </div>
+          <div class="effect-grid-3" style="margin-bottom:14px">
+            <div class="prop"><label>Style</label>
+              <div class="seg" id="startupStyleSeg">
+                <button data-v="chase" aria-pressed="true">Running light</button>
+                <button data-v="fill">Fill ring</button>
+              </div>
+            </div>
+            <div class="prop"><label>Colour</label>
+              <input type="color" id="startupColor" value="#ffffff">
+            </div>
+            <div class="prop" id="startupTailProp"><label>Tail (LEDs)</label>
+              <input type="number" id="startupTail" min="1" max="16" step="1" value="4" style="width:64px">
+            </div>
+          </div>
+          <div class="effect-grid" style="align-items:end;margin-bottom:0">
+            <label class="inline">one lap <input type="number" id="startupLap" min="0.3" max="10"
+              step="0.1" value="1.5" style="width:64px"> s</label>
+            <label class="inline">fade into effect <input type="number" id="startupFade" min="0" max="10"
+              step="0.1" value="1.5" style="width:64px"> s</label>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn sec sm" onclick="previewStartupAnimation()">Preview</button>
+            <button class="btn sm" onclick="saveStartupAnimation()">Save</button>
+            <span class="note" id="startupAnimNote"></span>
+          </div>
+        </div>
+      </section>
+
       <section>
         <div class="section-head"><h2>Advanced</h2><div class="rule"></div></div>
         <div class="card">
@@ -2860,6 +2895,62 @@ async function stopLedOrderTest(){
   try{ await api("/api/rgb/effects/stop",{method:"POST"}); }catch(e){}
   drawSetupCase();
 }
+
+/* ---------- startup animation ---------- */
+
+function startupAnimForm(){
+  const style = document.querySelector("#startupStyleSeg button[aria-pressed='true']");
+  return {
+    enabled: document.getElementById("startupEnabled").checked,
+    style: style ? style.dataset.v : "chase",
+    color: document.getElementById("startupColor").value,
+    lap_s: parseFloat(document.getElementById("startupLap").value) || 1.5,
+    tail: parseInt(document.getElementById("startupTail").value) || 4,
+    fade_s: parseFloat(document.getElementById("startupFade").value) || 0,
+  };
+}
+
+function setStartupStyle(style){
+  document.querySelectorAll("#startupStyleSeg button").forEach(b=>
+    b.setAttribute("aria-pressed", String(b.dataset.v === style)));
+  // the tail only means something for the running light
+  document.getElementById("startupTailProp").style.visibility = style === "chase" ? "" : "hidden";
+}
+
+async function loadStartupAnimation(){
+  try{
+    const c = await api("/api/rgb/startup-animation");
+    document.getElementById("startupEnabled").checked = c.enabled;
+    document.getElementById("startupColor").value = c.color;
+    document.getElementById("startupLap").value = c.lap_s;
+    document.getElementById("startupTail").value = c.tail;
+    document.getElementById("startupFade").value = c.fade_s;
+    setStartupStyle(c.style);
+    document.getElementById("startupAnimNote").textContent =
+      c.available ? "" : "needs hub.control: direct in config.yaml";
+  }catch(e){
+    document.getElementById("startupAnimNote").textContent = "not available: " + e.message;
+  }
+}
+
+async function saveStartupAnimation(){
+  try{
+    await api("/api/rgb/startup-animation",{method:"POST",body:JSON.stringify(startupAnimForm())});
+    say("Startup animation saved - it plays the next time shyyctl starts.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function previewStartupAnimation(){
+  try{
+    say("Playing the startup animation...");
+    await api("/api/rgb/startup-animation/preview",{method:"POST",body:JSON.stringify(startupAnimForm())});
+    say("Startup animation done.");
+  }catch(e){ say(e.message,"error"); }
+}
+
+document.querySelectorAll("#startupStyleSeg button").forEach(b=>
+  b.addEventListener("click", ()=>setStartupStyle(b.dataset.v)));
+loadStartupAnimation();
 
 /* ---------- settings ---------- */
 
