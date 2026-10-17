@@ -3723,7 +3723,7 @@ async function loadSystemInfo(){
    OpenRGB (RAM lighting) and SensorHelper (temperatures) need admin
    rights - by default that's a UAC prompt for each at every launch. Set
    up once here (one prompt), protected copies start through Windows'
-   Task Scheduler instead; see tools/elevated_helpers.ps1. */
+   Task Scheduler instead; see app/elevated_helpers.py. */
 function renderElevatedHelpers(h){
   const section = document.getElementById("elevatedHelpersSection");
   section.style.display = h.supported ? "" : "none";

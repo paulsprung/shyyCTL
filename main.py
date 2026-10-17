@@ -15,6 +15,21 @@ Run:
 
 import sys
 
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--elevated-helpers":
+    # Settings' "start without UAC prompts", in the elevated copy of this
+    # program its one prompt started (see app/elevated_helpers.py) - none
+    # of the server setup below may happen in it.
+    from app.elevated_helpers import main as _elevated_helpers_main
+    sys.exit(_elevated_helpers_main(sys.argv[2:]))
+
+if __name__ == "__main__" and "--remove-elevated-helpers" in sys.argv:
+    # The uninstaller's way of undoing that (see
+    # tools/build_installer/installer.nsi) - exactly what Settings' "Undo"
+    # does, then exit.
+    from app.elevated_helpers import run_elevated as _run_elevated
+    _run_elevated("remove")
+    sys.exit(0)
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--liquidctl":
     # The installed exe doubles as the bundled liquidctl CLI (see
     # app/hub.py's _liquidctl_command): `shyyctl.exe --liquidctl <args>`
@@ -102,6 +117,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.conflicts import running_conflicts
+from app import elevated_helpers
 from app.hub import DirectHub, Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
@@ -676,17 +692,15 @@ async def _keepalive_loop():
 #
 # OpenRGB (RAM RGB) and SensorHelper (temperatures) need admin rights. The
 # default is a UAC prompt for each at every launch; once set up from
-# Settings (tools/elevated_helpers.ps1, one prompt), protected copies of
+# Settings (app/elevated_helpers.py, one prompt), protected copies of
 # both in %ProgramFiles%\shyyctl\helpers are started by two scheduled
-# tasks at the highest run level instead - see that script for why only
+# tasks at the highest run level instead - see that module for why only
 # that arrangement is safe to run elevated without asking. A copy that no
 # longer matches the bundled helper (after an update) isn't used: back to
 # the prompt, until set up again.
 
-HELPER_TASK_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "shyyctl" / "helpers"
-HELPER_TASKS = ("OpenRGB", "SensorHelper")
-_HELPER_SCRIPT = (ASSETS_DIR / "elevated_helpers.ps1" if getattr(sys, "frozen", False)
-                  else ROOT / "tools" / "elevated_helpers.ps1")
+HELPER_TASK_DIR = elevated_helpers.DEST
+HELPER_TASKS = elevated_helpers.HELPERS
 _digests: dict[tuple, str] = {}
 
 
@@ -760,60 +774,14 @@ def _run_helper_task(name: str) -> bool:
         return False
 
 
-def _run_elevated_helpers_script(action: str) -> dict:
-    """Runs tools/elevated_helpers.ps1 elevated (one UAC prompt) and
-    waits for it. Blocking - call from a thread."""
-    import ctypes
-    from ctypes import wintypes
-    import tempfile
-
-    if not _HELPER_SCRIPT.is_file():
-        return {"ok": False, "message": f"setup script missing: {_HELPER_SCRIPT}"}
-    result_file = Path(tempfile.gettempdir()) / f"shyyctl-helpers-{os.getpid()}.json"
-    result_file.unlink(missing_ok=True)
-    args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-            "-File", str(_HELPER_SCRIPT), "-Action", action, "-ResultFile", str(result_file)]
-    if action == "install":
-        args += ["-VendorDir", str(ROOT / "vendor"),
-                 "-User", f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".lstrip("\\"),
-                 "-OpenRgbSettings", str(Path(os.environ.get("APPDATA", "")) / "OpenRGB" / "OpenRGB.json"),
-                 "-SensorPort", str(_sensor_helper_port())]
-
-    class SHELLEXECUTEINFOW(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
-                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
-                    ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
-                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
-                    ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
-                    ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
-
-    info = SHELLEXECUTEINFOW()
-    info.cbSize = ctypes.sizeof(info)
-    info.fMask = 0x00000040 | 0x00000100  # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
-    info.lpVerb = "runas"
-    info.lpFile = "powershell.exe"
-    info.lpParameters = subprocess.list2cmdline(args)
-    info.nShow = 0  # SW_HIDE
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
-    shell32.ShellExecuteExW.restype = wintypes.BOOL
-    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    if not shell32.ShellExecuteExW(ctypes.byref(info)):
-        err = ctypes.get_last_error()
-        return {"ok": False, "message": "the administrator prompt was declined" if err == 1223
-                else f"could not start the setup (error {err})"}
-    try:
-        kernel32.WaitForSingleObject(info.hProcess, 300_000)
-    finally:
-        kernel32.CloseHandle(info.hProcess)
-    try:
-        return json.loads(result_file.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {"ok": False, "message": "the setup didn't report back"}
-    finally:
-        result_file.unlink(missing_ok=True)
+def _run_elevated_helpers(action: str) -> dict:
+    """Sets up or removes the prompt-free start (one UAC prompt) and waits
+    for it. Blocking - call from a thread."""
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".lstrip("\\")
+    return elevated_helpers.run_elevated(
+        action, vendor_dir=ROOT / "vendor", user=user,
+        openrgb_settings=Path(os.environ.get("APPDATA", "")) / "OpenRGB" / "OpenRGB.json",
+        sensor_port=_sensor_helper_port())
 
 
 def _elevated_helpers_status() -> dict:
@@ -2247,18 +2215,36 @@ async def elevated_helpers_status():
 @app.post("/api/system/elevated-helpers/{action}")
 async def elevated_helpers_action(action: str):
     """Set up (one UAC prompt) or remove starting OpenRGB and SensorHelper
-    without a prompt - see tools/elevated_helpers.ps1. Setting up restarts
+    without a prompt - see app/elevated_helpers.py. Setting up restarts
     both from their protected copies right away; removing starts them the
     old way again, with a prompt."""
     if action not in ("install", "remove"):
         raise HTTPException(404, "unknown action")
     if sys.platform != "win32":
         raise HTTPException(400, "only on Windows")
-    result = await asyncio.to_thread(_run_elevated_helpers_script, action)
+    result = await asyncio.to_thread(_run_elevated_helpers, action)
+    if not result.get("ok"):
+        log.warning("%s the prompt-free helper start failed: %s",
+                    "setting up" if action == "install" else "removing", result.get("message"))
     if action == "remove" and result.get("ok"):
         asyncio.create_task(asyncio.to_thread(_start_openrgb_if_needed))
         asyncio.create_task(_bring_up_sensor_helper())
+    if action == "install" and result.get("ok"):
+        asyncio.create_task(_reconnect_openrgb_after_setup())
     return {**result, **await asyncio.to_thread(_elevated_helpers_status)}
+
+
+async def _reconnect_openrgb_after_setup():
+    """Setting up restarts OpenRGB from its protected copy, so the old SDK
+    connection is gone - and nothing else notices until something writes
+    to it. Back on as soon as the new one answers (a running effect then
+    takes RAM and board on again by itself)."""
+    for _ in range(30):
+        await asyncio.sleep(1.5)
+        if await asyncio.to_thread(openrgb.reconnect):
+            log.info("OpenRGB reconnected after setting up the prompt-free start")
+            return
+    log.warning("OpenRGB didn't answer after setting up the prompt-free start: %s", openrgb.last_error)
 
 
 @app.get("/api/system/autostart")
@@ -4609,14 +4595,6 @@ def _already_running(host: str, port: int) -> bool:
 
 
 if __name__ == "__main__":
-    if "--remove-elevated-helpers" in sys.argv:
-        # The uninstaller's way of undoing "Start without UAC prompts" (see
-        # tools/build_installer/installer.nsi) - exactly what Settings'
-        # "Undo" does, then exit.
-        log.info("removing the prompt-free helper start: %s",
-                 _run_elevated_helpers_script("remove").get("message"))
-        sys.exit(0)
-
     _host = CONFIG["server"]["host"]
     _port = CONFIG["server"]["port"]
 
