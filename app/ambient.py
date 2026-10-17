@@ -150,8 +150,16 @@ class AmbientSampler:
         # so it burned a full core re-decoding the (2240px-wide) video
         # over and over, with the sampled colours racing far ahead of
         # what the panel was actually showing.
-        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-re", "-stream_loop", "-1", "-i", path,
-               "-vf", f"scale={GRID_W}:{GRID_H}", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        # Only the picture's edge at 32x16 is wanted, so decode cheaply:
+        # one thread (by default ffmpeg starts one per core, each holding
+        # full-size 2240x1080 frames - 150MB+ for this), no deblocking
+        # (invisible at 32x16), no audio. Measured on the real panel video:
+        # ~19% of a core and 153MB down to ~10% and 31MB.
+        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error",
+               "-threads", "1", "-skip_loop_filter", "all", "-flags2", "fast",
+               "-re", "-stream_loop", "-1", "-i", path,
+               "-an", "-sn", "-dn", "-filter_threads", "1",
+               "-vf", f"scale={GRID_W}:{GRID_H}:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-r", str(self._fps), "-"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -190,8 +198,8 @@ class AmbientSampler:
         a persistent process left running to redundantly redecode the
         same pixels every 0.5s."""
         ffmpeg_path = resolve_ffmpeg_path()
-        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-i", path,
-               "-vf", f"scale={GRID_W}:{GRID_H}", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-threads", "1", "-i", path,
+               "-vf", f"scale={GRID_W}:{GRID_H}:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24",
                "-frames:v", "1", "-"]
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

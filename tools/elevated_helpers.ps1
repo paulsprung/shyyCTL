@@ -102,7 +102,7 @@ try {
         Select-Object -First 1
     if ($openrgb) {
         $action = New-ScheduledTaskAction -Execute $openrgb.FullName `
-            -Argument "--server --startminimized --config `"$config`"" -WorkingDirectory $openrgb.DirectoryName
+            -Argument "--server --config `"$config`"" -WorkingDirectory $openrgb.DirectoryName
         Register-ScheduledTask -TaskPath $TaskPath -TaskName 'OpenRGB' -Action $action -Principal $principal `
             -Settings $settings -Description 'Started by shyyctl: OpenRGB with admin rights for RAM RGB, without a UAC prompt.' `
             -Force | Out-Null

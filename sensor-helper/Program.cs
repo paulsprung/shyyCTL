@@ -112,6 +112,14 @@ try
                 }
                 var tree = BuildNode("Computer", null, computer.Hardware.Select(BuildHardwareNode).ToList());
                 var json = JsonSerializer.Serialize(tree);
+                // LibreHardwareMonitor keeps every reading of every sensor
+                // as history (a day's worth) - nothing here reads it, and
+                // with ~200 sensors polled every few seconds it grew the
+                // process by tens of MB an hour.
+                foreach (var hardware in computer.Hardware)
+                {
+                    ClearHistory(hardware);
+                }
                 var bytes = Encoding.UTF8.GetBytes(json);
                 context.Response.ContentType = "application/json";
                 context.Response.ContentLength64 = bytes.Length;
@@ -130,6 +138,13 @@ try
         finally
         {
             context.Response.OutputStream.Close();
+            // .NET sizes its youngest-generation budget by the CPU's cache,
+            // so on a big-cache CPU (a 9950X3D: 128MB L3) the garbage of a
+            // few hundred requests piled up before any collection - the
+            // process sat at ~65MB private instead of ~15MB. A request
+            // comes every few seconds at most; collecting after each one
+            // costs a millisecond or two.
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         }
     }
 
@@ -145,6 +160,18 @@ catch (Exception ex)
 }
 
 // -- helpers --------------------------------------------------------------
+
+static void ClearHistory(IHardware hardware)
+{
+    foreach (var sensor in hardware.Sensors)
+    {
+        sensor.ClearValues();
+    }
+    foreach (var sub in hardware.SubHardware)
+    {
+        ClearHistory(sub);
+    }
+}
 
 static void UpdateRecursive(IHardware hardware)
 {

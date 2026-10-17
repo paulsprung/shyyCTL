@@ -68,14 +68,46 @@ _LIQUIDCTL_LOCK = threading.Lock()
 HUB_READ_ATTEMPTS = 96
 
 
-def patch_liquidctl_reads() -> None:
+def control_hub_class():
+    """liquidctl's ControlHub driver class - loaded on its own.
+
+    liquidctl's package __init__ (and liquidctl.driver's) import every one
+    of its ~30 device drivers: 132 modules, ~12MB of RAM in a process that
+    only ever talks to this one hub. The two packages are registered as
+    bare namespaces first, so importing the ControlHub module brings in
+    only what it uses itself (smart_device, usb, base, util, error).
+    Device discovery still works - HidapiBus matches against the driver
+    classes that are loaded, and this is the one it needs. Not for the
+    bundled liquidctl CLI (main.py's --liquidctl), which needs the real
+    packages - see patch_liquidctl_reads(full=True)."""
+    if "liquidctl.driver" not in sys.modules:
+        import importlib.util
+        import types
+        spec = importlib.util.find_spec("liquidctl")
+        if spec is not None and spec.submodule_search_locations:
+            roots = list(spec.submodule_search_locations)
+            for name, path in (("liquidctl", roots),
+                               ("liquidctl.driver", [os.path.join(r, "driver") for r in roots])):
+                package = types.ModuleType(name)
+                package.__path__ = path
+                package.__package__ = name
+                sys.modules[name] = package
+    from liquidctl.driver.control_hub import ControlHub
+    return ControlHub
+
+
+def patch_liquidctl_reads(full: bool = False) -> None:
     """Raise the Control Hub driver's read budget (see HUB_READ_ATTEMPTS).
     Applied in this process (accessory_ids) and in every bundled liquidctl
-    child (main.py's --liquidctl entry) - not possible for a separately
-    installed liquidctl on PATH, which is why the bundled copy is preferred
-    in the installed app (see _liquidctl_command)."""
+    child (main.py's --liquidctl entry, full=True: the CLI needs the whole
+    liquidctl package, not control_hub_class()'s lean load) - not possible
+    for a separately installed liquidctl on PATH, which is why the bundled
+    copy is preferred in the installed app (see _liquidctl_command)."""
     try:
-        from liquidctl.driver.control_hub import ControlHub
+        if full:
+            from liquidctl.driver.control_hub import ControlHub
+        else:
+            ControlHub = control_hub_class()
     except Exception:
         return
     if getattr(ControlHub, "_MAX_READ_ATTEMPTS", 0) < HUB_READ_ATTEMPTS:
@@ -276,7 +308,7 @@ class Hub:
         asking again. This is the actual auto-detection path; the CLI never
         exposed the piece needed for it.
         """
-        from liquidctl.driver.control_hub import ControlHub
+        ControlHub = control_hub_class()
         patch_liquidctl_reads()
 
         ids: dict[str, int] = {}
@@ -459,7 +491,7 @@ class DirectHub:
         with self._conn_lock:
             self._close()
             try:
-                from liquidctl.driver.control_hub import ControlHub
+                ControlHub = control_hub_class()
             except Exception as exc:
                 self.last_error = f"liquidctl could not be loaded: {exc}"
                 return False

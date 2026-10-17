@@ -54,7 +54,7 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--liquidctl"
 
     try:
         from app.hub import patch_liquidctl_reads
-        patch_liquidctl_reads()
+        patch_liquidctl_reads(full=True)
     except Exception:
         pass
 
@@ -91,6 +91,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
+if "--lite" in sys.argv:
+    # The background service serves no web UI - see app/web_stub.py: FastAPI
+    # and its dependencies were ~25MB of RAM it only loaded to define routes.
+    from app import web_stub
+    web_stub.install()
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -255,6 +260,7 @@ def _drop_panorama(panel) -> None:
 _keepalive_task: asyncio.Task | None = None
 _curve_task: asyncio.Task | None = None
 _curve_status: dict = {"curves": []}
+_curve_status_read_at = 0.0  # last time anyone asked for it - see _curve_loop
 
 # Host-driven, position-aware hub effects (Advanced RGB view) - see
 # _run_position_effect below. A plain threading.Event rather than an asyncio
@@ -853,7 +859,10 @@ def _launch_vendor_openrgb() -> bool:
         if _run_helper_task("OpenRGB"):
             return True
         log.warning("OpenRGB's scheduled task didn't start - falling back to a UAC prompt")
-    args = "--server --startminimized"
+    # --server alone: OpenRGB runs its SDK server without loading its
+    # window and tray icon at all - about half the memory of the
+    # (minimised) window it used to start with, which nobody opened.
+    args = "--server"
     log.info("Starting bundled OpenRGB (%s) with its SDK server%s...",
             exe, " (elevated - expect a UAC prompt)" if elevated else "")
     if elevated:
@@ -874,7 +883,7 @@ def _launch_vendor_openrgb() -> bool:
         return True
 
     try:
-        subprocess.Popen([str(exe), "--server", "--startminimized"], cwd=str(exe.parent))
+        subprocess.Popen([str(exe), "--server"], cwd=str(exe.parent))
     except OSError as exc:
         log.warning("Could not launch bundled OpenRGB: %s", exc)
         return False
@@ -1812,6 +1821,29 @@ async def _bring_up_openrgb():
         asyncio.create_task(_reapply_hub_rgb_state_delayed())
 
 
+_sensor_helper_wanted_at = 0.0
+
+
+def _want_sensor_helper():
+    """Something needs temperatures now (the web UI asked, or a fan curve
+    on CPU temperature): start SensorHelper in the background if it isn't
+    answering - at most once a minute, so a declined UAC prompt isn't
+    asked again on every poll."""
+    global _sensor_helper_wanted_at
+    if time.monotonic() - _sensor_helper_wanted_at < 60:
+        return
+    _sensor_helper_wanted_at = time.monotonic()
+    asyncio.create_task(_bring_up_sensor_helper())
+
+
+def _curves_need_cpu_temp() -> bool:
+    try:
+        curves = json.loads(CURVE_FILE.read_text(encoding="utf-8")).get("curves") or []
+    except Exception:
+        return False
+    return any(c.get("source") in ("cpu", "cpu_gpu") and c.get("channels") for c in curves)
+
+
 async def _bring_up_sensor_helper():
     """SensorHelper.exe (CPU/motherboard/RAM temperature - see
     app/sensors.py) in the background at launch, only if a URL is
@@ -1854,7 +1886,12 @@ async def lifespan(app: FastAPI):
     # catches up once it answers (_bring_up_openrgb); a running effect
     # picks RAM and board up on its own.
     asyncio.create_task(_bring_up_openrgb())
-    asyncio.create_task(_bring_up_sensor_helper())
+    # SensorHelper (temperatures) only right away if a fan curve runs on
+    # CPU temperature; otherwise once something asks for temperatures (the
+    # web UI) - most of the time nothing does, and it's ~30MB plus, without
+    # the prompt-free setup, a UAC prompt at every login.
+    if _curves_need_cpu_temp():
+        asyncio.create_task(_bring_up_sensor_helper())
 
     try:
         await panorama_task
@@ -2110,8 +2147,14 @@ async def status():
 async def sensors():
     """CPU/RAM load, GPU load/mem/temp, CPU temperature - see
     app/sensors.py for exactly where each one comes from and why each
-    degrades to None independently rather than failing the whole call."""
-    return await asyncio.to_thread(sensors_mod.snapshot, CONFIG)
+    degrades to None independently rather than failing the whole call.
+    The first ask starts SensorHelper if it isn't running (see
+    _want_sensor_helper) - it isn't started at launch any more unless a
+    fan curve needs it."""
+    snap = await asyncio.to_thread(sensors_mod.snapshot, CONFIG)
+    if snap.get("cpu_temp_c") is None:
+        _want_sensor_helper()
+    return snap
 
 
 @app.get("/api/system/resources")
@@ -2542,7 +2585,11 @@ async def set_curve(body: CurvesRequest):
 async def curve_status():
     """What _curve_loop is actually doing right now, per curve - separate
     from the stored config above, same GET-config/GET-status split as
-    scan and the RGB effects (/api/scan/status, /api/rgb/effects/status)."""
+    scan and the RGB effects (/api/scan/status, /api/rgb/effects/status).
+    Asking for it is also what keeps _curve_loop reading temperatures for
+    curves no fan follows yet."""
+    global _curve_status_read_at
+    _curve_status_read_at = time.monotonic()
     return _curve_status
 
 
@@ -2628,6 +2675,19 @@ async def _curve_loop():
             state = {}
         curves = state.get("curves") or _default_curves()
         statuses = []
+        # Temperatures only when they matter: a fan following a curve, or
+        # someone looking at the curves (the Fans page polls the status).
+        # Otherwise every tick cost an nvidia-smi process (~40ms) and a
+        # SensorHelper round trip - about 1% of a core around the clock,
+        # as much as the rest of shyyctl, for curves nothing followed.
+        live_fans = hub.channels.get("fan", []) if hub.connected else []
+        followed = [c for c in curves if any(ch in live_fans for ch in c.get("channels", []))]
+        watched = time.monotonic() - _curve_status_read_at < 15
+        if not followed and not watched:
+            _curve_status = {"curves": [{"id": c.get("id"), "temp_c": None, "temp_raw_c": None, "duty": None}
+                                        for c in curves]}
+            await asyncio.sleep(4)
+            continue
         # CPU/GPU temp reads have nothing to do with the hub - gating the
         # whole block on hub.connected (as this used to) meant every
         # single curve, including a GPU-only one, went blank the instant
@@ -2646,6 +2706,8 @@ async def _curve_loop():
             sensors_cfg.get("cpu_sensor_match", "CPU Package"),
         )
         gpu_t = (await asyncio.to_thread(sensors_mod.gpu)).get("temp_c")
+        if cpu_t is None and any(c.get("source") in ("cpu", "cpu_gpu") for c in (followed or curves)):
+            _want_sensor_helper()
         raw_temps = {"cpu": cpu_t, "gpu": gpu_t, "cpu_gpu": _combine_temp(cpu_t, gpu_t)}
         temps = {source: _smoothed_temp(source, t) for source, t in raw_temps.items()}
         fan_channels = hub.channels.get("fan", []) if hub.connected else []
