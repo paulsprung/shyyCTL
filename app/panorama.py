@@ -72,9 +72,12 @@ control surface from the fan/RGB side of this project.
 import ctypes
 import datetime
 import logging
+import queue
 import random
 import struct
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from app.procflags import NO_WINDOW
@@ -677,6 +680,25 @@ class _PanoramaBase:
             return None
         return decode_pb(raw)
 
+    def _read_reply(self, field_no: int, timeout_s: float) -> list | None:
+        """The next message carrying top-level field field_no, skipping
+        anything else that arrives first, or None on timeout. The panel
+        also sends things nobody asked for (lone f600 "ok"s, a late reply
+        to an earlier command) - taking simply the next message as the
+        answer let one of those stand in for the real reply and shifted
+        every later request by one."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            entries = self.read_message(timeout_s=left)
+            if entries is None:
+                return None
+            if pb_get(entries, field_no) is not None:
+                return entries
+            log.debug("skipped a message while waiting for f%d: %r", field_no, entries)
+
     def read_messages(self, count: int, timeout_s: float = 2.0) -> list:
         out = []
         for _ in range(count):
@@ -772,8 +794,7 @@ class _PanoramaBase:
         if not self.connected:
             raise PanoramaError("not connected")
         self._write(build_ping_frame())
-        entries = self.read_message(timeout_s=timeout_s)
-        return entries is not None
+        return self._read_reply(10, timeout_s) is not None
 
     def list_media(self, timeout_s: float = 2.0) -> list:
         """Media already on the device, per its own listing response -
@@ -782,7 +803,7 @@ class _PanoramaBase:
         if not self.connected:
             raise PanoramaError("not connected")
         self._write(build_media_list_frame())
-        entries = self.read_message(timeout_s=timeout_s)
+        entries = self._read_reply(503, timeout_s)
         if entries is None:
             return []
         listing = pb_get(entries, 503)
@@ -826,7 +847,7 @@ class _PanoramaBase:
         if standby_media is None:
             standby_media = self.last_standby_media
         self._write(build_screen_config_frame(active_media, brightness, poweron_media, standby_media))
-        ok = self.read_message(timeout_s=timeout_s) is not None
+        ok = self._read_reply(600, timeout_s) is not None
         self._write(build_commit_frame())
         # Confirmed against real captured traffic: the device replies to
         # BOTH the main config frame and this commit follow-up (two "ok"
@@ -835,7 +856,7 @@ class _PanoramaBase:
         # read against the wrong reply - exactly the failure mode seen
         # against real hardware (first command in a sweep worked, every
         # one after it didn't).
-        self.read_message(timeout_s=timeout_s)
+        self._read_reply(600, timeout_s)
         self.last_media = active_media
         self.last_brightness = max(0, min(100, int(brightness)))
         self.last_poweron_media = poweron_media
@@ -1404,12 +1425,26 @@ class PanoramaPrint(_PanoramaBase):
     this way against real hardware this session. Overlapped I/O plus
     WaitForSingleObject on the operation's event handle is the standard
     way to get a real, cancelable timeout on an arbitrary Windows handle.
+
+    Reading happens on a thread of its own that keeps one ReadFile posted
+    at all times, the way KANALI does (its capture shows a new bulk-IN
+    read submitted the instant the previous one completes - never none
+    outstanding). The panel drops off the USB bus for ~60s whenever it
+    goes too long without a read to hand its replies to: with no host it
+    re-enumerates every 70s, and when reads only ever ran for the moment
+    a ping waited for its answer, it still did every 2-7 minutes - the
+    screen going black under shyyctl but never under KANALI. Whole
+    messages land in _inbox; _read_message takes them from there.
     """
 
     def __init__(self, timeout: float = 1.0):
         super().__init__(timeout)
         self._handle = None
-        self._event = None
+        self._event = None  # writes only - the reader has its own
+        self._inbox: queue.Queue = queue.Queue()
+        self._reader: threading.Thread | None = None
+        self._reader_stop: threading.Event | None = None
+        self._reader_error: str | None = None
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # Same reasoning as _setupapi_dll(): CreateFileW/CloseHandle return
         # or take a 64-bit HANDLE, which ctypes truncates to 32 bits without
@@ -1463,9 +1498,25 @@ class PanoramaPrint(_PanoramaBase):
             return False
         self._handle = handle
         self._event = event
+        self._inbox = queue.Queue()
+        self._reader_error = None
+        stop = threading.Event()
+        self._reader_stop = stop
+        self._reader = threading.Thread(target=self._read_loop, args=(handle, stop),
+                                        name="panorama-reader", daemon=True)
+        self._reader.start()
         return True
 
     def disconnect(self):
+        if self._reader_stop is not None:
+            self._reader_stop.set()
+        if self._handle is not None:
+            # NULL overlapped: cancels the reader's posted ReadFile too,
+            # not only I/O this thread issued.
+            self._kernel32.CancelIoEx(self._handle, None)
+        reader, self._reader = self._reader, None
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2.0)
         if self._handle is not None:
             self._kernel32.CloseHandle(self._handle)
             self._handle = None
@@ -1515,15 +1566,88 @@ class PanoramaPrint(_PanoramaBase):
         if transferred != len(frame):
             raise PanoramaError(f"WriteFile only sent {transferred}/{len(frame)} bytes")
 
-    def _read_chunk(self, timeout_s: float) -> bytes:
-        """One ReadFile - whatever the device has sent so far, which is
-        NOT reliably one complete reply (see _PanoramaBase._read_message,
-        which reassembles the real TRYX-framed message this returns
-        fragments of). Buffer sized well above the largest real reply
-        seen (~10.7KB, media metadata)."""
-        chunk = ctypes.create_string_buffer(32768)
-        transferred = self._overlapped_call(self._kernel32.ReadFile, chunk, 32768, timeout_s)
-        return chunk.raw[:transferred] if transferred else b""
+    def _read_message(self, timeout_s: float) -> bytes:
+        """The next whole message the reader thread collected, b'' if none
+        arrives within timeout_s. Raises once the reader has failed (the
+        panel left the bus), so a dead connection surfaces on the next
+        command instead of looking like a slow device."""
+        try:
+            item = self._inbox.get(timeout=max(timeout_s, 0.0))
+        except queue.Empty:
+            if self._reader_error is not None:
+                raise PanoramaError(self._reader_error)
+            return b""
+        if item is None:
+            self._inbox.put(None)  # keep failing every later read too
+            raise PanoramaError(self._reader_error or "panel connection closed")
+        return item
+
+    _READ_SIZE = 32768  # well above the largest real reply seen (~10.7KB, media metadata)
+
+    def _read_loop(self, handle, stop: threading.Event):
+        k32 = self._kernel32
+        event = k32.CreateEventW(None, True, False, None)
+        if event is None:
+            self._fail_reader(f"CreateEventW failed (gle={ctypes.get_last_error()})")
+            return
+        buf = ctypes.create_string_buffer(self._READ_SIZE)
+        pending = bytearray()
+        try:
+            while not stop.is_set():
+                k32.ResetEvent(event)
+                ov = _OVERLAPPED()
+                ov.hEvent = event
+                if not k32.ReadFile(handle, buf, self._READ_SIZE, None, ctypes.byref(ov)):
+                    err = ctypes.get_last_error()
+                    if err != _ERROR_IO_PENDING:
+                        self._fail_reader(f"ReadFile failed (gle={err})", stop)
+                        return
+                    # Wait without a deadline: the read stays posted until
+                    # the panel sends something - that is the point.
+                    while k32.WaitForSingleObject(event, 250) == _WAIT_TIMEOUT:
+                        if stop.is_set():
+                            k32.CancelIoEx(handle, ctypes.byref(ov))
+                            break
+                transferred = wintypes.DWORD(0)
+                if not k32.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(transferred), True):
+                    self._fail_reader(f"ReadFile failed (gle={ctypes.get_last_error()})", stop)
+                    return
+                if not transferred.value:
+                    stop.wait(0.01)
+                    continue
+                pending += buf.raw[:transferred.value]
+                self._split_messages(pending)
+        finally:
+            k32.CloseHandle(event)
+
+    def _split_messages(self, pending: bytearray):
+        """Moves every complete message out of pending into _inbox. A reply
+        arrives as two bulk transfers - the 8-byte TRYX+length header, then
+        the body (see _PanoramaBase._read_message) - so a header waits here
+        for its body. Unframed bytes are passed on as they are, same as
+        _PanoramaBase._read_message does."""
+        while pending:
+            if pending[:4] == TRYX_MAGIC:
+                if len(pending) < 8:
+                    return
+                length = int.from_bytes(pending[4:8], "little")
+                if len(pending) < 8 + length:
+                    return
+                self._inbox.put(bytes(pending[8:8 + length]))
+                del pending[:8 + length]
+            elif len(pending) < 4 and TRYX_MAGIC.startswith(bytes(pending)):
+                return
+            else:
+                cut = pending.find(TRYX_MAGIC, 1)
+                cut = len(pending) if cut < 0 else cut
+                self._inbox.put(bytes(pending[:cut]))
+                del pending[:cut]
+
+    def _fail_reader(self, reason: str, stop: threading.Event | None = None):
+        if stop is not None and stop.is_set():
+            return  # our own disconnect() cancelled the read
+        self._reader_error = reason
+        self._inbox.put(None)
 
 
 def find_print_panel(timeout: float = 1.0) -> "PanoramaPrint | None":
