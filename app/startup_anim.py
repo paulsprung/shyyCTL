@@ -174,15 +174,6 @@ def scale(color: tuple, level: float) -> tuple[int, int, int]:
     return tuple(round(c * level) for c in color)
 
 
-def ambient_color(zones: dict, v: float, h: float) -> tuple[int, int, int]:
-    """An LED's colour from a video's four sampled edge zones, by its
-    position in the case (v: 0 top..1 bottom, h: 0 left..1 right) - the
-    same blend as the "ambient" effect in main.py."""
-    top, bottom, left, right = zones["top"], zones["bottom"], zones["left"], zones["right"]
-    return tuple(round((top[c] * (1 - v) + bottom[c] * v + left[c] * (1 - h) + right[c] * h) / 2)
-                 for c in range(3))
-
-
 def blend(a: list[tuple], b: list[tuple], k: float) -> list[tuple[int, int, int]]:
     """a -> b, k from 0 (all a) to 1 (all b), smoothed at both ends."""
     k = max(0.0, min(1.0, k))

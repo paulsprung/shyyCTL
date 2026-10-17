@@ -69,6 +69,7 @@ import asyncio
 import colorsys
 import contextlib
 import functools
+import hashlib
 import io
 import json
 import logging
@@ -664,6 +665,161 @@ async def _keepalive_loop():
         await asyncio.sleep(2)
 
 
+# -- helpers started through scheduled tasks (no UAC prompt) ------------------
+#
+# OpenRGB (RAM RGB) and SensorHelper (temperatures) need admin rights. The
+# default is a UAC prompt for each at every launch; once set up from
+# Settings (tools/elevated_helpers.ps1, one prompt), protected copies of
+# both in %ProgramFiles%\shyyctl\helpers are started by two scheduled
+# tasks at the highest run level instead - see that script for why only
+# that arrangement is safe to run elevated without asking. A copy that no
+# longer matches the bundled helper (after an update) isn't used: back to
+# the prompt, until set up again.
+
+HELPER_TASK_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "shyyctl" / "helpers"
+HELPER_TASKS = ("OpenRGB", "SensorHelper")
+_HELPER_SCRIPT = (ASSETS_DIR / "elevated_helpers.ps1" if getattr(sys, "frozen", False)
+                  else ROOT / "tools" / "elevated_helpers.ps1")
+_digests: dict[tuple, str] = {}
+
+
+def _sensor_helper_port() -> int:
+    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url", "")
+    try:
+        return int(lhm_url.rsplit(":", 1)[1].split("/", 1)[0])
+    except (IndexError, ValueError):
+        return 8085
+
+
+def _helper_exe(base: Path, name: str) -> Path | None:
+    if name == "OpenRGB":
+        folder = base / "OpenRGB"
+        return next(folder.rglob("OpenRGB.exe"), None) if folder.is_dir() else None
+    exe = base / "SensorHelper" / "SensorHelper.exe"
+    return exe if exe.is_file() else None
+
+
+def _file_digest(path: Path) -> str:
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _digests:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        _digests[key] = h.hexdigest()
+    return _digests[key]
+
+
+def _task_exists(name: str) -> bool:
+    try:
+        return subprocess.run(["schtasks", "/query", "/tn", f"\\shyyctl\\{name}"], capture_output=True,
+                              timeout=10, creationflags=NO_WINDOW).returncode == 0
+    except Exception:
+        return False
+
+
+def _helper_task_state(name: str) -> str:
+    """"missing" (not set up), "outdated" (the protected copy no longer
+    matches the bundled helper, or the sensor port changed - set up
+    again), or "ready"."""
+    if sys.platform != "win32":
+        return "missing"
+    protected = _helper_exe(HELPER_TASK_DIR, name)
+    if protected is None or not _task_exists(name):
+        return "missing"
+    bundled = _helper_exe(ROOT / "vendor", name)
+    try:
+        if bundled is not None and _file_digest(bundled) != _file_digest(protected):
+            return "outdated"
+    except OSError:
+        return "outdated"
+    if name == "SensorHelper":
+        try:
+            setup = json.loads((HELPER_TASK_DIR / "setup.json").read_text(encoding="utf-8-sig"))
+            if int(setup.get("sensor_port", 0)) != _sensor_helper_port():
+                return "outdated"
+        except Exception:
+            return "outdated"
+    return "ready"
+
+
+def _run_helper_task(name: str) -> bool:
+    try:
+        return subprocess.run(["schtasks", "/run", "/tn", f"\\shyyctl\\{name}"], capture_output=True,
+                              timeout=15, creationflags=NO_WINDOW).returncode == 0
+    except Exception as exc:
+        log.warning("could not start scheduled task %s: %s", name, exc)
+        return False
+
+
+def _run_elevated_helpers_script(action: str) -> dict:
+    """Runs tools/elevated_helpers.ps1 elevated (one UAC prompt) and
+    waits for it. Blocking - call from a thread."""
+    import ctypes
+    from ctypes import wintypes
+    import tempfile
+
+    if not _HELPER_SCRIPT.is_file():
+        return {"ok": False, "message": f"setup script missing: {_HELPER_SCRIPT}"}
+    result_file = Path(tempfile.gettempdir()) / f"shyyctl-helpers-{os.getpid()}.json"
+    result_file.unlink(missing_ok=True)
+    args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+            "-File", str(_HELPER_SCRIPT), "-Action", action, "-ResultFile", str(result_file)]
+    if action == "install":
+        args += ["-VendorDir", str(ROOT / "vendor"),
+                 "-User", f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".lstrip("\\"),
+                 "-OpenRgbSettings", str(Path(os.environ.get("APPDATA", "")) / "OpenRGB" / "OpenRGB.json"),
+                 "-SensorPort", str(_sensor_helper_port())]
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR), ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR), ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
+                    ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040 | 0x00000100  # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = "powershell.exe"
+    info.lpParameters = subprocess.list2cmdline(args)
+    info.nShow = 0  # SW_HIDE
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        return {"ok": False, "message": "the administrator prompt was declined" if err == 1223
+                else f"could not start the setup (error {err})"}
+    try:
+        kernel32.WaitForSingleObject(info.hProcess, 300_000)
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+    try:
+        return json.loads(result_file.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"ok": False, "message": "the setup didn't report back"}
+    finally:
+        result_file.unlink(missing_ok=True)
+
+
+def _elevated_helpers_status() -> dict:
+    states = {name: _helper_task_state(name) for name in HELPER_TASKS}
+    return {
+        "supported": sys.platform == "win32",
+        "states": states,
+        "ready": all(v == "ready" for v in states.values()),
+        "any": any(v != "missing" for v in states.values()),
+        "folder": str(HELPER_TASK_DIR),
+    }
+
+
 def _launch_vendor_openrgb() -> bool:
     """Starts the bundled portable OpenRGB (see tools/setup_vendor.py) with
     its SDK server enabled, only called when nothing is already listening
@@ -692,6 +848,11 @@ def _launch_vendor_openrgb() -> bool:
         return False
 
     elevated = CONFIG.get("openrgb", {}).get("launch_elevated", True)
+    if elevated and _helper_task_state("OpenRGB") == "ready":
+        log.info("Starting OpenRGB through its scheduled task (protected copy, no UAC prompt)")
+        if _run_helper_task("OpenRGB"):
+            return True
+        log.warning("OpenRGB's scheduled task didn't start - falling back to a UAC prompt")
     args = "--server --startminimized"
     log.info("Starting bundled OpenRGB (%s) with its SDK server%s...",
             exe, " (elevated - expect a UAC prompt)" if elevated else "")
@@ -770,7 +931,7 @@ async def _connect_openrgb_with_recovery() -> bool:
     else:
         log.warning("OpenRGB not connected: %s", openrgb.last_error)
 
-    if _launch_vendor_openrgb():
+    if await asyncio.to_thread(_launch_vendor_openrgb):
         # A single fixed short wait wasn't enough against real hardware:
         # OpenRGB's own device scan (SMBus/PawnIO/RAM enumeration) was
         # still visibly running in its console output well past 3s, long
@@ -821,14 +982,13 @@ def _launch_vendor_sensor_helper() -> bool:
     if not exe.exists():
         return False
 
-    port = 8085
-    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url", "")
-    try:
-        port = int(lhm_url.rsplit(":", 1)[1].split("/", 1)[0])
-    except (IndexError, ValueError):
-        pass
-
+    port = _sensor_helper_port()
     elevated = CONFIG.get("sensor_helper", {}).get("launch_elevated", True)
+    if elevated and _helper_task_state("SensorHelper") == "ready":
+        log.info("Starting SensorHelper through its scheduled task (protected copy, no UAC prompt)")
+        if _run_helper_task("SensorHelper"):
+            return True
+        log.warning("SensorHelper's scheduled task didn't start - falling back to a UAC prompt")
     log.info("Starting bundled SensorHelper (%s) on port %d%s...",
             exe, port, " (elevated - expect a UAC prompt)" if elevated else "")
     if elevated:
@@ -1041,7 +1201,7 @@ def _set_autostart(enabled: bool):
                 pass
 
 
-async def _reapply_rgb_state(hub_only: bool = False):
+async def _reapply_rgb_state(hub_only: bool = False, boards_only: bool = False):
     """Pushes every colour saved by _save_rgb_state_entry back to the
     hardware. Called unconditionally on every launch, same reasoning as
     the saved position effect and Panorama's last-applied media/
@@ -1049,7 +1209,8 @@ async def _reapply_rgb_state(hub_only: bool = False):
     colour back, so there's no "only if not already set" check possible -
     only "always re-apply, best effort, one target's failure doesn't
     block the rest". hub_only skips motherboard and RAM (see
-    _reapply_hub_rgb_state_delayed).
+    _reapply_hub_rgb_state_delayed); boards_only skips the hub (direct
+    control re-applies it at launch without waiting for OpenRGB).
 
     Waits for the startup animation first (its finale lights RAM and the
     board too), and with a saved effect about to take over, leaves alone
@@ -1091,7 +1252,8 @@ async def _reapply_rgb_state(hub_only: bool = False):
         except Exception as exc:
             log.warning("could not reapply saved RAM colours: %s", exc)
 
-    hub_state = {ch: e for ch, e in state.get("hub", {}).items() if ch not in driven}
+    hub_state = {} if boards_only else {ch: e for ch, e in state.get("hub", {}).items()
+                                         if ch not in driven}
     for channel, entry in hub_state.items():
         try:
             rgb = _hex_to_rgb(entry["color"])
@@ -1158,6 +1320,11 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
     from the layout - so the effect starts as soon as the startup
     animation is over, fading in from where it ended."""
     if not HUB_DIRECT:
+        # the hub's zones live in OpenRGB here - it, then the scan sizing
+        # them, has to come first
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(_openrgb_bringup_done.wait(), timeout=120)
+        await asyncio.sleep(0.5)
         for _ in range(150):
             if not scan.running:
                 break
@@ -1394,26 +1561,16 @@ def _play_ambient_show(show: _Show) -> dict | None:
             log.warning("startup animation: could not show the video on the panel: %s", exc)
     sampler = AmbientSampler(fps=12)
     sampler.set_source(str(original), original.suffix.lower() in _VIDEO_SUFFIXES)
-    all_leds = [l for r in rings for l in r["leds"]]
-    xs, ys = [l["x"] for l in all_leds] or [0, 1], [l["y"] for l in all_leds] or [0, 1]
-    x0, y0 = min(xs), min(ys)
-    w, h = (max(xs) - x0) or 1.0, (max(ys) - y0) or 1.0
+    dirs = _ambient_directions([l for r in rings for l in r["leds"]])
     frames = {}
     start = time.monotonic()
     try:
         while not stop.is_set():
             t = time.monotonic() - start
-            zones = sampler.zones()
             fade = min(1.0, t / 0.5)
             for r in rings:
-                if r["leds"]:
-                    by_index = {l["index"]: l for l in r["leds"]}
-                    frames[r["id"]] = [startup_anim.scale(startup_anim.ambient_color(
-                        zones, (by_index[i]["y"] - y0) / h, (by_index[i]["x"] - x0) / w), fade)
-                        for i in range(r["count"])]
-                else:
-                    frames[r["id"]] = [startup_anim.scale(startup_anim.ambient_color(zones, 0.5, 0.5),
-                                                          fade)] * r["count"]
+                frames[r["id"]] = [startup_anim.scale(sampler.edge_color(*dirs.get((r["id"], i), (0, -1))), fade)
+                                   for i in range(r["count"])]
             show.write(frames)
             if t >= cfg.show_s:
                 break
@@ -1627,6 +1784,50 @@ def _remember_gallery_remote(item_id: str, remote_name: str):
     _save_gallery(items)
 
 
+_openrgb_bringup_done = asyncio.Event()
+
+
+async def _bring_up_openrgb():
+    """OpenRGB in the background at launch (see lifespan): connect, or
+    launch it and wait for it - however long a UAC prompt stays open -
+    then what needs it: the quick scan (it reads RAM and board through
+    OpenRGB; started after 45s regardless, so fans get mapped even while
+    OpenRGB is still away) and the saved RAM/board colours (hub colours
+    too when the hub goes through OpenRGB)."""
+    connect = asyncio.create_task(_connect_openrgb_with_recovery())
+    done, _ = await asyncio.wait({connect}, timeout=45)
+    if hub.connected or openrgb.connected:
+        scan.start("quick")
+    try:
+        ok = await asyncio.wait_for(connect, timeout=600) if not done else connect.result()
+    except Exception as exc:
+        log.warning("OpenRGB did not come up: %s", exc)
+        ok = False
+    _openrgb_bringup_done.set()
+    if not ok:
+        log.warning("OpenRGB still not connected after recovery attempts: %s", openrgb.last_error)
+        return
+    await _reapply_rgb_state_logged(boards_only=HUB_DIRECT)
+    if not HUB_DIRECT:
+        asyncio.create_task(_reapply_hub_rgb_state_delayed())
+
+
+async def _bring_up_sensor_helper():
+    """SensorHelper.exe (CPU/motherboard/RAM temperature - see
+    app/sensors.py) in the background at launch, only if a URL is
+    configured and nothing answers there yet - never a second instance."""
+    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
+    if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
+        await asyncio.to_thread(_launch_vendor_sensor_helper)
+
+
+async def _reapply_rgb_state_logged(**kwargs):
+    try:
+        await _reapply_rgb_state(**kwargs)
+    except Exception as exc:
+        log.warning("could not reapply saved RGB colours: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _keepalive_task, _curve_task
@@ -1646,30 +1847,14 @@ async def lifespan(app: FastAPI):
     _start_startup_animation()
     await _sync_openrgb_hub_detection()
 
-    try:
-        # Overall budget on top of _connect_openrgb_with_recovery's own
-        # internal waits (20s zombie check + ~20s relaunch poll = ~40s
-        # already, see its docstring on why 20s and not something
-        # tighter) - a final backstop so a worse-than-expected case (e.g.
-        # the kill not releasing openrgb_bridge's lock as quickly as
-        # usual) still can't hold up the rest of startup indefinitely.
-        if not await asyncio.wait_for(_connect_openrgb_with_recovery(), timeout=50):
-            log.warning("OpenRGB still not connected after recovery attempts: %s", openrgb.last_error)
-    except asyncio.TimeoutError:
-        log.warning("OpenRGB connection attempt exceeded the 50s startup budget - "
-                   "continuing without it for this launch")
-
-    # Same auto-launch idea as OpenRGB above, for SensorHelper.exe (CPU/
-    # motherboard/RAM temperature - see app/sensors.py and
-    # sensor-helper/Program.cs). Only attempts this if a URL is
-    # configured at all and it isn't already reachable (a previous
-    # launch already left it up) - never launches a second instance.
-    # Fire-and-forget: unlike OpenRGB, nothing else in startup needs this
-    # to be up synchronously, sensors are polled independently and
-    # asynchronously later.
-    lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
-    if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
-        _launch_vendor_sensor_helper()
+    # OpenRGB and SensorHelper come up in the background: launching either
+    # can mean a UAC prompt, and waiting for it here held the whole server
+    # back - fans, display, effects - for as long as the prompt stayed
+    # unanswered (2.5 minutes after a real boot). What needs OpenRGB
+    # catches up once it answers (_bring_up_openrgb); a running effect
+    # picks RAM and board up on its own.
+    asyncio.create_task(_bring_up_openrgb())
+    asyncio.create_task(_bring_up_sensor_helper())
 
     try:
         await panorama_task
@@ -1678,40 +1863,15 @@ async def lifespan(app: FastAPI):
     _keepalive_task = asyncio.create_task(_keepalive_loop())
     _curve_task = asyncio.create_task(_curve_loop())
 
-    # Auto-discover on every launch rather than waiting for a human to open
-    # Scan and click a button - "quick" spins each fan just long enough to
-    # confirm it's there and read its RPM (no curve calibration, unlike
-    # "full") and, unless skipped, reads motherboard/RAM through OpenRGB
-    # too (see scan.py - that check now runs before any fan spins up).
-    # Only worth starting if there's something to scan; on a box with
-    # neither the hub nor OpenRGB reachable this would just spawn a thread
-    # that immediately fails with "no hub found".
-    if hub.connected or openrgb.connected:
-        scan.start("quick")
-
-    # Push back whatever static RGB colours shyyctl itself last applied -
-    # see _reapply_rgb_state's docstring, same "no readback, so always
-    # re-apply" reasoning as the saved effect below. Mobo/RAM colours
-    # don't depend on the scan above; hub channel colours do (a channel's
-    # zone reports 0 LEDs until the scan's resize step runs), so that
-    # part is retried again after a delay by the background task.
-    if openrgb.connected:
-        try:
-            await _reapply_rgb_state()
-        except Exception as exc:
-            log.warning("could not reapply saved RGB colours: %s", exc)
-        asyncio.create_task(_reapply_hub_rgb_state_delayed())
+    if HUB_DIRECT and hub.connected:
+        # The hub's own saved colours don't need OpenRGB.
+        asyncio.create_task(_reapply_rgb_state_logged(hub_only=True))
 
     # Resume whatever position effect was running when this process last
     # stopped - see _save_effect_state's docstring: it's host-driven, so
     # it goes dark on process exit with nothing to bring it back unless
     # this does. persist=False - don't touch the saved file just for
-    # replaying it, and don't wipe it if this particular attempt fails
-    # (a device that isn't connected *yet* this early shouldn't cost a
-    # human their saved effect for every future launch). Runs as a
-    # background task (see _resume_effect_after_scan) so it can wait for
-    # the quick-scan above to actually finish sizing the hub's zones
-    # first, without delaying server startup itself.
+    # replaying it, and don't wipe it if this particular attempt fails.
     saved_effect = _load_effect_state()
     if saved_effect is not None:
         asyncio.create_task(_resume_effect_after_scan(saved_effect))
@@ -1792,7 +1952,7 @@ async def _lite_service_main():
         await _sync_openrgb_hub_detection()
         if not await asyncio.to_thread(openrgb.connect):
             log.warning("OpenRGB not connected: %s", openrgb.last_error)
-            if _launch_vendor_openrgb():
+            if await asyncio.to_thread(_launch_vendor_openrgb):
                 for _ in range(10):
                     await asyncio.sleep(2)
                     if await asyncio.to_thread(openrgb.connect):
@@ -1810,7 +1970,7 @@ async def _lite_service_main():
     if needs_lhm:
         lhm_url = CONFIG.get("sensors", {}).get("librehardwaremonitor_url")
         if lhm_url and not await asyncio.to_thread(_lhm_reachable, lhm_url):
-            _launch_vendor_sensor_helper()
+            await asyncio.to_thread(_launch_vendor_sensor_helper)
 
     if hub.connected and rgb_state.get("hub"):
         scan.start("quick")
@@ -2031,6 +2191,28 @@ async def set_system_services(body: ServiceModeRequest):
 
 class AutostartRequest(BaseModel):
     enabled: bool
+
+
+@app.get("/api/system/elevated-helpers")
+async def elevated_helpers_status():
+    return await asyncio.to_thread(_elevated_helpers_status)
+
+
+@app.post("/api/system/elevated-helpers/{action}")
+async def elevated_helpers_action(action: str):
+    """Set up (one UAC prompt) or remove starting OpenRGB and SensorHelper
+    without a prompt - see tools/elevated_helpers.ps1. Setting up restarts
+    both from their protected copies right away; removing starts them the
+    old way again, with a prompt."""
+    if action not in ("install", "remove"):
+        raise HTTPException(404, "unknown action")
+    if sys.platform != "win32":
+        raise HTTPException(400, "only on Windows")
+    result = await asyncio.to_thread(_run_elevated_helpers_script, action)
+    if action == "remove" and result.get("ok"):
+        asyncio.create_task(asyncio.to_thread(_start_openrgb_if_needed))
+        asyncio.create_task(_bring_up_sensor_helper())
+    return {**result, **await asyncio.to_thread(_elevated_helpers_status)}
 
 
 @app.get("/api/system/autostart")
@@ -2988,6 +3170,35 @@ def _fit_frame(frame: list, count: int) -> list:
     return [frame[min(len(frame) - 1, int((i + 0.5) * len(frame) / count))] for i in range(count)]
 
 
+# Layout x/y are fractions of the canvas, which is wider than tall (see
+# web/index.html's CANVAS_W/CANVAS_H less its padding) - a step in x is
+# this many times a step in y on screen.
+_CANVAS_ASPECT = (900 - 48) / (600 - 48)
+
+
+def _ambient_directions(leds: list[dict]) -> dict[tuple, tuple[float, float]]:
+    """(unit id, LED index) -> the direction from the Panorama's centre
+    to that LED, in the panel's own frame (its rotation in the layout
+    taken out, y downwards) - what AmbientSampler.edge_color() takes.
+    Without the panel placed, from the middle of all the LEDs."""
+    display = next((u for u in layout.load().get("units", []) if u.get("kind") == "display"), None)
+    if display is not None:
+        cx, cy = display.get("x", 0.5), display.get("y", 0.5)
+        rot = math.radians(display.get("rotation", 0) or 0)
+    elif leds:
+        cx = sum(l["x"] for l in leds) / len(leds)
+        cy = sum(l["y"] for l in leds) / len(leds)
+        rot = 0.0
+    else:
+        return {}
+    cos_r, sin_r = math.cos(-rot), math.sin(-rot)
+    out = {}
+    for l in leds:
+        dx, dy = (l["x"] - cx) * _CANVAS_ASPECT, l["y"] - cy
+        out[(l["unit"], l["index"])] = (dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r)
+    return out
+
+
 def _resolve_effect_targets():
     """Every real per-LED write target the position effect can drive,
     resolved once (not per-frame - re-resolving RAM/mobo every frame
@@ -3007,7 +3218,11 @@ def _resolve_effect_targets():
     mobo_units = [u for u in data["units"] if u.get("kind") == "mobo"]
 
     ram_targets: list[tuple[dict, object]] = []
-    if ram_units:
+    # Only with OpenRGB actually connected: asking a missing one retries
+    # its way through several seconds per device type, and the effect (fans
+    # included) would sit dark meanwhile. A running effect picks RAM and
+    # board up once OpenRGB is there (see _run_position_effect).
+    if ram_units and openrgb.connected:
         try:
             ram_devices = openrgb.ram()
             for u in ram_units:
@@ -3019,7 +3234,7 @@ def _resolve_effect_targets():
             log.warning("effect: could not resolve RAM sticks: %s", exc)
 
     mobo_target = None
-    if mobo_units:
+    if mobo_units and openrgb.connected:
         try:
             mobo_devices = openrgb.motherboard()
             if mobo_devices:
@@ -3153,9 +3368,14 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         stop = _effect_stop
     leds_by_unit, fan_units, ram_targets, mobo_target = _resolve_effect_targets()
 
-    driven_ids = {u["id"] for u in fan_units} | {u["id"] for u, _ in ram_targets}
-    if mobo_target is not None:
-        driven_ids.add(mobo_target[0]["id"])
+    # Every placed unit counts for the effect's geometry, whether its
+    # device is reachable yet or not - RAM and board can join later, and
+    # the effect shouldn't shift on screen when they do.
+    placed = layout.load().get("units", [])
+    wants_ram = any(u.get("kind") == "ram" for u in placed)
+    wants_mobo = any(u.get("kind") == "mobo" for u in placed)
+    driven_ids = ({u["id"] for u in fan_units}
+                  | {u["id"] for u in placed if u.get("kind") in ("ram", "mobo")})
     all_leds = [led for uid in driven_ids for led in leds_by_unit.get(uid, [])]
     if led_selection is not None:
         all_leds = [led for led in all_leds if led["index"] in led_selection.get(led["unit"], ())]
@@ -3163,6 +3383,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         _end_effect(stop, "no LEDs selected" if led_selection is not None
                     else "no units placed in Setup yet")
         return
+    ambient_dirs = _ambient_directions([l for ls in leds_by_unit.values() for l in ls]) if shape == "ambient" else {}
     xs = [l["x"] for l in all_leds]
     ys = [l["y"] for l in all_leds]
     x_min, x_max = min(xs), max(xs)
@@ -3369,21 +3590,10 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         elif shape == "ambient":
             # Colours come from the Panorama's own currently-applied
             # media (see app/ambient.py), not the palette/colours the
-            # human picked - each LED blends the video's four sampled
-            # edge zones by its own normalised top/bottom and left/right
-            # position, so the rig mirrors roughly what's on the panel's
-            # edges the way a TV ambilight mirrors screen edges, just
-            # from a locally decoded file instead of a live feed.
-            zones = ambient_sampler.zones()
-            top, bottom, left, right = zones["top"], zones["bottom"], zones["left"], zones["right"]
-            colors_out = []
-            for led in unit_leds:
-                v = _position_value("top_to_bottom", led, bounds)
-                h = _position_value("left_to_right", led, bounds)
-                colors_out.append(tuple(
-                    round((top[c] * (1 - v) + bottom[c] * v + left[c] * (1 - h) + right[c] * h) / 2)
-                    for c in range(3)
-                ))
+            # human picked: the picture's edge extended outwards from the
+            # panel, each LED taking the edge colour in its direction.
+            colors_out = [ambient_sampler.edge_color(*ambient_dirs.get((led["unit"], led["index"]), (0, -1)))
+                          for led in unit_leds]
 
         else:
             # Default wave behavior
@@ -3431,6 +3641,7 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
     if shape == "ambient":
         refresh_ambient_source()
     last_ambient_check = time.monotonic()
+    last_board_check = time.monotonic()
 
     for _, device in ram_targets:
         openrgb.select_mode(device, "direct")
@@ -3487,6 +3698,23 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 if moving:
                     phase[0] = ((time.monotonic() - start) / period_s) % 1.0
                 now = time.monotonic()
+
+                if (now - last_board_check > 3.0 and openrgb.connected
+                        and ((wants_ram and not ram_targets) or (wants_mobo and mobo_target is None))):
+                    # OpenRGB came up after the effect started (a UAC
+                    # prompt answered late, a restart) - take RAM and
+                    # board on from here.
+                    last_board_check = now
+                    try:
+                        _, _, ram_targets, mobo_target = _resolve_effect_targets()
+                        for _, device in ram_targets:
+                            openrgb.select_mode(device, "direct")
+                        if mobo_target is not None:
+                            openrgb.select_mode(mobo_target[1], "direct")
+                        if ram_targets or mobo_target is not None:
+                            log.info("effect: RAM/motherboard joined (OpenRGB is up now)")
+                    except Exception as exc:
+                        log.debug("effect: RAM/motherboard still unavailable: %s", exc)
 
                 if shape == "ambient" and time.monotonic() - last_ambient_check > 2.0:
                     # Cheap enough to just do every couple seconds

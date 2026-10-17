@@ -40,6 +40,10 @@ ICON = str(ICON_PATH) if ICON_PATH.exists() else None
 
 extra_datas = [
     (str(REPO_ROOT / "web"), "web"),
+    # run elevated from Settings to start OpenRGB/SensorHelper without a
+    # UAC prompt (main.py's /api/system/elevated-helpers), and by the
+    # uninstaller to undo that
+    (str(REPO_ROOT / "tools" / "elevated_helpers.ps1"), "."),
 ]
 extra_binaries = []
 extra_hiddenimports = [

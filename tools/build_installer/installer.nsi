@@ -71,6 +71,15 @@ Section "shyyctl" SecMain
   ; "cannot copy file" error instead of just handling it.
   nsExec::Exec 'taskkill /F /IM shyyctl.exe'
   Pop $0
+  ; Same for the two helpers, whose files under vendor\ get replaced too.
+  ; Started through a UAC prompt they run elevated, and this installer
+  ; (running as the user) can't stop them - taskkill exits 1 for "found
+  ; but couldn't terminate". Only then: once more, elevated.
+  nsExec::Exec 'taskkill /F /IM OpenRGB.exe /IM SensorHelper.exe'
+  Pop $0
+  StrCmp $0 "1" 0 helpers_stopped
+    ExecShellWait "runas" "taskkill.exe" "/F /IM OpenRGB.exe /IM SensorHelper.exe" SW_HIDE
+  helpers_stopped:
 
   ; The PyInstaller --onedir output (shyyctl.exe + its _internal/ folder,
   ; containing web/, config.example.yaml, and every bundled Python/native
@@ -140,6 +149,13 @@ Function un.onInit
 FunctionEnd
 
 Section "Uninstall"
+  ; Starting OpenRGB/SensorHelper without a UAC prompt, if it was set up
+  ; (Settings): its scheduled tasks and the protected copies under
+  ; Program Files - only removable with admin rights, so one prompt.
+  IfFileExists "$PROGRAMFILES64\shyyctl\helpers\*.*" 0 no_elevated_helpers
+    ExecShellWait "runas" "powershell.exe" '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\_internal\elevated_helpers.ps1" -Action remove' SW_HIDE
+  no_elevated_helpers:
+
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\shyyctl"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "shyyctl"
   DeleteRegKey HKCU "Software\shyyctl"

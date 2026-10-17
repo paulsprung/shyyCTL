@@ -675,22 +675,29 @@ class DirectHub:
         self._note_writer(channel)
         self._with_device(f"set LEDs on {channel}", write)
 
-    _writers: dict[str, tuple[int, str, float]] = {}
+    # channel -> the last two writers, newest first: (thread ident, name, time)
+    _writers: dict[str, list[tuple[int, str, float]]] = {}
     _writers_warned = 0.0
 
     def _note_writer(self, channel: str):
-        """Logs when two threads keep writing the same LED channel within
-        a moment of each other - two animations fighting over the LEDs,
-        which shows as wild flickering, should be visible in the log."""
+        """Logs when two threads take turns writing the same LED channel -
+        two animations fighting over the LEDs, which shows as wild
+        flickering. One thread handing over to another (an animation
+        ending, the saved colour following) writes A, B - only A, B, A
+        within a second is a fight."""
         me = threading.current_thread()
         now = time.monotonic()
-        last = self._writers.get(channel)
-        if (last is not None and last[0] != me.ident and now - last[2] < 0.3
-                and now - DirectHub._writers_warned > 30):
-            DirectHub._writers_warned = now
-            log.warning("hub: %s written by two threads at once (%s and %s) - two animations "
-                        "are fighting over the LEDs", channel, last[1], me.name)
-        self._writers[channel] = (me.ident, me.name, now)
+        seen = self._writers.get(channel, [])
+        if seen and seen[0][0] == me.ident:
+            seen[0] = (me.ident, me.name, now)
+        else:
+            if (len(seen) == 2 and seen[1][0] == me.ident and now - seen[1][2] < 1.0
+                    and now - DirectHub._writers_warned > 30):
+                DirectHub._writers_warned = now
+                log.warning("hub: %s written by two threads in turn (%s and %s) - two animations "
+                            "are fighting over the LEDs", channel, seen[0][1], me.name)
+            seen = [(me.ident, me.name, now)] + seen[:1]
+        self._writers[channel] = seen
 
     def set_color(self, channel: str, mode: str, colors: list[str]):
         """The hub's own firmware effects (via liquidctl's ControlHub

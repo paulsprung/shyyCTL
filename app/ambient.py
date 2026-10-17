@@ -1,10 +1,12 @@
 """Ambient-light colour sampling from the Panorama display's own currently
 applied media - not screen/desktop capture. The panel plays a file shyyctl
 already manages (the gallery); this decodes that same local file with
-ffmpeg at a tiny resolution and low frame rate, and reduces each frame to
-four edge-zone average colours (top/bottom/left/right) the "ambient" RGB
-effect blends per-LED by position - the same idea a TV's ambilight uses,
-just against a known local file instead of a live HDMI/display feed.
+ffmpeg at a small resolution and keeps the colours along the picture's
+edge. edge_color() then extends that edge outwards, the way a TV's
+ambilight does: an LED gets the colour of the edge at the point where a
+line from the display's centre towards the LED leaves the picture - so
+the fans to the right of the panel glow in what's at its right edge,
+those above in what's at its top, and so on round the case.
 
 One long-lived ffmpeg subprocess per source (not re-invoked per frame) -
 video decode overhead should happen once regardless of how many frames
@@ -23,15 +25,50 @@ from .procflags import NO_WINDOW
 
 log = logging.getLogger("ambient")
 
-# 4x4 is the smallest grid that still gives four distinct edges (a top
-# row, a bottom row, a left column, a right column) without needing a
-# second ffmpeg filter pass to average sub-regions separately - scale's
-# own default downsampling already averages every source pixel that
-# lands in each output pixel, so this one scale is the only reduction
-# step needed.
-GRID_W, GRID_H = 4, 4
+# ffmpeg's scale already averages every source pixel landing in an output
+# pixel, so one scale gives the edge colours directly: 32x16 is fine enough
+# along the edge for a case full of fans, and the edge band is averaged
+# EDGE_DEPTH cells deep so a thin border line in the video doesn't decide
+# the colour alone.
+GRID_W, GRID_H = 32, 16
+EDGE_DEPTH = 2
 FRAME_BYTES = GRID_W * GRID_H * 3  # rgb24
-SAMPLE_FPS = 2  # LEDs don't need video frame rate, just to track big colour changes
+# Every frame is decoded anyway (-re paces the decode, not the output), so
+# sampling more of them costs little - and the light follows the video
+# instead of jumping twice a second.
+SAMPLE_FPS = 10
+# The panel's picture (2240x1080) - the shape the edge is projected from.
+MEDIA_ASPECT = 2240 / 1080
+
+_BLACK_EDGES = {"top": [(0, 0, 0)] * GRID_W, "bottom": [(0, 0, 0)] * GRID_W,
+                "left": [(0, 0, 0)] * GRID_H, "right": [(0, 0, 0)] * GRID_H}
+
+
+def edge_point(dx: float, dy: float, aspect: float = MEDIA_ASPECT) -> tuple[str, float]:
+    """Where a line from the picture's centre in direction (dx, dy) - y
+    downwards - leaves it: the edge ("top"/"bottom"/"left"/"right") and
+    the position along it, 0..1 (left to right, or top to bottom)."""
+    if dx == 0 and dy == 0:
+        return "top", 0.5
+    # the picture spans [-aspect, aspect] x [-1, 1]; whichever pair of
+    # sides the line reaches first is the one it leaves through
+    to_side = aspect / abs(dx) if dx else float("inf")
+    to_top_bottom = 1 / abs(dy) if dy else float("inf")
+    if to_side <= to_top_bottom:
+        return ("right" if dx > 0 else "left"), (dy * to_side + 1) / 2
+    return ("bottom" if dy > 0 else "top"), (dx * to_top_bottom / aspect + 1) / 2
+
+
+def sample_edge(edges: dict, side: str, u: float) -> tuple[int, int, int]:
+    """The edge colour at u (0..1) along one side, interpolated between
+    the sampled cells."""
+    cells = edges[side]
+    pos = max(0.0, min(1.0, u)) * len(cells) - 0.5
+    i = max(0, min(len(cells) - 1, int(pos // 1)))
+    j = min(len(cells) - 1, i + 1)
+    f = max(0.0, min(1.0, pos - i))
+    a, b = cells[i], cells[j]
+    return tuple(round(a[c] + (b[c] - a[c]) * f) for c in range(3))
 
 
 class AmbientSampler:
@@ -39,9 +76,9 @@ class AmbientSampler:
         # The startup animation's ambient show samples faster than the
         # effect: a few seconds of intro need to follow the video closely.
         self._fps = fps
-        self._lock = threading.Lock()        # guards _zones
+        self._lock = threading.Lock()        # guards _edges
         self._state_lock = threading.Lock()  # guards source switching below
-        self._zones = {"top": (0, 0, 0), "bottom": (0, 0, 0), "left": (0, 0, 0), "right": (0, 0, 0)}
+        self._edges = dict(_BLACK_EDGES)
         self._path: str | None = None
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
@@ -52,9 +89,17 @@ class AmbientSampler:
         self._run_stop: threading.Event | None = None
         self._started_at = 0.0
 
-    def zones(self) -> dict[str, tuple[int, int, int]]:
+    def edges(self) -> dict[str, list[tuple[int, int, int]]]:
+        """The latest frame's edge colours: "top"/"bottom" left to right,
+        "left"/"right" top to bottom."""
         with self._lock:
-            return dict(self._zones)
+            return self._edges
+
+    def edge_color(self, dx: float, dy: float) -> tuple[int, int, int]:
+        """The picture's edge extended outwards: the colour where a line
+        from its centre in direction (dx, dy) - y downwards - leaves it."""
+        side, u = edge_point(dx, dy)
+        return sample_edge(self.edges(), side, u)
 
     def set_source(self, path: str, is_video: bool):
         """No-op if already sampling this exact file - called every few
@@ -157,15 +202,22 @@ class AmbientSampler:
             log.warning("ambient: could not sample image %s: %s", path, exc)
 
     def _update_zones_from_frame(self, data: bytes):
-        pixels = [tuple(data[i:i + 3]) for i in range(0, FRAME_BYTES, 3)]  # row-major, GRID_H x GRID_W
+        """One rgb24 GRID_W x GRID_H frame -> the colours along its edge,
+        each averaged EDGE_DEPTH cells inwards."""
+        def px(x, y):
+            i = (y * GRID_W + x) * 3
+            return data[i], data[i + 1], data[i + 2]
 
         def avg(pxs):
             n = len(pxs)
             return tuple(sum(p[c] for p in pxs) // n for c in range(3))
 
-        top = avg(pixels[0:GRID_W])
-        bottom = avg(pixels[(GRID_H - 1) * GRID_W:GRID_H * GRID_W])
-        left = avg([pixels[r * GRID_W] for r in range(GRID_H)])
-        right = avg([pixels[r * GRID_W + GRID_W - 1] for r in range(GRID_H)])
+        depth = range(EDGE_DEPTH)
+        edges = {
+            "top": [avg([px(x, d) for d in depth]) for x in range(GRID_W)],
+            "bottom": [avg([px(x, GRID_H - 1 - d) for d in depth]) for x in range(GRID_W)],
+            "left": [avg([px(d, y) for d in depth]) for y in range(GRID_H)],
+            "right": [avg([px(GRID_W - 1 - d, y) for d in depth]) for y in range(GRID_H)],
+        }
         with self._lock:
-            self._zones = {"top": top, "bottom": bottom, "left": left, "right": right}
+            self._edges = edges

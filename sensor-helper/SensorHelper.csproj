@@ -21,7 +21,7 @@
          vendored ffmpeg.exe/OpenRGB.exe already do) - a person running
          shyyctl shouldn't need the .NET runtime installed separately. -->
     <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
     <InvariantGlobalization>true</InvariantGlobalization>
     <AssemblyName>SensorHelper</AssemblyName>
   </PropertyGroup>
