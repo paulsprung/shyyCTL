@@ -219,9 +219,13 @@ class Scan:
                 else:
                     self.absent.append(channel)
 
-        self.step = "Sizing OpenRGB LED zones"
-        self.progress = 0.75
-        self._resize_hub_zones()
+        # Only when OpenRGB drives the hub's LEDs: a DirectHub writes
+        # exactly as many colours as the identified model has, there are
+        # no OpenRGB zones to size (OpenRGB doesn't even see the hub then).
+        if not getattr(self.hub, "drives_leds", False):
+            self.step = "Sizing OpenRGB LED zones"
+            self.progress = 0.75
+            self._resize_hub_zones()
 
         self.step = "Done"
         self.progress = 1.0

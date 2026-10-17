@@ -1,6 +1,9 @@
-"""Wrapper around the liquidctl CLI for the NZXT Control Hub.
+"""The NZXT Control Hub: DirectHub (bottom of this file, the default) keeps
+one connection open and drives fans and per-LED colour itself; Hub is the
+older liquidctl-CLI wrapper, used when config.yaml's hub.control is
+"openrgb" (hub LEDs then go through OpenRGB, fans through liquidctl).
 
-Subprocess + CLI rather than liquidctl's Python API: the ControlHub driver
+Hub - subprocess + CLI rather than liquidctl's Python API: the ControlHub driver
 only landed in liquidctl 1.16.0, and the CLI is what actually got exercised
 against the real hardware. PYTHONIOENCODING is forced to utf-8 because
 Windows consoles default to cp1252, which can't encode the box-drawing
@@ -128,6 +131,8 @@ class HubError(Exception):
 
 
 class Hub:
+    drives_leds = False  # hub LEDs go through OpenRGB in this mode
+
     def __init__(self, match: str):
         self.match = match
         self.connected = False
@@ -376,3 +381,328 @@ class Hub:
                 pass
             readings.append({"key": key, "value": value, "unit": unit})
         return readings
+
+
+# -- direct control ----------------------------------------------------------
+#
+# Hue 2 per-LED packets, exactly as OpenRGB sends them to this hub (USB PID
+# 0x2022 - "NZXT RGB & Fan Controller 2024" in OpenRGB, "NZXT Control Hub"
+# in liquidctl; see OpenRGB's Controllers/NZXTHue2Controller/
+# NZXTHue2Controller.cpp, SendDirect/SendApply/SetChannelLEDs):
+#   0x22 0x10|group, 1<<channel, 0x00, then up to 20 LEDs as G,R,B
+#   (group 0 = LEDs 0-19, group 1 = LEDs 20-39), then
+#   0x22 0xA0, 1<<channel, 0x00, 0x01, 0, 0, 0x28, 0, 0, 0x80, 0, 0x32, 0, 0, 0x01
+# to latch the new colours. No mode switch is needed first - direct
+# packets take over from whatever firmware effect was running.
+_REPORT_LENGTH = 64
+_LEDS_PER_PACKET = 20
+MAX_LEDS_PER_CHANNEL = 40
+_APPLY_TAIL = [0x00, 0x01, 0x00, 0x00, 0x28, 0x00, 0x00, 0x80, 0x00, 0x32, 0x00, 0x00, 0x01]
+# The hub sends this report by itself every ~0.5s once initialized
+# (liquidctl's initialize() sets the interval): per-channel control mode at
+# byte 16+i, rpm as little-endian u16 at 24+2i, duty at 40+i, noise at 56.
+_FAN_REPORT = (0x67, 0x02)
+_FAN_MODES = {1: "DC", 2: "PWM"}
+
+
+class DirectHub:
+    """The hub driven by shyyctl alone, over one connection that stays
+    open - fan duty, fan readings and per-LED colour all go through it,
+    the way NZXT CAM does it. OpenRGB no longer touches the hub at all in
+    this mode (main.py switches off OpenRGB's detector for it), so there
+    is no second program on the device any more, and no liquidctl process
+    per call either.
+
+    liquidctl's ControlHub driver still does discovery, initialize() (fan
+    report interval, accessory IDs) and the fan duty packet. Everything
+    that reads afterwards is this class's own: a background thread listens
+    to the reports the hub sends on its own and keeps the latest fan
+    report, so status() never waits on the device and never competes with
+    LED writes for replies - the cause of liquidctl's "missing messages".
+
+    Same public interface as Hub (the CLI wrapper above), plus
+    set_leds(); drives_leds tells main.py which one it has. A lost
+    connection (hub unplugged, USB reset) is reopened by the next call,
+    at most every few seconds."""
+
+    drives_leds = True
+    _RECONNECT_EVERY_S = 5.0
+
+    def __init__(self, match: str):
+        self.match = match
+        self.connected = False
+        self.last_error: str | None = None
+        self.description: str | None = None
+        self.channels: dict[str, list[str]] = {"fan": [], "led": []}
+        self.modes = list(FIRMWARE_MODES)
+        self.supports_per_led = True
+        self._dev = None
+        self._accessory_ids: dict[str, int] = {}
+        # Lock order, wherever more than one is held: _conn_lock, then
+        # _write_lock, then _read_lock - never _conn_lock while holding
+        # either of the others. The reader thread only ever holds
+        # _read_lock (one short timed read at a time), so closing or
+        # re-initializing the device under both I/O locks is guaranteed
+        # not to pull the handle out from under a read or write in progress.
+        self._conn_lock = threading.RLock()
+        self._write_lock = threading.RLock()
+        self._read_lock = threading.Lock()
+        self._reader_stop: threading.Event | None = None
+        self._reader: threading.Thread | None = None
+        self._readings: tuple[float, list[dict]] | None = None
+        self._first_report = threading.Event()
+        self._next_reconnect = 0.0
+
+    # -- lifecycle -----------------------------------------------------
+
+    def connect(self) -> bool:
+        with self._conn_lock:
+            self._close()
+            try:
+                from liquidctl.driver.control_hub import ControlHub
+            except Exception as exc:
+                self.last_error = f"liquidctl could not be loaded: {exc}"
+                return False
+            patch_liquidctl_reads()
+            try:
+                dev = next((d for d in ControlHub.find_supported_devices()
+                            if self.match.lower() in d.description.lower()), None)
+            except Exception as exc:
+                self.last_error = f"Could not enumerate USB devices: {exc}"
+                return False
+            if dev is None:
+                self.last_error = f"No device matching '{self.match}'."
+                return False
+            try:
+                dev.connect()
+            except Exception as exc:
+                self.last_error = f"Found the hub but could not open it: {exc}"
+                return False
+            try:
+                init = dev.initialize()
+            except Exception as exc:
+                self._safe_disconnect(dev)
+                self.last_error = f"Found the hub but could not initialize it: {exc}"
+                return False
+            self._dev = dev
+            self.description = dev.description
+            speed = getattr(dev, "_speed_channels", None) or {f"fan{i + 1}": None for i in range(5)}
+            self.channels = {
+                "fan": sorted(speed, key=lambda c: int(c[3:])),
+                "led": self._apply_init(init),
+            }
+            self._readings = None
+            self._first_report.clear()
+            stop = threading.Event()
+            self._reader_stop = stop
+            self._reader = threading.Thread(target=self._read_loop, args=(dev, stop),
+                                            name="hub-reader", daemon=True)
+            self._reader.start()
+            self.connected = True
+            self.last_error = None
+            log.info("hub: direct connection to %s open (fans %s, LEDs %s)",
+                     self.description, self.channels["fan"], self.channels["led"])
+            return True
+
+    def disconnect(self):
+        with self._conn_lock:
+            self._close()
+
+    def _close(self):
+        """Stops the reader and closes the handle - only once no read or
+        write can still be using it (see the lock-order note above)."""
+        dev, self._dev = self._dev, None
+        self.connected = False
+        if self._reader_stop is not None:
+            self._reader_stop.set()
+        reader, self._reader = self._reader, None
+        if dev is None:
+            return
+        with self._write_lock, self._read_lock:
+            self._safe_disconnect(dev)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1.0)
+
+    @staticmethod
+    def _safe_disconnect(dev):
+        try:
+            dev.disconnect()
+        except Exception as exc:
+            log.debug("hub: closing handle failed: %s", exc)
+
+    def _lost(self, dev, reason: str):
+        with self._conn_lock:
+            if dev is not self._dev:
+                return  # an older connection failing late - already replaced
+            log.warning("hub: connection lost (%s) - reopening", reason)
+            self.last_error = f"connection lost: {reason}"
+            self._close()
+            self._next_reconnect = 0.0
+
+    def ensure_connected(self) -> bool:
+        """Reopens a lost connection - at most every _RECONNECT_EVERY_S."""
+        if self.connected:
+            return True
+        with self._conn_lock:
+            if self.connected:
+                return True
+            if time.monotonic() < self._next_reconnect:
+                return False
+            self._next_reconnect = time.monotonic() + self._RECONNECT_EVERY_S
+            return self.connect()
+
+    def _apply_init(self, init) -> list[str]:
+        """initialize()'s accessory list -> populated LED channels, plus
+        the raw accessory ID of each channel's first accessory (see
+        geometry.py: 0x20/0x22/0x24 are F120X/F240X/F360X)."""
+        ids: dict[str, int] = {}
+        leds: set[int] = set()
+        for key, value, _unit in init or []:
+            found = re.match(r"LED (\d+) accessory (\d+)$", key)
+            if not found:
+                continue
+            leds.add(int(found.group(1)))
+            if found.group(2) == "1":
+                ids[f"led{found.group(1)}"] = getattr(value, "value", value)
+        self._accessory_ids = ids
+        return [f"led{n}" for n in sorted(leds)]
+
+    # -- reading -------------------------------------------------------
+
+    def _read_loop(self, dev, stop: threading.Event):
+        hiddev = dev.device.hiddev
+        try:
+            hiddev.set_nonblocking(False)
+        except Exception:
+            pass
+        while not stop.is_set():
+            try:
+                with self._read_lock:
+                    if stop.is_set():
+                        return
+                    data = hiddev.read(max_length=_REPORT_LENGTH, timeout_ms=250)
+            except Exception as exc:
+                if not stop.is_set():
+                    self._lost(dev, f"read failed: {exc}")
+                return
+            if len(data) > 56 and data[0] == _FAN_REPORT[0] and data[1] == _FAN_REPORT[1]:
+                self._readings = (time.monotonic(), self._parse_fan_report(data))
+                self._first_report.set()
+
+    def _parse_fan_report(self, msg) -> list[dict]:
+        readings = []
+        for i, _channel in enumerate(self.channels["fan"]):
+            n = i + 1
+            readings.append({"key": f"Fan {n} speed",
+                             "value": float(msg[24 + 2 * i] | (msg[25 + 2 * i] << 8)), "unit": "rpm"})
+            readings.append({"key": f"Fan {n} duty", "value": float(msg[40 + i]), "unit": "%"})
+            readings.append({"key": f"Fan {n} control mode",
+                             "value": _FAN_MODES.get(msg[16 + i], "N/A"), "unit": ""})
+        readings.append({"key": "Noise level", "value": float(msg[56]), "unit": "dB"})
+        return sorted(readings, key=lambda r: r["key"])
+
+    def status(self) -> list[dict]:
+        """The latest fan report the hub sent by itself (~every 0.5s) -
+        nothing is asked of the device here. Waits briefly only for the
+        very first report after (re)connecting. Readings older than 10s
+        mean reports stopped arriving: reported as none, not as current."""
+        if not self.ensure_connected():
+            return []
+        if self._readings is None:
+            self._first_report.wait(timeout=2.0)
+        current = self._readings
+        if current is None or time.monotonic() - current[0] > 10:
+            return []
+        return [dict(r) for r in current[1]]
+
+    def rpm(self, channel: str) -> int | None:
+        if not channel.startswith("fan"):
+            return None
+        for reading in self.status():
+            if reading["key"].lower() == f"fan {channel[3:]} speed":
+                return int(reading["value"])
+        return None
+
+    # -- writing -------------------------------------------------------
+
+    def _with_device(self, action: str, fn):
+        if not self.ensure_connected():
+            raise HubError(f"Hub not connected - could not {action}: {self.last_error}")
+        with self._write_lock:
+            dev = self._dev
+            if dev is None:
+                raise HubError(f"Hub not connected - could not {action}.")
+            try:
+                return fn(dev)
+            except HubError:
+                raise
+            except Exception as exc:
+                error = exc
+        # Outside _write_lock: _lost takes _conn_lock, which connect()
+        # holds while it waits for _write_lock - the other order deadlocks.
+        self._lost(dev, f"{action}: {error}")
+        raise HubError(f"Could not {action}: {error}") from error
+
+    def set_fan(self, channel: str, duty: int) -> int:
+        duty = max(0, min(100, int(duty)))
+        if channel not in self.channels["fan"]:
+            raise HubError(f"Unknown fan channel '{channel}'.")
+        self._with_device(f"set {channel} to {duty}%",
+                          lambda dev: dev.set_fixed_speed(channel, duty))
+        return duty
+
+    def set_leds(self, channel: str, colors) -> None:
+        """Per-LED colours for one LED channel ("led1".."led5"), in strip
+        order, (r, g, b) each - at most MAX_LEDS_PER_CHANNEL."""
+        found = re.fullmatch(r"led(\d+)", channel)
+        if not found:
+            raise HubError(f"Unknown LED channel '{channel}'.")
+        bit = 1 << (int(found.group(1)) - 1)
+        data: list[int] = []
+        for r, g, b in list(colors)[:MAX_LEDS_PER_CHANNEL]:
+            data += [int(g) & 0xFF, int(r) & 0xFF, int(b) & 0xFF]
+        if not data:
+            return
+        packets = []
+        for group in range((len(data) + 3 * _LEDS_PER_PACKET - 1) // (3 * _LEDS_PER_PACKET)):
+            chunk = data[group * 3 * _LEDS_PER_PACKET:(group + 1) * 3 * _LEDS_PER_PACKET]
+            packets.append([0x22, 0x10 | group, bit, 0x00] + chunk)
+        packets.append([0x22, 0xA0, bit] + _APPLY_TAIL)
+
+        def write(dev):
+            for packet in packets:
+                dev.device.write(packet + [0x00] * (_REPORT_LENGTH - len(packet)))
+        self._with_device(f"set LEDs on {channel}", write)
+
+    def set_color(self, channel: str, mode: str, colors: list[str]):
+        """The hub's own firmware effects (via liquidctl's ControlHub
+        driver, which sends the 2023-style packets this hub expects)."""
+        if mode not in FIRMWARE_MODES:
+            raise HubError(f"'{mode}' isn't supported on this hub - only {FIRMWARE_MODES}.")
+        rgb = [[int(c.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)] for c in colors]
+        self._with_device(f"set {channel} to {mode}",
+                          lambda dev: dev.set_color(channel, mode, rgb))
+
+    def blackout(self, except_channel: str | None):
+        for ch in self.channels.get("led", []):
+            self.set_color(ch, "fixed", ["ff0000"] if ch == except_channel else ["000000"])
+
+    def known_accessory_ids(self) -> dict[str, int]:
+        """Accessory IDs as last read - no device access."""
+        return dict(self._accessory_ids)
+
+    def accessory_ids(self) -> dict[str, int]:
+        """Re-reads the accessory list (initialize() again, on the open
+        connection - the reader is paused meanwhile, since initialize()
+        reads its own replies), so a fan plugged in since connecting shows
+        up; falls back to what was read at connect time if that fails."""
+        if not self.ensure_connected():
+            return dict(self._accessory_ids)
+        with self._write_lock, self._read_lock:
+            dev = self._dev
+            if dev is not None:
+                try:
+                    self.channels["led"] = self._apply_init(dev.initialize())
+                except Exception as exc:
+                    log.warning("hub: re-reading accessories failed: %s", exc)
+        return dict(self._accessory_ids)

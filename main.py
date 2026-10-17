@@ -96,7 +96,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.conflicts import running_conflicts
-from app.hub import Hub, HubError
+from app.hub import DirectHub, Hub, HubError
 from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
@@ -105,6 +105,7 @@ from app.panorama import (PanoramaError, build_encoded_media_container, find_pri
                           find_usb_panel, generate_thumbnail)
 from app.procflags import NO_WINDOW
 from app.scan import Scan
+from app import geometry
 from app import sensors as sensors_mod
 
 # ROOT is where persistent, writable state lives (config.yaml, curve.json,
@@ -205,7 +206,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
                      handlers=_log_handlers)
 log = logging.getLogger("shyyctl")
 
-hub = Hub(match=CONFIG["hub"]["match"])
+# hub.control: "direct" (default) - shyyctl drives the hub's fans and LEDs
+# itself over one open connection, OpenRGB only handles RAM + motherboard
+# (see app/hub.py's DirectHub). "openrgb" - the previous split: hub LEDs via
+# OpenRGB, fans via a liquidctl process per call.
+HUB_DIRECT = str(CONFIG["hub"].get("control", "direct")).lower() != "openrgb"
+hub = (DirectHub if HUB_DIRECT else Hub)(match=CONFIG["hub"]["match"])
 openrgb = OpenRgbBridge(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"])
 scan = Scan(hub, openrgb)
 layout = Layout(LAYOUT_FILE)
@@ -284,7 +290,10 @@ def _start_effect_thread(fn, *args) -> asyncio.Future:
         try:
             fn(*args)
         finally:
-            loop.call_soon_threadsafe(finished)
+            try:
+                loop.call_soon_threadsafe(finished)
+            except RuntimeError:
+                pass  # loop already closed (shutdown) - nobody's waiting any more
 
     threading.Thread(target=run, name="effect", daemon=True).start()
     return done
@@ -880,6 +889,67 @@ def _stop_openrgb():
     openrgb.disconnect()
 
 
+# OpenRGB's own detector name for this hub (USB PID 0x2022 - see its
+# Controllers/NZXTHue2Controller/NZXTHue2ControllerDetect.cpp).
+OPENRGB_HUB_DETECTOR = "NZXT RGB & Fan Controller 2024"
+
+
+def _set_openrgb_hub_detector(enabled: bool) -> bool:
+    """Switches OpenRGB's detection of the hub on or off in its settings
+    file (%APPDATA%\\OpenRGB\\OpenRGB.json, "Detectors" -> "detectors" ->
+    name: bool - the same switch as OpenRGB's Settings > Supported Devices
+    list). With hub.control: direct, shyyctl is the hub's only driver and
+    OpenRGB is left with RAM + motherboard; it only reads this at startup.
+    Every other setting in the file is kept as it is. Returns whether the
+    file changed."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return False
+    path = Path(appdata) / "OpenRGB" / "OpenRGB.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except Exception as exc:
+        # Never rewrite a settings file that can't be read back - that
+        # would throw away every other OpenRGB setting in it.
+        log.warning("could not read %s (%s) - leaving OpenRGB's hub detection as it is", path, exc)
+        return False
+    if not isinstance(data, dict):
+        return False
+    section = data.get("Detectors")
+    if not isinstance(section, dict):
+        section = data["Detectors"] = {}
+    detectors = section.get("detectors")
+    if not isinstance(detectors, dict):
+        detectors = section["detectors"] = {}
+    if detectors.get(OPENRGB_HUB_DETECTOR, True) == enabled:
+        return False
+    detectors[OPENRGB_HUB_DETECTOR] = enabled
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.warning("could not update %s: %s", path, exc)
+        return False
+    log.info("OpenRGB hub detection %s (hub.control: %s)",
+             "enabled" if enabled else "disabled", "direct" if HUB_DIRECT else "openrgb")
+    return True
+
+
+async def _sync_openrgb_hub_detection():
+    """Before connecting to OpenRGB at startup: make its hub detection
+    match hub.control, and restart an already running OpenRGB whose
+    setting just changed (it only reads the file when it starts) - the
+    usual startup path then launches it again."""
+    if await asyncio.to_thread(_set_openrgb_hub_detector, not HUB_DIRECT):
+        if await asyncio.to_thread(_process_running, "OpenRGB.exe"):
+            log.info("restarting OpenRGB so its hub detection change takes effect")
+            await asyncio.to_thread(_kill_process, "OpenRGB.exe")
+            openrgb.disconnect()
+            await asyncio.sleep(1.0)
+
+
 def _stop_sensor_helper():
     _kill_process("SensorHelper.exe")
 
@@ -1003,19 +1073,14 @@ async def _reapply_rgb_state():
             persistent = entry.get("persistent", True)
 
             def _do(channel=channel, rgb=rgb, persistent=persistent):
-                with _open_hub_raw() as raw:
-                    ctrl = raw.find_controller("NZXT")
-                    if ctrl is None:
+                with _hub_leds() as leds:
+                    # In OpenRGB mode a channel's zone size doesn't survive
+                    # an OpenRGB restart until a scan re-sizes it (see the
+                    # resize endpoint's docstring) - skip silently rather
+                    # than writing colour data to a zone reporting 0 LEDs.
+                    if not leds.channel_leds(channel):
                         return
-                    zone = raw.zone_for_channel(ctrl, channel)
-                    # A channel's zone size doesn't survive an OpenRGB
-                    # restart until a scan re-sizes it (see the resize
-                    # endpoint's docstring) - skip silently rather than
-                    # writing colour data to a zone reporting 0 LEDs.
-                    if zone is None or zone.leds_count == 0:
-                        return
-                    raw.select_mode(ctrl, "static" if persistent else "direct")
-                    raw.set_zone_color(ctrl.index, zone, rgb)
+                    leds.fill(channel, rgb, persistent)
 
             await asyncio.to_thread(_do)
         except Exception as exc:
@@ -1077,6 +1142,7 @@ async def lifespan(app: FastAPI):
 
     if not await _hub_call(hub.connect):
         log.warning("hub not connected: %s", hub.last_error)
+    await _sync_openrgb_hub_detection()
 
     try:
         # Overall budget on top of _connect_openrgb_with_recovery's own
@@ -1220,6 +1286,7 @@ async def _lite_service_main():
     saved_effect = _load_effect_state()
     rgb_state = _load_rgb_state()
     if saved_effect is not None or rgb_state:
+        await _sync_openrgb_hub_detection()
         if not await asyncio.to_thread(openrgb.connect):
             log.warning("OpenRGB not connected: %s", openrgb.last_error)
             if _launch_vendor_openrgb():
@@ -1369,6 +1436,7 @@ async def status():
         "hub": {
             "connected": hub.connected, "error": hub.last_error,
             "description": hub.description, "channels": hub.channels,
+            "control": "direct" if HUB_DIRECT else "openrgb",
         },
         "openrgb": {"connected": openrgb.connected, "error": openrgb.last_error},
         "panorama": {"connected": panel is not None and panel.connected},
@@ -1947,6 +2015,125 @@ def _open_hub_raw(timeout: float = 5.0) -> OpenRgbRaw:
     return OpenRgbRaw(host=CONFIG["openrgb"]["host"], port=CONFIG["openrgb"]["port"], timeout=timeout)
 
 
+MAX_HUB_LEDS = 40  # per channel - Hue 2 protocol limit (app/hub.py)
+
+
+class HubLedsUnavailable(Exception):
+    """A hub-LED action that can't happen: no hub (status 503/404), or a
+    channel with no known LED count (400)."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def _hub_channel_led_count(channel: str) -> int | None:
+    """Direct mode: LEDs on a hub channel. The hub itself never reports a
+    count (see scan.py) - the placed unit's count (from a scan or a model
+    picked in Setup) wins, else the model behind the channel's accessory ID
+    (geometry.py's table)."""
+    for unit in layout.load().get("units", []):
+        if unit.get("kind") == "fan" and unit.get("led_channel") == channel and unit.get("leds"):
+            return int(unit["leds"])
+    accessory = hub.known_accessory_ids().get(channel) if HUB_DIRECT else None
+    model = geometry.identify_by_accessory_id(accessory) if accessory is not None else None
+    return model.leds if model else None
+
+
+class _DirectHubLeds:
+    """Hub LEDs written by shyyctl itself (DirectHub.set_leds)."""
+
+    def channel_leds(self, channel: str) -> int | None:
+        return _hub_channel_led_count(channel) if channel in hub.channels.get("led", []) else None
+
+    def write(self, channel: str, colors: list[tuple]) -> None:
+        hub.set_leds(channel, colors)
+
+    def fill(self, channel: str, rgb: tuple, persistent: bool = True) -> None:
+        # A direct colour stays on the hub until something else is sent,
+        # and every saved colour is re-sent on startup anyway (see
+        # _reapply_rgb_state) - "persistent" has nothing extra to do here.
+        count = self.channel_leds(channel)
+        if not count:
+            raise HubLedsUnavailable(f"channel '{channel}' has no known LED count yet - run a scan or pick its model in Setup")
+        hub.set_leds(channel, [rgb] * count)
+
+    def reconnect(self) -> None:
+        # DirectHub reopens a lost connection on its own (on the next
+        # write) - this only reports whether it's back yet.
+        if not hub.ensure_connected():
+            raise HubLedsUnavailable(f"hub not connected: {hub.last_error}", 503)
+
+
+class _OpenRgbHubLeds:
+    """Hub LEDs via OpenRGB's protocol-5 SDK (hub.control: openrgb)."""
+
+    def __init__(self, raw: OpenRgbRaw):
+        self.raw = raw
+        self.ctrl = raw.find_controller("NZXT")
+        self._mode = None
+
+    def _select(self, mode: str):
+        if self._mode != mode:
+            self.raw.select_mode(self.ctrl, mode)
+            self._mode = mode
+
+    def channel_leds(self, channel: str) -> int | None:
+        zone = self.raw.zone_for_channel(self.ctrl, channel)
+        return zone.leds_count if zone is not None and zone.leds_count else None
+
+    def write(self, channel: str, colors: list[tuple]) -> None:
+        zone = self.raw.zone_for_channel(self.ctrl, channel)
+        if zone is None:
+            raise HubLedsUnavailable(f"no zone on {self.ctrl.name} matches channel '{channel}'")
+        self._select("direct")
+        self.raw.set_zone_colors(self.ctrl.index, zone.index, colors)
+
+    def fill(self, channel: str, rgb: tuple, persistent: bool = True) -> None:
+        zone = self.raw.zone_for_channel(self.ctrl, channel)
+        if zone is None or not zone.leds_count:
+            raise HubLedsUnavailable(f"channel '{channel}' has no LEDs sized in OpenRGB yet")
+        self._select("static" if persistent else "direct")
+        self.raw.set_zone_color(self.ctrl.index, zone, rgb)
+
+    def reconnect(self) -> None:
+        self.raw.close()
+        self.raw.connect()
+        self.ctrl = self.raw.find_controller("NZXT")
+        self._mode = None
+        if self.ctrl is None:
+            raise HubLedsUnavailable("no hub RGB device found", 404)
+
+
+@contextlib.contextmanager
+def _hub_leds(timeout: float = 5.0):
+    """The one way every hub-LED feature (static colours, per-LED writes,
+    effects, the LED-order test, Identify) gets at the hub's LEDs, whichever
+    path hub.control selects. Raises HubLedsUnavailable if there's no hub."""
+    if HUB_DIRECT:
+        if not hub.connected and not hub.connect():
+            raise HubLedsUnavailable(f"hub not connected: {hub.last_error}", 503)
+        yield _DirectHubLeds()
+        return
+    with _open_hub_raw(timeout=timeout) as raw:
+        leds = _OpenRgbHubLeds(raw)
+        if leds.ctrl is None:
+            raise HubLedsUnavailable("no hub RGB device found", 404)
+        yield leds
+
+
+def _hub_rgb_entry() -> dict | None:
+    if not HUB_DIRECT:
+        return _hub_via_raw()
+    if not hub.connected:
+        return None
+    zones = [{"name": f"LED {ch[3:]}", "leds": _hub_channel_led_count(ch) or 0}
+             for ch in hub.channels.get("led", [])]
+    return {"name": hub.description or "NZXT Control Hub", "type": "LEDSTRIP",
+            "leds": sum(z["leds"] for z in zones), "modes": ["Direct"], "zones": zones,
+            "driven_by": "shyyctl"}
+
+
 def _hub_via_raw() -> dict | None:
     """The hub's real zone sizes, straight from the protocol-5 client -
     see app/openrgb_raw.py's docstring. openrgb_bridge.py's describe_all()
@@ -1988,10 +2175,13 @@ async def rgb_state():
 
 @app.get("/api/rgb/devices")
 async def rgb_devices():
-    if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
+    if openrgb.connected or await asyncio.to_thread(openrgb.connect):
+        devices = await asyncio.to_thread(openrgb.describe_all)
+    elif HUB_DIRECT and hub.connected:
+        devices = []  # RAM/board unavailable, the hub is still worth listing
+    else:
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
-    devices = await asyncio.to_thread(openrgb.describe_all)
-    hub_entry = await asyncio.to_thread(_hub_via_raw)
+    hub_entry = await asyncio.to_thread(_hub_rgb_entry)
     if hub_entry is not None:
         devices = [d for d in devices if "NZXT" not in d["name"]]
         devices.append(hub_entry)
@@ -2145,7 +2335,16 @@ async def resize_hub_channel(channel: str, body: ResizeRequest):
     identifies with certainty (app/scan.py's _resize_hub_zones); call
     this directly for a channel scan left at 'unknown' confidence after
     picking its model by hand, or to redo one channel without a full
-    rescan."""
+    rescan.
+
+    Direct mode (hub.control: direct) has no zones to size - the count
+    comes from the Setup layout / the fan model (_hub_channel_led_count) -
+    so this only checks the number is one the hub can take."""
+    if HUB_DIRECT:
+        if not 0 < body.leds <= MAX_HUB_LEDS:
+            raise HTTPException(400, f"a hub channel takes 1-{MAX_HUB_LEDS} LEDs")
+        return {"ok": True}
+
     def _do():
         with _open_hub_raw() as raw:
             ctrl = raw.find_controller("NZXT")
@@ -2173,6 +2372,19 @@ async def resize_hub_channel(channel: str, body: ResizeRequest):
     return {"ok": True}
 
 
+async def _run_hub_leds(fn):
+    """Runs a blocking hub-LED action, mapping its failures to HTTP errors
+    the same way for every hub-LED endpoint."""
+    try:
+        await asyncio.to_thread(fn)
+    except HubLedsUnavailable as exc:
+        raise HTTPException(exc.status, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(503, f"hub LEDs unavailable: {exc}")
+
+
 @app.post("/api/rgb/hub/{channel}/color")
 async def set_hub_channel_color(channel: str, body: ColorRequest):
     """liquidctl LED control is confirmed broken for the 360mm units - hub
@@ -2184,28 +2396,10 @@ async def set_hub_channel_color(channel: str, body: ColorRequest):
     rgb = _hex_to_rgb(body.color)
 
     def _do():
-        with _open_hub_raw() as raw:
-            ctrl = raw.find_controller("NZXT")
-            if ctrl is None:
-                return "no_device"
-            zone = raw.zone_for_channel(ctrl, channel)
-            if zone is None:
-                return f"no zone on {ctrl.name} matches channel '{channel}'"
-            if zone.leds_count == 0:
-                return (f"channel '{channel}' has no LEDs sized yet - "
-                        f"resize it first (POST /api/rgb/hub/{channel}/resize)")
-            raw.select_mode(ctrl, "static" if body.persistent else "direct")
-            raw.set_zone_color(ctrl.index, zone, rgb)
-            return None
+        with _hub_leds() as leds:
+            leds.fill(channel, rgb, body.persistent)
 
-    try:
-        error = await asyncio.to_thread(_do)
-    except Exception as exc:
-        raise HTTPException(503, f"OpenRGB not connected: {exc}")
-    if error == "no_device":
-        raise HTTPException(404, "no hub RGB device found")
-    if error:
-        raise HTTPException(400, error)
+    await _run_hub_leds(_do)
     _save_rgb_state_entry("hub", channel, body.color, body.persistent)
     return {"ok": True}
 
@@ -2225,28 +2419,14 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
     rgb_list = [_hex_to_rgb(c) for c in body.colors]
 
     def _do():
-        with _open_hub_raw() as raw:
-            ctrl = raw.find_controller("NZXT")
-            if ctrl is None:
-                return "no_device"
-            zone = raw.zone_for_channel(ctrl, channel)
-            if zone is None:
-                return f"no zone on {ctrl.name} matches channel '{channel}'"
-            if zone.leds_count != len(rgb_list):
-                return (f"channel '{channel}' has {zone.leds_count} LEDs, "
-                        f"but {len(rgb_list)} colours were sent")
-            raw.select_mode(ctrl, "static")
-            raw.set_zone_colors(ctrl.index, zone.index, rgb_list)
-            return None
+        with _hub_leds() as leds:
+            count = leds.channel_leds(channel)
+            if count != len(rgb_list):
+                raise ValueError(f"channel '{channel}' has {count or 0} LEDs, "
+                                 f"but {len(rgb_list)} colours were sent")
+            leds.write(channel, rgb_list)
 
-    try:
-        error = await asyncio.to_thread(_do)
-    except Exception as exc:
-        raise HTTPException(503, f"OpenRGB not connected: {exc}")
-    if error == "no_device":
-        raise HTTPException(404, "no hub RGB device found")
-    if error:
-        raise HTTPException(400, error)
+    await _run_hub_leds(_do)
     return {"ok": True}
 
 
@@ -2714,12 +2894,23 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         # every other visible thing (RAM/mobo write after this one in the
         # same frame) stalling behind it too, on a loop with no upper
         # bound on how many frames this repeats for.
-        with _open_hub_raw(timeout=2.0) as raw:
-            ctrl = raw.find_controller("NZXT") if fan_units else None
-            if fan_units and ctrl is None:
-                log.warning("effect: no hub RGB device found, fan channels won't animate")
-            elif ctrl is not None:
-                raw.select_mode(ctrl, "direct")
+        with contextlib.ExitStack() as stack:
+            leds = None
+            if fan_units and HUB_DIRECT:
+                # Not _hub_leds(): a hub that's away right now (USB reset)
+                # comes back by itself (DirectHub reconnects on the next
+                # write), fans included - no reason to sit this effect out.
+                leds = _DirectHubLeds()
+            elif fan_units:
+                try:
+                    leds = stack.enter_context(_hub_leds(timeout=2.0))
+                except HubLedsUnavailable as exc:
+                    log.warning("effect: %s, fan channels won't animate", exc)
+
+            def channel_counts():
+                return {u["led_channel"]: leds.channel_leds(u["led_channel"]) for u in fan_units}
+
+            hub_counts = channel_counts() if leds is not None else {}
             start = time.monotonic()
             hub_failures = 0
             bridge_failures = 0
@@ -2752,18 +2943,18 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                     refresh_ambient_source()
                     last_ambient_check = time.monotonic()
 
-                if ctrl is not None:
+                if leds is not None:
                     for u in fan_units:
                         try:
-                            zone = raw.zone_for_channel(ctrl, u["led_channel"])
-                            if zone is None or zone.leds_count == 0:
+                            count = hub_counts.get(u["led_channel"])
+                            if not count:
                                 continue
                             unit_leds, frame = frame_colors(u)
-                            if len(unit_leds) != zone.leds_count:
+                            if len(unit_leds) != count:
                                 continue
                             if unchanged(("hub", u["id"]), frame, now):
                                 continue
-                            raw.set_zone_colors(ctrl.index, zone.index, frame)
+                            leds.write(u["led_channel"], frame)
                             last_sent[("hub", u["id"])] = (frame, now)
                             hub_failures = 0
                         except Exception as exc:
@@ -2797,11 +2988,8 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                         # extra needless failure cycles before retrying,
                         # on top of the one this branch just handled.
                         try:
-                            raw.close()
-                            raw.connect()
-                            ctrl = raw.find_controller("NZXT")
-                            if ctrl is not None:
-                                raw.select_mode(ctrl, "direct")
+                            leds.reconnect()
+                            hub_counts = channel_counts()
                             log.info("effect: reconnected to the hub after repeated write failures")
                             hub_failures = 0
                             last_sent.clear()
@@ -2886,24 +3074,18 @@ def _run_chase_effect(channel: str, window: int, step_s: float,
     if stop is None:
         stop = _effect_stop
     try:
-        with _open_hub_raw() as raw:
-            ctrl = raw.find_controller("NZXT")
-            if ctrl is None:
-                _end_effect(stop, "no hub RGB device found")
-                return
-            zone = raw.zone_for_channel(ctrl, channel)
-            if zone is None or zone.leds_count == 0:
+        with _hub_leds() as leds:
+            n = leds.channel_leds(channel)
+            if not n:
                 _end_effect(stop, f"channel '{channel}' has no sized LEDs")
                 return
-            n = zone.leds_count
-            raw.select_mode(ctrl, "direct")
             step = 0
             while not stop.is_set():
                 colors = [
                     (255, 255, 255) if (step - i) % n < window else (0, 0, 0)
                     for i in range(n)
                 ]
-                raw.set_zone_colors(ctrl.index, zone.index, colors)
+                leds.write(channel, colors)
                 step = (step + 1) % n
                 stop.wait(step_s)
     except Exception as exc:
@@ -3131,25 +3313,14 @@ async def identify_unit(unit_id: str):
 
     if unit["kind"] == "fan":
         def _do():
-            with _open_hub_raw() as raw:
-                ctrl = raw.find_controller("NZXT")
-                if ctrl is None:
-                    return "no_device"
-                raw.select_mode(ctrl, "static")
+            with _hub_leds() as leds:
                 for u in units:
                     if u["kind"] != "fan" or not u.get("led_channel"):
                         continue
-                    zone = raw.zone_for_channel(ctrl, u["led_channel"])
-                    if zone is None or zone.leds_count == 0:
+                    if not leds.channel_leds(u["led_channel"]):
                         continue
-                    raw.set_zone_color(ctrl.index, zone, RED if u["id"] == unit_id else BLACK)
-                return None
-        try:
-            error = await asyncio.to_thread(_do)
-        except Exception as exc:
-            raise HTTPException(503, f"OpenRGB not connected: {exc}")
-        if error == "no_device":
-            raise HTTPException(404, "no hub RGB device found")
+                    leds.fill(u["led_channel"], RED if u["id"] == unit_id else BLACK)
+        await _run_hub_leds(_do)
     elif unit["kind"] in ("mobo", "ram"):
         if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
             raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")

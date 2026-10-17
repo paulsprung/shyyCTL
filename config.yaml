@@ -6,6 +6,13 @@ hub:
   # do not use a bare "nzxt", the ASUS Aura LED Controller sits on the same
   # bus and a loose match becomes ambiguous.
   match: "control hub"
+  # "direct" (default): shyyctl drives the hub's fans AND its LEDs itself,
+  # over one connection it keeps open (like NZXT CAM) - OpenRGB is told to
+  # leave the hub alone and only handles RAM + motherboard RGB.
+  # "openrgb": the previous setup - hub LEDs through OpenRGB, fans through a
+  # separate liquidctl process per call. Only worth switching back to if
+  # direct control misbehaves on your hardware; restart shyyctl afterwards.
+  control: "direct"
 
 openrgb:
   host: "127.0.0.1"
