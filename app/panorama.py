@@ -76,6 +76,7 @@ import queue
 import random
 import struct
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -458,7 +459,15 @@ def resolve_ffmpeg_path() -> str:
     else just 'ffmpeg' to fall back on PATH - resolved at call time, not
     import time, since the vendor file may not exist yet when this module
     is first imported but does by the time media is actually uploaded."""
-    vendored = Path(__file__).resolve().parent.parent / "vendor" / "ffmpeg.exe"
+    # vendor/ sits next to shyyctl.exe in an install (main.py's ROOT), not
+    # next to this module - frozen, that's inside _internal/, where the
+    # installed app looked in vain and fell back to a PATH ffmpeg most
+    # machines don't have: every gallery Apply failed with "ffmpeg not found".
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent
+    else:
+        root = Path(__file__).resolve().parent.parent
+    vendored = root / "vendor" / "ffmpeg.exe"
     return str(vendored) if vendored.is_file() else "ffmpeg"
 
 
