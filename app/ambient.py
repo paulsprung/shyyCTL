@@ -35,7 +35,10 @@ SAMPLE_FPS = 2  # LEDs don't need video frame rate, just to track big colour cha
 
 
 class AmbientSampler:
-    def __init__(self):
+    def __init__(self, fps: int = SAMPLE_FPS):
+        # The startup animation's ambient show samples faster than the
+        # effect: a few seconds of intro need to follow the video closely.
+        self._fps = fps
         self._lock = threading.Lock()        # guards _zones
         self._state_lock = threading.Lock()  # guards source switching below
         self._zones = {"top": (0, 0, 0), "bottom": (0, 0, 0), "left": (0, 0, 0), "right": (0, 0, 0)}
@@ -104,7 +107,7 @@ class AmbientSampler:
         # what the panel was actually showing.
         cmd = [ffmpeg_path, "-nostdin", "-loglevel", "error", "-re", "-stream_loop", "-1", "-i", path,
                "-vf", f"scale={GRID_W}:{GRID_H}", "-f", "rawvideo", "-pix_fmt", "rgb24",
-               "-r", str(SAMPLE_FPS), "-"]
+               "-r", str(self._fps), "-"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      creationflags=NO_WINDOW)

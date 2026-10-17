@@ -101,7 +101,8 @@ from app.layout import Layout
 from app.openrgb_bridge import OpenRgbBridge
 from app.openrgb_raw import OpenRgbRaw
 from app.ambient import AmbientSampler
-from app.panorama import (PanoramaError, build_encoded_media_container, find_print_panel,
+from app.panorama import (DEFAULT_POWERON_MEDIA, KANALI_DEFAULT_POWERON_MEDIA, PanoramaError,
+                          build_encoded_media_container, find_print_panel,
                           find_usb_panel, generate_thumbnail)
 from app.procflags import NO_WINDOW
 from app.scan import Scan
@@ -338,7 +339,8 @@ def _load_panorama_state() -> dict:
 
 def _save_panorama_state(media: str | None, brightness: int | None,
                           poweron_media: str | None = None, standby_media: str | None = None,
-                          gallery_id: str | None = "__unset__"):
+                          gallery_id: str | None = "__unset__",
+                          boot_gallery_id: str | None = "__unset__"):
     """Persists what shyyctl itself last applied - not a read of the
     device's real current state, which the reverse-engineered protocol has
     no command for (checked: neither the handshake's device-info reply nor
@@ -367,13 +369,19 @@ def _save_panorama_state(media: str | None, brightness: int | None,
     the sentinel "__unset__" (not None) so brightness-only calls that
     don't know or care about the current media (panorama_brightness) can
     omit it and leave whatever gallery_id was already saved alone,
-    distinct from a real caller explicitly clearing it to None."""
+    distinct from a real caller explicitly clearing it to None.
+
+    boot_gallery_id: the same for the power-on slot - which gallery item
+    the custom boot screen came from, None for the TRYX default."""
+    saved = _load_panorama_state()
     if gallery_id == "__unset__":
-        gallery_id = _load_panorama_state().get("gallery_id")
+        gallery_id = saved.get("gallery_id")
+    if boot_gallery_id == "__unset__":
+        boot_gallery_id = saved.get("boot_gallery_id")
     PANORAMA_STATE_FILE.write_text(
         json.dumps({"media": media, "brightness": brightness,
                    "poweron_media": poweron_media, "standby_media": standby_media,
-                   "gallery_id": gallery_id}),
+                   "gallery_id": gallery_id, "boot_gallery_id": boot_gallery_id}),
         encoding="utf-8")
 
 
@@ -1041,12 +1049,25 @@ async def _reapply_rgb_state(hub_only: bool = False):
     colour back, so there's no "only if not already set" check possible -
     only "always re-apply, best effort, one target's failure doesn't
     block the rest". hub_only skips motherboard and RAM (see
-    _reapply_hub_rgb_state_delayed)."""
+    _reapply_hub_rgb_state_delayed).
+
+    Waits for the startup animation first (its finale lights RAM and the
+    board too), and with a saved effect about to take over, leaves alone
+    every unit that effect drives - a static colour in between would
+    flash before the effect fades in from where the animation ended."""
     state = _load_rgb_state()
     if not state:
         return
+    await _wait_startup_animation()
+    if _startup_anim_taken_over() or _effect_status.get("running"):
+        return  # something the user started has the LEDs now
+    driven: set[str] = set()
+    if HUB_DIRECT and EFFECT_STATE_FILE.is_file():
+        units = layout.load().get("units", [])
+        driven = {u.get("led_channel") for u in units if u.get("kind") == "fan"}
+        driven |= {u["id"] for u in units if u.get("kind") in ("mobo", "ram")}
 
-    mobo = None if hub_only else state.get("mobo", {}).get("0")
+    mobo = None if hub_only or "mobo" in driven else state.get("mobo", {}).get("0")
     if mobo:
         try:
             devices = await asyncio.to_thread(openrgb.motherboard)
@@ -1056,7 +1077,8 @@ async def _reapply_rgb_state(hub_only: bool = False):
         except Exception as exc:
             log.warning("could not reapply saved motherboard colour: %s", exc)
 
-    ram_state = {} if hub_only else state.get("ram", {})
+    ram_state = {} if hub_only else {i: e for i, e in state.get("ram", {}).items()
+                                     if f"ram-{i}" not in driven}
     if ram_state:
         try:
             devices = await asyncio.to_thread(openrgb.ram)
@@ -1069,16 +1091,7 @@ async def _reapply_rgb_state(hub_only: bool = False):
         except Exception as exc:
             log.warning("could not reapply saved RAM colours: %s", exc)
 
-    hub_state = state.get("hub", {})
-    if hub_state:
-        await _wait_startup_animation()
-        if HUB_DIRECT and EFFECT_STATE_FILE.is_file():
-            # A saved effect is about to take these rings over, fading in
-            # from where the startup animation left them - a static colour
-            # in between would flash.
-            driven = {u.get("led_channel") for u in layout.load().get("units", [])
-                      if u.get("kind") == "fan"}
-            hub_state = {ch: e for ch, e in hub_state.items() if ch not in driven}
+    hub_state = {ch: e for ch, e in state.get("hub", {}).items() if ch not in driven}
     for channel, entry in hub_state.items():
         try:
             rgb = _hex_to_rgb(entry["color"])
@@ -1150,6 +1163,8 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
                 break
             await asyncio.sleep(0.2)
     played = await _wait_startup_animation()
+    if _startup_anim_taken_over() or _effect_status.get("running"):
+        return  # Stop, or something else started meanwhile - don't paint over it
     try:
         await _do_start_position_effect(saved_effect, persist=False, fade_in=played)
     except Exception as exc:
@@ -1160,17 +1175,28 @@ async def _resume_effect_after_scan(saved_effect: "PositionEffectRequest"):
 #
 # The hub keeps nothing across a power-off (every LED comes up white -
 # confirmed on the real hardware), so the first thing the fan rings show
-# that shyyctl chose is this: played on the hub alone, right after shyyctl
-# has it, then faded into the saved effect or the saved static colours.
+# that shyyctl chose is this: played on the hub right after shyyctl has it,
+# optionally with RAM and motherboard joining for a finale once OpenRGB is
+# up, then faded into the saved effect or the saved static colours.
 # Frames: app/startup_anim.py.
 
 class StartupAnimation(BaseModel):
     enabled: bool = True
-    style: str = "chase"         # startup_anim.STYLES
+    style: str = "snake"                # startup_anim.STYLES
+    direction: str = "bottom_to_top"    # snake/cascade: startup_anim.DIRECTIONS
+    reverse: bool = False               # rings counter-clockwise
+    palette: str = "solid"              # startup_anim.PALETTES
     color: str = "#ffffff"
-    lap_s: float = 1.5           # one lap around a ring
-    tail: int = 4                # chase only: LEDs the tail fades over
-    fade_s: float = 1.5          # into the saved effect / colours
+    color2: str = "#4c79ff"             # gradient: the tail end
+    brightness: int = 100               # %
+    lap_s: float = 1.5                  # one fan ring's worth of travel
+    laps: int = 1                       # chase/cascade: times round each ring
+    tail: int = 10                      # LEDs the tail fades over
+    ambient_source: str = ""            # gallery item id; "" = the power-on video
+    ambient_on_display: bool = True     # the panel plays that video meanwhile
+    show_s: float = 8.0                 # ambient: how long
+    finale: bool = True                 # RAM + motherboard join, everything lights up
+    fade_s: float = 1.5                 # into the saved effect / colours
 
 
 def _load_startup_animation() -> StartupAnimation:
@@ -1185,25 +1211,65 @@ def _load_startup_animation() -> StartupAnimation:
 
 
 def _checked_startup_animation(body: StartupAnimation) -> StartupAnimation:
-    if body.style not in startup_anim.STYLES:
-        raise HTTPException(400, f"unknown style {body.style!r} - must be one of {startup_anim.STYLES}")
+    for field, allowed in (("style", startup_anim.STYLES), ("direction", startup_anim.DIRECTIONS),
+                           ("palette", startup_anim.PALETTES)):
+        if getattr(body, field) not in allowed:
+            raise HTTPException(400, f"unknown {field} {getattr(body, field)!r} - must be one of {allowed}")
     _hex_to_rgb(body.color)
+    _hex_to_rgb(body.color2)
+    if body.ambient_source and not any(i["id"] == body.ambient_source for i in _load_gallery()):
+        raise HTTPException(400, "the ambient video is no longer in the gallery")
     return body.model_copy(update={
+        "brightness": min(max(body.brightness, 5), 100),
         "lap_s": min(max(body.lap_s, 0.3), 10.0),
-        "tail": min(max(body.tail, 1), 16),
+        "laps": min(max(body.laps, 1), 5),
+        "tail": min(max(body.tail, 1), 40),
+        "show_s": min(max(body.show_s, 2.0), 30.0),
         "fade_s": min(max(body.fade_s, 0.0), 10.0),
     })
 
 
 _startup_anim_task: asyncio.Future | None = None
-_startup_anim_fade: tuple[str, tuple[int, int, int]] | None = None  # (style, colour) the rings ended on
+_startup_anim_loop: asyncio.AbstractEventLoop | None = None
+# unit id -> the colours it was left showing when the animation ended (by
+# strip index) - where a following effect fades in from. None until an
+# animation has played.
+_startup_anim_end: dict[str, list[tuple[int, int, int]]] | None = None
 _STARTUP_FRAME_S = 0.04
+_FINALE_S = 1.2
+_FINALE_OPENRGB_WAIT_S = 20.0
 
 
-def _startup_rings() -> list[tuple[str, list[float]]]:
-    """(led channel, place of each strip LED along its ring) for every
-    placed fan unit the hub drives. Units without positions in the layout
-    run in strip order."""
+class _Show:
+    """One run of the startup animation: settings, rings, colours, and the
+    brightness every write goes out at."""
+
+    def __init__(self, cfg: StartupAnimation, stop: threading.Event):
+        self.cfg = cfg
+        self.stop = stop
+        self.colors = [_hex_to_rgb(cfg.color), _hex_to_rgb(cfg.color2)]
+        self.level = cfg.brightness / 100
+        self.rings = _startup_rings(cfg.reverse)
+        self.t0 = time.monotonic()
+
+    def t(self) -> float:
+        return time.monotonic() - self.t0
+
+    def paint(self, u: float) -> tuple[int, int, int]:
+        return startup_anim.paint(self.cfg.palette, self.colors, u, self.t())
+
+    def write(self, frames: dict[str, list[tuple]]):
+        for ring in self.rings:
+            hub.set_leds(ring["channel"], [startup_anim.scale(c, self.level) for c in frames[ring["id"]]])
+
+    def tick(self):
+        self.stop.wait(_STARTUP_FRAME_S)
+
+
+def _startup_rings(reverse: bool = False) -> list[dict]:
+    """Every placed fan unit the hub drives: {"id", "channel", "leds"
+    (layout entries with positions), "places" (ring_order), "count"}.
+    Units whose positions don't match their LED count run in strip order."""
     data = layout.with_leds()
     rings = []
     for u in data["units"]:
@@ -1213,74 +1279,370 @@ def _startup_rings() -> list[tuple[str, list[float]]]:
         count = _hub_channel_led_count(channel)
         if not count:
             continue
-        places = startup_anim.ring_order([l for l in data["leds"] if l["unit"] == u["id"]])
-        if len(places) != count:
+        leds = [l for l in data["leds"] if l["unit"] == u["id"]]
+        places = startup_anim.ring_order(leds, reverse)
+        if len(places) != count or len(leds) != count:
+            leds = []
             places = [i / count for i in range(count)]
-        rings.append((channel, places))
+        rings.append({"id": u["id"], "channel": channel, "leds": leds, "places": places, "count": count})
     return rings
 
 
-def _run_startup_animation(cfg: StartupAnimation, fade_to_saved_colours: bool,
-                           stop: threading.Event):
-    """Plays the animation once on every fan ring (blocking, ~lap_s),
-    then - when no effect follows - fades into the saved static colours.
-    A following effect does its own fade (see _run_position_effect)."""
-    global _startup_anim_fade
-    rings = _startup_rings()
-    if not rings:
-        return
-    color = _hex_to_rgb(cfg.color)
-    total = max(startup_anim.duration(cfg.style, cfg.lap_s, cfg.tail, len(pl)) for _, pl in rings)
+def _play_ring_laps(show: _Show) -> dict:
+    """chase / fill / cascade: each ring its own run - all at once, or
+    (cascade) one after another in travel order."""
+    cfg, rings = show.cfg, show.rings
+    delays = {r["id"]: 0.0 for r in rings}
+    if cfg.style == "cascade":
+        order = startup_anim.unit_order([(r["id"], r["leds"]) for r in rings], cfg.direction)
+        delays = {uid: i * cfg.lap_s * startup_anim.CASCADE_STAGGER for i, uid in enumerate(order)}
+    total = max(delays[r["id"]] + startup_anim.duration(cfg.style, cfg.lap_s, cfg.tail, r["count"], cfg.laps)
+                for r in rings)
+    start = time.monotonic()
+    while not show.stop.is_set():
+        t = time.monotonic() - start
+        show.write({r["id"]: startup_anim.frame(cfg.style, r["places"], t - delays[r["id"]], cfg.lap_s,
+                                                 cfg.tail, cfg.palette, show.colors, cfg.laps)
+                    for r in rings})
+        if t >= total:
+            break
+        show.tick()
+    return {r["id"]: startup_anim.end_frame(cfg.style, r["places"], cfg.palette, show.colors, show.t())
+            for r in rings}
+
+
+def _play_snake(show: _Show) -> dict:
+    """One snake along a path through every ring in travel order (see
+    startup_anim.snake_path), at one ring's length per lap_s."""
+    cfg, rings = show.cfg, show.rings
+    path = startup_anim.snake_path([(r["id"], r["leds"]) for r in rings if r["leds"]],
+                                   cfg.direction, cfg.reverse)
+    # rings without positions still get their turn, in strip order
+    path += [(r["id"], i) for r in rings if not r["leds"] for i in range(r["count"])]
+    if not path:
+        return {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
+    speed = (sum(r["count"] for r in rings) / len(rings)) / cfg.lap_s  # LEDs per second
+    total = (len(path) + cfg.tail) / speed
+    start = time.monotonic()
+    while not show.stop.is_set():
+        t = time.monotonic() - start
+        head = t * speed
+        frames = {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
+        for step, at in enumerate(path):
+            if at is startup_anim.GAP:
+                continue
+            behind = head - step
+            level = startup_anim.tail_level(behind, cfg.tail)
+            if level:
+                u = behind / cfg.tail if cfg.palette != "rainbow" else step / len(path)
+                frames[at[0]][at[1]] = startup_anim.scale(show.paint(u), level)
+        show.write(frames)
+        if t >= total:
+            break
+        show.tick()
+    return {r["id"]: [(0, 0, 0)] * r["count"] for r in rings}
+
+
+def _call_on_loop(coro, timeout: float):
+    """Runs a coroutine on the server's event loop from the animation's
+    thread (the Panorama lock is an asyncio lock) and waits for it."""
+    return asyncio.run_coroutine_threadsafe(coro, _startup_anim_loop).result(timeout)
+
+
+async def _panel_show_media(media: str) -> str | None:
+    """Switches the panel to `media` without remembering it as the applied
+    media; returns what was showing before, or None if the panel isn't
+    there or didn't confirm."""
+    panel = _panorama
+    if panel is None or not panel.connected:
+        return None
+    async with _panorama_lock:
+        previous = panel.last_media
+        ok = await _call_panel(panel.set_media, media)
+    return previous if ok else None
+
+
+def _ambient_source(cfg: StartupAnimation) -> tuple[Path, str | None] | None:
+    """(local video, its name on the panel or None) for the ambient show:
+    the chosen gallery item, or the custom power-on video by default. The
+    TRYX default animations exist only on the panel, never locally, so
+    they can't be followed."""
+    state = _load_panorama_state()
+    item_id = cfg.ambient_source or state.get("boot_gallery_id")
+    if not item_id:
+        return None
+    item = next((i for i in _load_gallery() if i["id"] == item_id), None)
+    original = next((GALLERY_DIR / item_id).glob("original.*"), None) if item else None
+    if original is None:
+        return None
+    remote = item.get("remote_name")
+    if item_id == state.get("boot_gallery_id"):
+        remote = state.get("poweron_media") or remote
+    return original, remote
+
+
+def _play_ambient_show(show: _Show) -> dict | None:
+    """The panel plays the chosen video (if on_display and it's on the
+    panel) while the rings light up from that same video, decoded locally
+    in step with it; then the panel goes back to the applied media. None
+    if there's no local video to follow."""
+    cfg, rings, stop = show.cfg, show.rings, show.stop
+    source = _ambient_source(cfg)
+    if source is None:
+        log.info("startup animation: ambient needs a gallery video (or a custom power-on video) - "
+                 "playing the snake instead")
+        return None
+    original, remote = source
+    previous = None
+    if cfg.ambient_on_display and remote:
+        # The panel connects on its own task at launch - give it a moment.
+        deadline = time.monotonic() + 10
+        while (_panorama is None or not _panorama.connected) and time.monotonic() < deadline and not stop.is_set():
+            stop.wait(0.2)
+        try:
+            previous = _call_on_loop(_panel_show_media(remote), timeout=10)
+        except Exception as exc:
+            log.warning("startup animation: could not show the video on the panel: %s", exc)
+    sampler = AmbientSampler(fps=12)
+    sampler.set_source(str(original), original.suffix.lower() in _VIDEO_SUFFIXES)
+    all_leds = [l for r in rings for l in r["leds"]]
+    xs, ys = [l["x"] for l in all_leds] or [0, 1], [l["y"] for l in all_leds] or [0, 1]
+    x0, y0 = min(xs), min(ys)
+    w, h = (max(xs) - x0) or 1.0, (max(ys) - y0) or 1.0
+    frames = {}
     start = time.monotonic()
     try:
         while not stop.is_set():
             t = time.monotonic() - start
-            for channel, places in rings:
-                hub.set_leds(channel, startup_anim.frame(cfg.style, places, t, cfg.lap_s, cfg.tail, color))
-            if t >= total:
+            zones = sampler.zones()
+            fade = min(1.0, t / 0.5)
+            for r in rings:
+                if r["leds"]:
+                    by_index = {l["index"]: l for l in r["leds"]}
+                    frames[r["id"]] = [startup_anim.scale(startup_anim.ambient_color(
+                        zones, (by_index[i]["y"] - y0) / h, (by_index[i]["x"] - x0) / w), fade)
+                        for i in range(r["count"])]
+                else:
+                    frames[r["id"]] = [startup_anim.scale(startup_anim.ambient_color(zones, 0.5, 0.5),
+                                                          fade)] * r["count"]
+            show.write(frames)
+            if t >= cfg.show_s:
                 break
-            stop.wait(_STARTUP_FRAME_S)
-        _startup_anim_fade = (cfg.style, color)
+            show.tick()
+    finally:
+        sampler.stop()
+        if previous is not None:
+            try:
+                _call_on_loop(_panel_show_media(previous), timeout=10)
+            except Exception as exc:
+                log.warning("startup animation: could not switch the panel back: %s", exc)
+    return frames
+
+
+def _finale_targets():
+    """RAM sticks and the motherboard as the effect would drive them -
+    [(unit, device, zone index, strip indices bottom-to-top)]."""
+    leds_by_unit, _, ram_targets, mobo_target = _resolve_effect_targets()
+    targets = []
+    for u, device in ram_targets:
+        order = [l["index"] for l in sorted(leds_by_unit.get(u["id"], []), key=lambda l: -l["y"])]
+        targets.append((u, device, 0, order))
+    if mobo_target is not None:
+        u, device, zone_index = mobo_target
+        targets.append((u, device, zone_index, []))
+    for _, device, _, _ in targets:
+        openrgb.select_mode(device, "direct")
+    return targets
+
+
+def _play_finale(show: _Show, end: dict) -> tuple[dict, list]:
+    """RAM and motherboard join in: once OpenRGB is up (the rings breathe
+    softly while it starts), the RAM sticks fill from the bottom, the
+    board and the rings ramp up, and everything ends lit. Returns the end
+    frames of everything it lit, and the RAM/board targets."""
+    rings, stop = show.rings, show.stop
+    full = {r["id"]: [show.paint(p) for p in r["places"]] for r in rings}
+    deadline = time.monotonic() + _FINALE_OPENRGB_WAIT_S
+    start = time.monotonic()
+    waited = False
+    while not openrgb.connected and time.monotonic() < deadline and not stop.is_set():
+        waited = True
+        t = time.monotonic() - start
+        level = 0.12 + 0.1 * (1 - math.cos(t * math.pi)) / 2
+        show.write({r["id"]: startup_anim.blend(end[r["id"]], [startup_anim.scale(c, level) for c in full[r["id"]]],
+                                                 min(1.0, t / 0.6)) for r in rings})
+        show.tick()
+    targets = []
+    if openrgb.connected:
+        try:
+            targets = _finale_targets()
+        except Exception as exc:
+            log.warning("startup animation: RAM/motherboard unavailable for the finale: %s", exc)
+    ring_start = {r["id"]: ([startup_anim.scale(c, 0.12) for c in full[r["id"]]] if waited else end[r["id"]])
+                  for r in rings}
+    finale_color = startup_anim.scale(show.paint(0.0), show.level)
+    start = time.monotonic()
+    while not stop.is_set():
+        k = min(1.0, (time.monotonic() - start) / _FINALE_S)
+        show.write({r["id"]: startup_anim.blend(ring_start[r["id"]], full[r["id"]], k) for r in rings})
+        for u, device, zone_index, order in targets:
+            count = len(device.zones[zone_index].leds)
+            if order and len(order) == count:
+                lit = k * count
+                frame = [(0, 0, 0)] * count
+                for rank, index in enumerate(order):
+                    frame[index] = startup_anim.scale(finale_color, max(0.0, min(1.0, lit - rank)))
+            else:
+                frame = [startup_anim.scale(finale_color, k)] * count
+            try:
+                openrgb.set_zone_colors_by_index(device, zone_index, frame)
+            except Exception as exc:
+                log.debug("startup animation: finale write failed for %s: %s", u["id"], exc)
+        if k >= 1:
+            break
+        show.tick()
+    ends = dict(full)
+    for u, device, zone_index, _ in targets:
+        ends[u["id"]] = [finale_color] * len(device.zones[zone_index].leds)
+    return ends, targets
+
+
+def _run_startup_animation(cfg: StartupAnimation, fade_to_saved_colours: bool,
+                           stop: threading.Event):
+    """Plays the animation (blocking, a few seconds), optionally the
+    finale, then - when no effect follows - fades into the saved static
+    colours. A following effect does its own fade from where this left
+    everything (_startup_anim_end, see _run_position_effect)."""
+    global _startup_anim_end
+    show = _Show(cfg, stop)
+    if not show.rings:
+        return
+    try:
+        end = None
+        if cfg.style == "ambient":
+            end = _play_ambient_show(show)
+        if end is None:
+            end = _play_snake(show) if cfg.style in ("snake", "ambient") else _play_ring_laps(show)
+        targets = []
+        if cfg.finale and not stop.is_set():
+            end, targets = _play_finale(show, end)
+        # what was really shown: rings went out at the chosen brightness
+        ring_ids = {r["id"] for r in show.rings}
+        shown = {uid: [startup_anim.scale(c, show.level) for c in f] if uid in ring_ids else f
+                 for uid, f in end.items()}
+        _startup_anim_end = shown
         if stop.is_set() or not fade_to_saved_colours:
             return
-        saved = _load_rgb_state().get("hub", {})
-        ends = {ch: startup_anim.end_frame(cfg.style, len(pl), color) for ch, pl in rings}
-        targets = {ch: [_hex_to_rgb(saved[ch]["color"]) if ch in saved else (0, 0, 0)] * len(pl)
-                   for ch, pl in rings}
+        saved = _load_rgb_state()
+        hub_saved = saved.get("hub", {})
+        ring_targets = {r["id"]: [_hex_to_rgb(hub_saved[r["channel"]]["color"]) if r["channel"] in hub_saved
+                                  else (0, 0, 0)] * r["count"] for r in show.rings}
+
+        def saved_colour(u):
+            if u["kind"] == "mobo":
+                entry = saved.get("mobo", {}).get("0")
+            else:
+                entry = saved.get("ram", {}).get(u["id"].rsplit("-", 1)[-1])
+            return _hex_to_rgb(entry["color"]) if entry else (0, 0, 0)
+
+        show.level = 1.0  # `shown` already carries the brightness
         fade_start = time.monotonic()
         while not stop.is_set():
             k = (time.monotonic() - fade_start) / cfg.fade_s if cfg.fade_s > 0 else 1.0
-            for channel, _ in rings:
-                hub.set_leds(channel, startup_anim.blend(ends[channel], targets[channel], k))
+            show.write({r["id"]: startup_anim.blend(shown[r["id"]], ring_targets[r["id"]], k) for r in show.rings})
+            for u, device, zone_index, _ in targets:
+                count = len(device.zones[zone_index].leds)
+                try:
+                    openrgb.set_zone_colors_by_index(
+                        device, zone_index, startup_anim.blend(shown[u["id"]], [saved_colour(u)] * count, k))
+                except Exception as exc:
+                    log.debug("startup animation: fade write failed for %s: %s", u["id"], exc)
             if k >= 1:
                 break
-            stop.wait(_STARTUP_FRAME_S)
+            show.tick()
     except Exception as exc:
         log.warning("startup animation stopped: %s", exc)
 
 
 def _start_startup_animation():
-    """Called once, right after the hub connected at launch."""
-    global _startup_anim_task
+    """Called once, right after the hub connected at launch. Runs as the
+    current "effect", so Stop or anything else started meanwhile ends it
+    like any effect - it used to have a stop flag of its own nothing
+    could reach, and kept writing alongside whatever was started next."""
+    global _startup_anim_task, _startup_anim_loop, _startup_anim_stop, _effect_task, _effect_status
     if not (HUB_DIRECT and hub.connected):
         return
     cfg = _load_startup_animation()
     if not cfg.enabled:
         return
-    _startup_anim_task = asyncio.ensure_future(asyncio.to_thread(
-        _run_startup_animation, cfg, _load_effect_state() is None, threading.Event()))
+    _startup_anim_loop = asyncio.get_running_loop()
+    stop = _new_effect_stop()
+    _startup_anim_stop = stop
+    _effect_status = {"running": True, "kind": "startup", "error": None}
+    _effect_task = _start_effect_thread(_run_startup_animation_once, cfg,
+                                        _load_effect_state() is None, stop)
+    _startup_anim_task = _effect_task
+
+
+def _run_startup_animation_once(cfg: StartupAnimation, fade_to_saved_colours: bool,
+                                stop: threading.Event):
+    _run_startup_animation(cfg, fade_to_saved_colours, stop)
+    _end_effect(stop)
+
+
+_startup_anim_stop: threading.Event | None = None
+
+
+def _startup_anim_taken_over() -> bool:
+    """Whether something else has the LEDs since the launch animation
+    started (Stop, an effect, a test pattern, a static colour) - then
+    nothing may be resumed or re-applied over it."""
+    stop = _startup_anim_stop
+    return stop is not None and (stop.is_set() or stop is not _effect_stop)
 
 
 async def _wait_startup_animation() -> bool:
-    """Waits for a running startup animation to finish; whether one ran."""
+    """Waits for a running startup animation to finish; whether one ran
+    to its end without anything taking over."""
     task = _startup_anim_task
     if task is None:
         return False
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=30)
+        await asyncio.wait_for(asyncio.shield(task), timeout=60)
     except Exception as exc:
         log.warning("startup animation did not finish cleanly: %s", exc)
-    return _startup_anim_fade is not None
+    return _startup_anim_end is not None and not _startup_anim_taken_over()
+
+
+async def _ensure_on_panel(item_id: str) -> str | None:
+    """The panel-side name of a gallery item, uploading it once if it was
+    never uploaded - so the ambient show can play it at launch without an
+    encode + upload on the way. None if the panel isn't there."""
+    item = next((i for i in _load_gallery() if i["id"] == item_id), None)
+    if item is None:
+        return None
+    if item.get("remote_name"):
+        return item["remote_name"]
+    panel = await get_panorama()
+    original = next((GALLERY_DIR / item_id).glob("original.*"), None)
+    if panel is None or not panel.connected or original is None:
+        return None
+    container = await asyncio.to_thread(build_encoded_media_container, str(original))
+    if container is None:
+        return None
+    async with _panorama_lock:
+        remote_name = await _call_panel(panel.upload_media, str(original), None, 2.0, 15.0, container)
+    if remote_name:
+        _remember_gallery_remote(item_id, remote_name)
+    return remote_name
+
+
+def _remember_gallery_remote(item_id: str, remote_name: str):
+    items = _load_gallery()
+    for item in items:
+        if item["id"] == item_id:
+            item["remote_name"] = remote_name
+    _save_gallery(items)
 
 
 @asynccontextmanager
@@ -2364,8 +2726,19 @@ class ColorRequest(BaseModel):
     persistent: bool = True
 
 
+async def _take_over_leds():
+    """A static colour about to be set: whatever effect, test pattern or
+    startup animation is running would paint straight over it - or both
+    would take turns, which flickers - so it stops first, and isn't
+    resumed at the next launch either."""
+    if _effect_status.get("running"):
+        await _stop_effect()
+        _clear_effect_state()
+
+
 @app.post("/api/rgb/mobo/color")
 async def set_mobo_color(body: ColorRequest):
+    await _take_over_leds()
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
@@ -2400,6 +2773,7 @@ async def mobo_leds():
 
 @app.post("/api/rgb/mobo/led/{index}/color")
 async def set_mobo_led_color(index: int, body: ColorRequest):
+    await _take_over_leds()
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
@@ -2420,6 +2794,7 @@ async def set_mobo_led_color(index: int, body: ColorRequest):
 
 @app.post("/api/rgb/ram/color")
 async def set_ram_color(body: ColorRequest):
+    await _take_over_leds()
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
@@ -2446,6 +2821,7 @@ async def ram_sticks():
 
 @app.post("/api/rgb/ram/stick/{index}/color")
 async def set_ram_stick_color(index: int, body: ColorRequest):
+    await _take_over_leds()
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
@@ -2463,6 +2839,7 @@ async def set_ram_stick_led_color(index: int, led_index: int, body: ColorRequest
     device, so this goes straight through the device's LED list (see
     OpenRgbBridge.set_device_led_color) rather than needing a zone index
     first, unlike the motherboard's multi-zone controller."""
+    await _take_over_leds()
     if not openrgb.connected and not await asyncio.to_thread(openrgb.connect):
         raise HTTPException(503, f"OpenRGB not connected: {openrgb.last_error}")
     rgb = _hex_to_rgb(body.color)
@@ -2553,6 +2930,7 @@ async def set_hub_channel_color(channel: str, body: ColorRequest):
     be sized (via a scan or the resize endpoint) - a 0-LED zone means
     nothing is known to be attached there, and is refused rather than
     silently falling back to a device-wide write."""
+    await _take_over_leds()
     rgb = _hex_to_rgb(body.color)
 
     def _do():
@@ -2576,6 +2954,7 @@ async def set_hub_channel_leds(channel: str, body: LedColorsRequest):
     colours sent must match that size exactly - no padding or truncating
     guesses, same reasoning as resize_zone's docstring about not guessing
     LED counts."""
+    await _take_over_leds()
     rgb_list = [_hex_to_rgb(c) for c in body.colors]
 
     def _do():
@@ -3040,11 +3419,11 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
         return unit_leds, colors_out
 
     if fade_in is not None:
-        # (seconds, colour the fan rings start from or None for dark, ids
-        # of those rings) - after the startup animation the effect blends
-        # in over the first few seconds instead of cutting in; everything
-        # else fades up from dark.
-        fade_s, fade_color, faded_ids = fade_in
+        # (seconds, {unit id: colours it was left showing}) - after the
+        # startup animation the effect blends in over the first few
+        # seconds from wherever each unit was left, instead of cutting in;
+        # units the animation never touched fade up from dark.
+        fade_s, ends = fade_in
         effect_frame_colors = frame_colors
         fade_started = [None]
 
@@ -3054,8 +3433,10 @@ def _run_position_effect(direction: str, palette: str, colors: list[tuple],
                 fade_started[0] = time.monotonic()
             k = (time.monotonic() - fade_started[0]) / fade_s if fade_s > 0 else 1.0
             if k < 1:
-                base = fade_color if fade_color is not None and u["id"] in faded_ids else (0, 0, 0)
-                colors_out = startup_anim.blend([base] * len(colors_out), colors_out, k)
+                base = ends.get(u["id"]) or [(0, 0, 0)]
+                if len(base) != len(colors_out):
+                    base = [base[0]] * len(colors_out)  # e.g. the board: layout count vs real zone
+                colors_out = startup_anim.blend(base, colors_out, k)
             return unit_leds, colors_out
 
     def refresh_ambient_source():
@@ -3387,10 +3768,8 @@ async def _do_start_position_effect(body: PositionEffectRequest, persist: bool =
         "started_at": time.time(), "error": None,
     }
     fade = None
-    if fade_in and _startup_anim_fade is not None:
-        style, color = _startup_anim_fade
-        fan_ids = {u["id"] for u in layout.load().get("units", []) if u.get("kind") == "fan"}
-        fade = (_load_startup_animation().fade_s, color if style == "fill" else None, fan_ids)
+    if fade_in and _startup_anim_end is not None:
+        fade = (_load_startup_animation().fade_s, dict(_startup_anim_end))
     _effect_task = _start_effect_thread(
         _run_position_effect, body.direction, body.palette,
         rgb_colors, period_s, body.moving, body.shape, selection, stop, fade)
@@ -3406,9 +3785,16 @@ async def get_startup_animation():
 
 @app.post("/api/rgb/startup-animation")
 async def set_startup_animation(body: StartupAnimation):
+    """Saves the settings. An ambient show that should also play on the
+    panel needs its video there already - uploaded once here, now, rather
+    than at launch."""
     cfg = _checked_startup_animation(body)
     STARTUP_ANIM_FILE.write_text(cfg.model_dump_json(), encoding="utf-8")
-    return cfg.model_dump()
+    note = None
+    if cfg.style == "ambient" and cfg.ambient_on_display and cfg.ambient_source:
+        if await _ensure_on_panel(cfg.ambient_source) is None:
+            note = "saved - but the video could not be put on the panel (not connected?); the LEDs still follow it"
+    return {**cfg.model_dump(), "note": note}
 
 
 @app.post("/api/rgb/startup-animation/preview")
@@ -3416,21 +3802,28 @@ async def preview_startup_animation(body: StartupAnimation):
     """Plays the given (not necessarily saved) animation now, the way it
     runs at launch: whatever was running stops, the animation plays, then
     the saved effect resumes with its fade - or the saved colours fade in."""
-    global _effect_task, _effect_status, _startup_anim_fade
+    global _effect_task, _effect_status, _startup_anim_end, _startup_anim_loop
     if not HUB_DIRECT:
         raise HTTPException(400, "the startup animation needs hub.control: direct")
     if not hub.ensure_connected():
         raise HTTPException(503, f"hub not connected: {hub.last_error}")
     cfg = _checked_startup_animation(body)
+    if cfg.style == "ambient" and cfg.ambient_on_display and cfg.ambient_source:
+        await _ensure_on_panel(cfg.ambient_source)
     saved = _load_effect_state()
     await _stop_effect()
     stop = _new_effect_stop()
-    _startup_anim_fade = None
+    _startup_anim_end = None
+    _startup_anim_loop = asyncio.get_running_loop()
     _effect_status = {"running": True, "kind": "startup", "error": None}
     _effect_task = _start_effect_thread(_run_startup_animation, cfg, saved is None, stop)
     await _effect_task
-    if stop is not _effect_stop:
-        return {"ok": True}  # something else was started meanwhile
+    if stop is not _effect_stop or stop.is_set():
+        # Something else was started, or Stop / a test pattern stopped the
+        # preview - resuming the effect now would paint over that.
+        if stop is _effect_stop:
+            _end_effect(stop)
+        return {"ok": True, "interrupted": True}
     _end_effect(stop)
     if saved is not None:
         await _do_start_position_effect(saved, persist=False, fade_in=True)
@@ -3640,6 +4033,12 @@ async def panorama_status():
             # matches on this instead of last_applied.media.
             "gallery_id": _load_panorama_state().get("gallery_id"),
         },
+        "boot": {
+            "media": panel.last_poweron_media,
+            "gallery_id": _load_panorama_state().get("boot_gallery_id"),
+            "is_default": panel.last_poweron_media in (DEFAULT_POWERON_MEDIA,
+                                                       KANALI_DEFAULT_POWERON_MEDIA),
+        },
     }
 
 
@@ -3773,6 +4172,7 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
         remote_name = await _call_panel(panel.upload_media, str(original), None, 2.0, 15.0, container)
         if remote_name is None:
             raise HTTPException(500, "upload failed (transfer step) - check server logs")
+        _remember_gallery_remote(item_id, remote_name)
         if as_boot:
             ok = await _call_panel(panel.set_boot_media, remote_name)
         else:
@@ -3785,7 +4185,8 @@ async def _apply_gallery_item(item_id: str, as_boot: bool) -> dict:
             # _save_panorama_state's "__unset__" sentinel default).
             if as_boot:
                 _save_panorama_state(panel.last_media, panel.last_brightness,
-                                     panel.last_poweron_media, panel.last_standby_media)
+                                     panel.last_poweron_media, panel.last_standby_media,
+                                     boot_gallery_id=item_id)
             else:
                 _save_panorama_state(panel.last_media, panel.last_brightness,
                                      panel.last_poweron_media, panel.last_standby_media,
@@ -3801,6 +4202,25 @@ async def gallery_apply(item_id: str):
 @app.post("/api/panorama/gallery/{item_id}/boot")
 async def gallery_set_boot(item_id: str):
     return await _apply_gallery_item(item_id, as_boot=True)
+
+
+@app.post("/api/panorama/boot/reset")
+async def panorama_boot_reset():
+    """Back to the TRYX power-on animation - the fallback for a custom
+    boot screen that misbehaves: sends exactly what KANALI always sends
+    in that slot."""
+    panel = await get_panorama()
+    if panel is None or not panel.connected:
+        raise HTTPException(503, "panel not connected")
+    async with _panorama_lock:
+        ok = await _call_panel(panel.set_boot_media, KANALI_DEFAULT_POWERON_MEDIA)
+        if ok:
+            _save_panorama_state(panel.last_media, panel.last_brightness,
+                                 panel.last_poweron_media, panel.last_standby_media,
+                                 boot_gallery_id=None)
+    if not ok:
+        raise HTTPException(500, "the panel did not confirm the change")
+    return {"ok": True}
 
 
 @app.delete("/api/panorama/gallery/{item_id}")

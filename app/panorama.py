@@ -107,6 +107,12 @@ MEDIA_SUFFIX = f".h264_{MEDIA_WIDTH}x{MEDIA_HEIGHT}"
 DEFAULT_POWERON_MEDIA = f"start.mp4{MEDIA_SUFFIX}"
 DEFAULT_STANDBY_MEDIA = f"screensaver.mp4{MEDIA_SUFFIX}"
 
+# What KANALI itself puts in the power-on slot - in every screen config of
+# a real KANALI capture, never anything else. Used to undo a custom boot
+# screen: the one value known to be fine, since KANALI sends it all the
+# time (running KANALI once resets the slot to it as well).
+KANALI_DEFAULT_POWERON_MEDIA = f"default_poweron.mp4{MEDIA_SUFFIX}"
+
 
 class PanoramaError(Exception):
     pass

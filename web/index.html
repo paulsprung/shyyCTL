@@ -390,26 +390,79 @@
           <div class="row" style="margin-bottom:14px">
             <label class="inline"><input type="checkbox" id="startupEnabled"> play at startup</label>
           </div>
+
           <div class="effect-grid-3" style="margin-bottom:14px">
             <div class="prop"><label>Style</label>
-              <div class="seg" id="startupStyleSeg">
-                <button data-v="chase" aria-pressed="true">Running light</button>
-                <button data-v="fill">Fill ring</button>
-              </div>
+              <div class="select-wrap"><select id="startupStyle" onchange="updateStartupProps()">
+                <option value="snake">Snake through the case</option>
+                <option value="cascade">Cascade, ring by ring</option>
+                <option value="chase">Running light, all rings</option>
+                <option value="fill">Fill rings</option>
+                <option value="ambient">Ambient from a video</option>
+              </select></div>
             </div>
-            <div class="prop"><label>Colour</label>
-              <input type="color" id="startupColor" value="#ffffff">
+            <div class="prop" data-for="snake cascade"><label>Direction through the case</label>
+              <div class="select-wrap"><select id="startupDirection">
+                <option value="bottom_to_top">Bottom&uarr;Top</option>
+                <option value="top_to_bottom">Top&darr;Bottom</option>
+                <option value="left_to_right">Left&rarr;Right</option>
+                <option value="right_to_left">Right&larr;Left</option>
+              </select></div>
             </div>
-            <div class="prop" id="startupTailProp"><label>Tail (LEDs)</label>
-              <input type="number" id="startupTail" min="1" max="16" step="1" value="4" style="width:64px">
+            <div class="prop" data-for="snake cascade chase fill"><label>Around each ring</label>
+              <div class="select-wrap"><select id="startupReverse">
+                <option value="false">Clockwise</option>
+                <option value="true">Counter-clockwise</option>
+              </select></div>
             </div>
           </div>
+
+          <div class="effect-grid-3" style="margin-bottom:14px" data-for="snake cascade chase fill finale">
+            <div class="prop"><label>Colours</label>
+              <div class="select-wrap"><select id="startupPalette" onchange="updateStartupProps()">
+                <option value="solid">One colour</option>
+                <option value="gradient">Gradient (head &rarr; tail)</option>
+                <option value="rainbow">Rainbow</option>
+              </select></div>
+            </div>
+            <div class="prop" data-for="palette-solid palette-gradient"><label>Colour</label>
+              <input type="color" id="startupColor" value="#ffffff">
+            </div>
+            <div class="prop" data-for="palette-gradient"><label>Tail colour</label>
+              <input type="color" id="startupColor2" value="#4c79ff">
+            </div>
+          </div>
+
+          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px">
+            <label class="inline" data-for="snake cascade chase fill">speed: one ring per
+              <input type="number" id="startupLap" min="0.3" max="10" step="0.1" value="1.5" style="width:64px"> s</label>
+            <label class="inline" data-for="snake cascade chase">tail
+              <input type="number" id="startupTail" min="1" max="40" step="1" value="10" style="width:64px"> LEDs</label>
+            <label class="inline" data-for="cascade chase">laps
+              <input type="number" id="startupLaps" min="1" max="5" step="1" value="1" style="width:64px"></label>
+            <label class="inline">brightness
+              <input type="number" id="startupBrightness" min="5" max="100" step="5" value="100" style="width:64px"> %</label>
+          </div>
+
+          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px" data-for="ambient">
+            <div class="prop"><label>Video</label>
+              <div class="select-wrap"><select id="startupAmbientSource"></select></div>
+            </div>
+            <label class="inline"><input type="checkbox" id="startupAmbientDisplay" checked> also play it on the display</label>
+            <label class="inline">plays
+              <input type="number" id="startupShow" min="2" max="30" step="0.5" value="8" style="width:64px"> s</label>
+          </div>
+
           <div class="effect-grid" style="align-items:end;margin-bottom:0">
-            <label class="inline">one lap <input type="number" id="startupLap" min="0.3" max="10"
-              step="0.1" value="1.5" style="width:64px"> s</label>
+            <label class="inline"><input type="checkbox" id="startupFinale" checked onchange="updateStartupProps()">
+              finale: RAM and board join, everything lights up</label>
             <label class="inline">fade into effect <input type="number" id="startupFade" min="0" max="10"
               step="0.1" value="1.5" style="width:64px"> s</label>
           </div>
+          <div class="note" data-for="ambient" style="margin-top:10px">
+            The rings follow the video's colours by their place in the case. The TRYX default
+            animations only exist on the panel itself, so pick a video from your gallery.</div>
+
           <div class="row" style="margin-top:14px">
             <button class="btn sec sm" onclick="previewStartupAnimation()">Preview</button>
             <button class="btn sm" onclick="saveStartupAnimation()">Save</button>
@@ -550,6 +603,13 @@
           <div class="card">
             <div class="card-title">Device</div>
             <div class="note" id="panoInfo" style="line-height:1.8"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Power-on screen</div>
+            <div class="note" id="panoBootInfo" style="line-height:1.8"></div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn sec sm" id="panoBootResetBtn" onclick="resetPanoBoot()">Reset to TRYX default</button>
+            </div>
           </div>
           <div class="card">
             <div class="card-title">Brightness</div>
@@ -2360,6 +2420,13 @@ function renderPanorama(){
     Resolution: ${info.width||"?"} &times; ${info.height||"?"}
   ` : `<span class="note">Panel not connected.</span>`;
 
+  const boot = panoStatus.boot;
+  const bootItem = boot && boot.gallery_id ? galleryItems.find(i=>i.id===boot.gallery_id) : null;
+  document.getElementById("panoBootInfo").innerHTML = !boot ? "--"
+    : boot.is_default ? "TRYX default animation"
+    : `${esc(bootItem ? bootItem.name : boot.media)}<br><span class="note">shown at power-on, before shyyctl starts</span>`;
+  document.getElementById("panoBootResetBtn").disabled = !boot || boot.is_default;
+
   document.getElementById("panoMediaTable").innerHTML = panoMedia.length ? `
     <thead><tr><th>Path</th><th>Suffix</th><th>Size</th></tr></thead>
     <tbody>${panoMedia.map(m=>`
@@ -2461,6 +2528,7 @@ function renderGallery(){
       </div>
       ${isCenter ? `<div class="kanali-card-actions">
         <button class="btn sm" onclick="event.stopPropagation(); doApplyGalleryItem('${item.id}')">Apply</button>
+        <button class="btn sec sm" onclick="event.stopPropagation(); doSetBootGalleryItem('${item.id}')">Set as boot</button>
         <button class="btn sec sm" onclick="event.stopPropagation(); deleteGalleryItem('${item.id}')">Delete</button>
       </div>` : ``}
     </div>`;
@@ -2536,6 +2604,23 @@ async function doApplyGalleryItem(id){
     renderGallery();
     await loadPanorama(); renderPanorama();
     drawAdvancedCase(); // Advanced canvas's display-unit preview mirrors whatever's applied now
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function doSetBootGalleryItem(id){
+  say("Encoding and uploading the power-on screen…");
+  try{
+    await api(`/api/panorama/gallery/${id}/boot`,{method:"POST"});
+    say("Power-on screen set - it shows the next time the PC is switched on.");
+    await loadPanorama(); renderPanorama();
+  }catch(e){ say(e.message,"error"); }
+}
+
+async function resetPanoBoot(){
+  try{
+    await api("/api/panorama/boot/reset",{method:"POST"});
+    say("Power-on screen reset to the TRYX default animation.");
+    await loadPanorama(); renderPanorama();
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -2899,33 +2984,70 @@ async function stopLedOrderTest(){
 /* ---------- startup animation ---------- */
 
 function startupAnimForm(){
-  const style = document.querySelector("#startupStyleSeg button[aria-pressed='true']");
+  const val = id => document.getElementById(id).value;
   return {
     enabled: document.getElementById("startupEnabled").checked,
-    style: style ? style.dataset.v : "chase",
-    color: document.getElementById("startupColor").value,
-    lap_s: parseFloat(document.getElementById("startupLap").value) || 1.5,
-    tail: parseInt(document.getElementById("startupTail").value) || 4,
-    fade_s: parseFloat(document.getElementById("startupFade").value) || 0,
+    style: val("startupStyle"),
+    direction: val("startupDirection"),
+    reverse: val("startupReverse") === "true",
+    palette: val("startupPalette"),
+    color: val("startupColor"),
+    color2: val("startupColor2"),
+    brightness: parseInt(val("startupBrightness")) || 100,
+    lap_s: parseFloat(val("startupLap")) || 1.5,
+    laps: parseInt(val("startupLaps")) || 1,
+    tail: parseInt(val("startupTail")) || 10,
+    ambient_source: val("startupAmbientSource"),
+    ambient_on_display: document.getElementById("startupAmbientDisplay").checked,
+    show_s: parseFloat(val("startupShow")) || 8,
+    finale: document.getElementById("startupFinale").checked,
+    fade_s: parseFloat(val("startupFade")) || 0,
   };
 }
 
-function setStartupStyle(style){
-  document.querySelectorAll("#startupStyleSeg button").forEach(b=>
-    b.setAttribute("aria-pressed", String(b.dataset.v === style)));
-  // the tail only means something for the running light
-  document.getElementById("startupTailProp").style.visibility = style === "chase" ? "" : "hidden";
+// Only the settings the chosen style (and palette) uses are shown: each
+// such element lists in data-for the styles / "palette-x" / "finale" it
+// belongs to.
+function updateStartupProps(){
+  const f = startupAnimForm();
+  const active = new Set([f.style, "palette-" + f.palette]);
+  if(f.finale) active.add("finale");
+  document.querySelectorAll("#startupAnimSection [data-for]").forEach(el=>{
+    const on = el.dataset.for.split(" ").some(k=>active.has(k));
+    el.style.display = on ? "" : "none";
+  });
+}
+
+function fillStartupAmbientSources(selected){
+  const box = document.getElementById("startupAmbientSource");
+  const videos = galleryItems.filter(i=>isVideoItem(i));
+  box.innerHTML = `<option value="">Power-on video (Display &rarr; Set as boot)</option>` +
+    videos.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join("");
+  box.value = videos.some(i=>i.id===selected) ? selected : "";
 }
 
 async function loadStartupAnimation(){
   try{
     const c = await api("/api/rgb/startup-animation");
+    const set = (id, v) => document.getElementById(id).value = v;
     document.getElementById("startupEnabled").checked = c.enabled;
-    document.getElementById("startupColor").value = c.color;
-    document.getElementById("startupLap").value = c.lap_s;
-    document.getElementById("startupTail").value = c.tail;
-    document.getElementById("startupFade").value = c.fade_s;
-    setStartupStyle(c.style);
+    set("startupStyle", c.style);
+    set("startupDirection", c.direction);
+    set("startupReverse", String(c.reverse));
+    set("startupPalette", c.palette);
+    set("startupColor", c.color);
+    set("startupColor2", c.color2);
+    set("startupBrightness", c.brightness);
+    set("startupLap", c.lap_s);
+    set("startupLaps", c.laps);
+    set("startupTail", c.tail);
+    set("startupShow", c.show_s);
+    document.getElementById("startupAmbientDisplay").checked = c.ambient_on_display;
+    document.getElementById("startupFinale").checked = c.finale;
+    set("startupFade", c.fade_s);
+    if(!galleryItems.length) await loadGallery();
+    fillStartupAmbientSources(c.ambient_source);
+    updateStartupProps();
     document.getElementById("startupAnimNote").textContent =
       c.available ? "" : "needs hub.control: direct in config.yaml";
   }catch(e){
@@ -2935,21 +3057,23 @@ async function loadStartupAnimation(){
 
 async function saveStartupAnimation(){
   try{
-    await api("/api/rgb/startup-animation",{method:"POST",body:JSON.stringify(startupAnimForm())});
-    say("Startup animation saved - it plays the next time shyyctl starts.");
+    const r = await api("/api/rgb/startup-animation",{method:"POST",body:JSON.stringify(startupAnimForm())});
+    say(r.note || "Startup animation saved - it plays the next time shyyctl starts.", r.note ? "error" : "info");
   }catch(e){ say(e.message,"error"); }
 }
 
 async function previewStartupAnimation(){
+  const btn = document.querySelector("#startupAnimSection button[onclick^='previewStartupAnimation']");
+  if(btn.disabled) return;
+  btn.disabled = true;
   try{
     say("Playing the startup animation...");
-    await api("/api/rgb/startup-animation/preview",{method:"POST",body:JSON.stringify(startupAnimForm())});
-    say("Startup animation done.");
+    const r = await api("/api/rgb/startup-animation/preview",{method:"POST",body:JSON.stringify(startupAnimForm())});
+    say(r.interrupted ? "Startup animation preview stopped." : "Startup animation done.");
   }catch(e){ say(e.message,"error"); }
+  finally{ btn.disabled = false; }
 }
 
-document.querySelectorAll("#startupStyleSeg button").forEach(b=>
-  b.addEventListener("click", ()=>setStartupStyle(b.dataset.v)));
 loadStartupAnimation();
 
 /* ---------- settings ---------- */

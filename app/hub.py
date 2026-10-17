@@ -672,7 +672,25 @@ class DirectHub:
         def write(dev):
             for packet in packets:
                 dev.device.write(packet + [0x00] * (_REPORT_LENGTH - len(packet)))
+        self._note_writer(channel)
         self._with_device(f"set LEDs on {channel}", write)
+
+    _writers: dict[str, tuple[int, str, float]] = {}
+    _writers_warned = 0.0
+
+    def _note_writer(self, channel: str):
+        """Logs when two threads keep writing the same LED channel within
+        a moment of each other - two animations fighting over the LEDs,
+        which shows as wild flickering, should be visible in the log."""
+        me = threading.current_thread()
+        now = time.monotonic()
+        last = self._writers.get(channel)
+        if (last is not None and last[0] != me.ident and now - last[2] < 0.3
+                and now - DirectHub._writers_warned > 30):
+            DirectHub._writers_warned = now
+            log.warning("hub: %s written by two threads at once (%s and %s) - two animations "
+                        "are fighting over the LEDs", channel, last[1], me.name)
+        self._writers[channel] = (me.ident, me.name, now)
 
     def set_color(self, channel: str, mode: str, colors: list[str]):
         """The hub's own firmware effects (via liquidctl's ControlHub
