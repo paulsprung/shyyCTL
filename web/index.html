@@ -116,6 +116,7 @@
   .prop{margin-bottom:12px}
   .prop label{display:block;font-size:11px;font-weight:600;color:var(--ink-soft);margin-bottom:5px}
   .prop input,.prop select{width:100%}
+  .prop input[type=color]{width:56px;height:38px}
 
   table.res{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
   table.res th{text-align:left;font-size:10px;letter-spacing:.06em;text-transform:uppercase;
@@ -280,6 +281,55 @@
   pre.dump{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;
     margin:0;max-height:320px;overflow:auto}
 
+  /* tabbed pages (RGB, Settings) */
+  .tab-pane{display:none} .tab-pane.active{display:block}
+
+  /* RGB > Effects: the live canvas and the effect controls side by side,
+     so changing a setting and seeing it happen don't need scrolling */
+  .effects-grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(330px,1fr);gap:14px;align-items:start}
+  .effects-grid > .stack{min-width:0}
+  .effects-side .effect-grid-3{grid-template-columns:1fr 1fr}
+  .effects-side .effect-grid-3 > .prop:first-child{grid-column:1 / -1}
+  .effects-side .effect-grid{grid-template-columns:auto 1fr}
+  .effect-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:16px;border-top:1px solid var(--rule)}
+  .effect-actions .btn.primary{flex:1}
+  @media (max-width:1100px){
+    .effects-grid{grid-template-columns:1fr}
+    .effects-side .effect-grid-3{grid-template-columns:repeat(3,1fr)}
+    .effects-side .effect-grid-3 > .prop:first-child{grid-column:auto}
+  }
+  @media (max-width:640px){.effects-side .effect-grid-3{grid-template-columns:1fr}}
+
+  /* Status > overview */
+  .overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+  .ov-card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--radius);padding:16px;
+    display:flex;flex-direction:column;gap:6px;min-width:0}
+  .ov-head{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;color:var(--ink-soft)}
+  .ov-head svg.icon{width:15px;height:15px}
+  .ov-value{font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ov-sub{font-family:var(--mono);font-size:11px;color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ov-card .row{margin-top:auto;padding-top:8px}
+
+  /* Settings > connections */
+  .conn-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-top:1px solid var(--rule)}
+  .conn-row:first-child{border-top:none;padding-top:0}
+  .conn-row:last-child{padding-bottom:0}
+  .conn-name{font-weight:600;font-size:13px;width:90px;flex:none}
+  .conn-detail{flex:1;min-width:0;font-family:var(--mono);font-size:11.5px;color:var(--ink-soft)}
+
+  /* a file input behind a normal button */
+  .file-btn{position:relative;overflow:hidden;display:inline-flex;align-items:center}
+  .file-btn input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+
+  details.more > summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:12px}
+  details.more > summary::-webkit-details-marker{display:none}
+  details.more > summary h2::before{content:"\25B8";display:inline-block;width:14px;color:var(--ink-soft);transition:transform .15s}
+  details.more[open] > summary h2::before{transform:rotate(90deg)}
+  details.more > summary + *{margin-top:12px}
+
+  .callout{font-size:12.5px;line-height:1.6;color:var(--ink-soft)}
+  .callout strong{color:var(--ink)}
+
   @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
   @media (max-width:820px){
     .shell{flex-direction:column}
@@ -326,6 +376,10 @@
     <!-- ================= STATUS ================= -->
     <div class="page" id="page-status">
       <section>
+        <div class="section-head"><h2>Right now</h2><div class="rule"></div></div>
+        <div class="overview" id="statusOverview"></div>
+      </section>
+      <section>
         <div class="section-head"><h2>Temperatures</h2><div class="rule"></div></div>
         <div class="stat-grid" id="statusTemps"></div>
       </section>
@@ -350,7 +404,7 @@
 
       <section>
         <div class="section-head"><h2>Fan curves</h2><div class="rule"></div>
-          <span class="note">assign a fan's group from its card above</span></div>
+          <span class="note">drag points to shape a curve &middot; double-click adds one</span></div>
         <div class="curve-grid" id="curveList"></div>
         <div class="row" style="margin-top:12px">
           <button class="btn sec sm" onclick="addCurve()">+ Add curve</button>
@@ -360,145 +414,29 @@
 
     <!-- ================= RGB ================= -->
     <div class="page" id="page-rgb">
-      <section>
-        <div class="section-head"><h2>Detail</h2><div class="rule"></div>
-          <span class="note" id="rgbNote"></span></div>
-        <div class="rgb-grid">
-          <div class="rgb-card">
-            <div class="rgb-card-top">
-              <div class="rgb-swatch" id="moboSwatch"></div>
-              <div><div class="rgb-card-name">Motherboard</div>
-                <div class="rgb-card-sub">last applied colour</div></div>
+      <div class="subnav" id="rgbSubnav">
+        <button data-tab="effects" aria-current="page" onclick="showRgbTab('effects')">Effects</button>
+        <button data-tab="colours" onclick="showRgbTab('colours')">Colours</button>
+        <button data-tab="startup" onclick="showRgbTab('startup')">Startup animation</button>
+      </div>
+
+      <!-- ---- effects ---- -->
+      <div class="tab-pane active" id="rgb-effects">
+        <section>
+          <div class="section-head"><h2>Effect</h2><div class="rule"></div>
+            <span class="note" id="effectStatusNote"></span></div>
+          <div class="effects-grid">
+            <div class="stack">
+              <div class="canvas adv-canvas"><svg id="advancedCase" viewBox="0 0 900 600"
+                style="width:100%;display:block;touch-action:none"
+                onpointerdown="advPointerDown(event)" onpointermove="advPointerMove(event)"
+                onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)">
+                <g id="advLedLayer"></g>
+                <g id="advDisplayLayer"></g>
+              </svg></div>
+              <div class="card" id="advancedLedProps"><div class="note">Click or drag across LEDs to pick some &middot; shift adds to the selection.</div></div>
             </div>
-            <div class="row">
-              <input type="color" id="moboColor" value="#4c79ff" oninput="previewSwatch('moboSwatch',this.value)">
-              <label class="inline"><input type="checkbox" id="moboPersist" checked> persistent</label>
-              <button class="btn sm" onclick="setMoboColor()">Apply</button>
-            </div>
-          </div>
-          <div id="ramSticksList" style="display:contents"><div class="note">Loading&hellip;</div></div>
-        </div>
-      </section>
-
-      <section>
-        <div class="section-head"><h2>Hub channels</h2><div class="rule"></div>
-          <span class="note">from the last scan</span></div>
-        <div id="hubRgbList" class="rgb-grid"></div>
-      </section>
-
-      <section id="startupAnimSection">
-        <div class="section-head"><h2>Startup animation</h2><div class="rule"></div>
-          <span class="note">plays when shyyctl starts, then switches to your effect / colours</span></div>
-        <div class="card">
-          <div class="row" style="margin-bottom:14px">
-            <label class="inline"><input type="checkbox" id="startupEnabled"> play at startup</label>
-          </div>
-
-          <div class="effect-grid-3" style="margin-bottom:14px">
-            <div class="prop"><label>Animation</label>
-              <div class="select-wrap"><select id="startupStyle" onchange="updateStartupProps()">
-                <option value="case_spin">Whole case turns</option>
-                <option value="spin">Each fan spins up</option>
-                <option value="ambient">Ambient light from a video</option>
-              </select></div>
-            </div>
-            <div class="prop" data-for="case_spin spin"><label>Starts at</label>
-              <div class="select-wrap"><select id="startupStartUnit"></select></div>
-            </div>
-            <div class="prop" data-for="case_spin spin"><label>Turning</label>
-              <div class="select-wrap"><select id="startupReverse">
-                <option value="true">Counter-clockwise</option>
-                <option value="false">Clockwise</option>
-              </select></div>
-            </div>
-          </div>
-
-          <div class="effect-grid-3" style="margin-bottom:14px" data-for="case_spin spin finale">
-            <div class="prop"><label>Colours</label>
-              <div class="select-wrap"><select id="startupPalette" onchange="updateStartupProps()">
-                <option value="solid">One colour</option>
-                <option value="gradient">Gradient around the turn</option>
-                <option value="rainbow">Rainbow</option>
-              </select></div>
-            </div>
-            <div class="prop" data-for="palette-solid palette-gradient"><label>Colour</label>
-              <input type="color" id="startupColor" value="#ffffff">
-            </div>
-            <div class="prop" data-for="palette-gradient"><label>Second colour</label>
-              <input type="color" id="startupColor2" value="#4c79ff">
-            </div>
-          </div>
-
-          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px">
-            <label class="inline" data-for="case_spin spin">turns
-              <input type="number" id="startupLaps" min="1" max="5" step="1" value="2" style="width:64px"></label>
-            <label class="inline" data-for="case_spin spin">one turn
-              <input type="number" id="startupLap" min="0.3" max="10" step="0.1" value="1.5" style="width:64px"> s</label>
-            <label class="inline">brightness
-              <input type="number" id="startupBrightness" min="5" max="100" step="5" value="100" style="width:64px"> %</label>
-          </div>
-
-          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px" data-for="ambient">
-            <div class="prop"><label>Video</label>
-              <div class="select-wrap"><select id="startupAmbientSource"></select></div>
-            </div>
-            <label class="inline"><input type="checkbox" id="startupAmbientDisplay" checked> also play it on the display</label>
-            <label class="inline">plays
-              <input type="number" id="startupShow" min="2" max="30" step="0.5" value="8" style="width:64px"> s</label>
-          </div>
-
-          <div class="effect-grid" style="align-items:end;margin-bottom:0">
-            <label class="inline"><input type="checkbox" id="startupFinale" checked onchange="updateStartupProps()">
-              RAM and board light up at the end</label>
-            <label class="inline">switch to your effect over <input type="number" id="startupFade" min="0" max="10"
-              step="0.1" value="1.5" style="width:64px"> s</label>
-          </div>
-          <div class="note" data-for="ambient" style="margin-top:10px">
-            The fans follow the video's colours by their place in the case. The TRYX default
-            animations only exist on the panel itself, so pick a video from your gallery.</div>
-
-          <div class="row" style="margin-top:14px">
-            <button class="btn sec sm" onclick="previewStartupAnimation()">Preview</button>
-            <button class="btn sm" onclick="saveStartupAnimation()">Save</button>
-            <span class="note" id="startupAnimNote"></span>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <div class="section-head"><h2>Advanced</h2><div class="rule"></div></div>
-        <div class="card">
-          <button class="btn" onclick="showPage('advanced')">Open Advanced &rarr;</button>
-        </div>
-      </section>
-    </div>
-
-    <!-- ================= RGB ADVANCED ================= -->
-    <div class="page" id="page-advanced">
-      <section>
-        <div class="section-head">
-          <button class="btn sec sm" onclick="showPage('rgb')">&larr; RGB</button>
-          <h2 style="margin-left:12px">Advanced</h2><div class="rule"></div>
-          <span class="note">click or drag to select LEDs &middot; shift to add</span>
-        </div>
-        <div class="setup-grid">
-          <div>
-            <div class="canvas adv-canvas"><svg id="advancedCase" viewBox="0 0 900 600"
-              style="width:100%;display:block;touch-action:none"
-              onpointerdown="advPointerDown(event)" onpointermove="advPointerMove(event)"
-              onpointerup="advPointerUp(event)" onpointercancel="advPointerUp(event)">
-              <g id="advLedLayer"></g>
-              <g id="advDisplayLayer"></g>
-            </svg></div>
-          </div>
-          <div id="advancedLedProps"><div class="note">Click or drag to select LEDs.</div></div>
-        </div>
-      </section>
-
-      <section>
-        <div class="section-head"><h2>Effect</h2><div class="rule"></div>
-          <span class="note" id="effectStatusNote"></span></div>
-        <div class="card">
+            <div class="card effects-side">
           <div class="prop" style="margin-bottom:16px">
             <label>Presets</label>
             <div class="row" id="effectPresetsRow" style="flex-wrap:wrap;gap:6px"></div>
@@ -577,15 +515,128 @@
             </label>
           </div>
 
-          <div class="row" style="margin-top:14px">
+          <div class="effect-actions">
+            <button class="btn sm primary" onclick="applyPositionEffect()">Apply to PC</button>
             <button class="btn sec sm" onclick="previewPositionEffect()">Preview</button>
-            <button class="btn sm" onclick="applyPositionEffect()">Apply to PC</button>
             <button class="btn sec sm" onclick="stopEffect()">Stop</button>
             <button class="btn sec sm" onclick="saveCurrentAsPreset()">Save as preset</button>
           </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ---- colours ---- -->
+      <div class="tab-pane" id="rgb-colours">
+        <div class="callout" style="margin-bottom:18px">One colour per device. Applying one stops a running effect.</div>
+      <section>
+        <div class="section-head"><h2>Motherboard &amp; RAM</h2><div class="rule"></div>
+          <span class="note" id="rgbNote"></span></div>
+        <div class="rgb-grid">
+          <div class="rgb-card">
+            <div class="rgb-card-top">
+              <div class="rgb-swatch" id="moboSwatch"></div>
+              <div><div class="rgb-card-name">Motherboard</div>
+                <div class="rgb-card-sub">last applied colour</div></div>
+            </div>
+            <div class="row">
+              <input type="color" id="moboColor" value="#4c79ff" oninput="previewSwatch('moboSwatch',this.value)">
+              <label class="inline" title="Also keep it on the board itself, so it stays when shyyctl isn't running"><input type="checkbox" id="moboPersist" checked> store on device</label>
+              <button class="btn sm" onclick="setMoboColor()">Apply</button>
+            </div>
+          </div>
+          <div id="ramSticksList" style="display:contents"><div class="note">Loading&hellip;</div></div>
+        </div>
+        </section>
+
+        <section>
+        <div class="section-head"><h2>Fans</h2><div class="rule"></div>
+          <span class="note">NZXT hub channels</span></div>
+        <div id="hubRgbList" class="rgb-grid"></div>
+        </section>
+      </div>
+
+      <!-- ---- startup animation ---- -->
+      <div class="tab-pane" id="rgb-startup">
+      <section id="startupAnimSection">
+        <div class="section-head"><h2>Startup animation</h2><div class="rule"></div>
+          <span class="note">plays when shyyctl starts, then switches to your effect or colours</span></div>
+        <div class="card">
+          <div class="row" style="margin-bottom:14px">
+            <label class="inline"><input type="checkbox" id="startupEnabled"> play at startup</label>
+          </div>
+
+          <div class="effect-grid-3" style="margin-bottom:14px">
+            <div class="prop"><label>Animation</label>
+              <div class="select-wrap"><select id="startupStyle" onchange="updateStartupProps()">
+                <option value="case_spin">Whole case turns</option>
+                <option value="spin">Each fan spins up</option>
+                <option value="ambient">Ambient light from a video</option>
+              </select></div>
+            </div>
+            <div class="prop" data-for="case_spin spin"><label>Starts at</label>
+              <div class="select-wrap"><select id="startupStartUnit"></select></div>
+            </div>
+            <div class="prop" data-for="case_spin spin"><label>Turning</label>
+              <div class="select-wrap"><select id="startupReverse">
+                <option value="true">Counter-clockwise</option>
+                <option value="false">Clockwise</option>
+              </select></div>
+            </div>
+          </div>
+
+          <div class="effect-grid-3" style="margin-bottom:14px" data-for="case_spin spin finale">
+            <div class="prop"><label>Colours</label>
+              <div class="select-wrap"><select id="startupPalette" onchange="updateStartupProps()">
+                <option value="solid">One colour</option>
+                <option value="gradient">Gradient around the turn</option>
+                <option value="rainbow">Rainbow</option>
+              </select></div>
+            </div>
+            <div class="prop" data-for="palette-solid palette-gradient"><label>Colour</label>
+              <input type="color" id="startupColor" value="#ffffff">
+            </div>
+            <div class="prop" data-for="palette-gradient"><label>Second colour</label>
+              <input type="color" id="startupColor2" value="#4c79ff">
+            </div>
+          </div>
+
+          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px">
+            <label class="inline" data-for="case_spin spin">turns
+              <input type="number" id="startupLaps" min="1" max="5" step="1" value="2" style="width:64px"></label>
+            <label class="inline" data-for="case_spin spin">one turn
+              <input type="number" id="startupLap" min="0.3" max="10" step="0.1" value="1.5" style="width:64px"> s</label>
+            <label class="inline">brightness
+              <input type="number" id="startupBrightness" min="5" max="100" step="5" value="100" style="width:64px"> %</label>
+          </div>
+
+          <div class="effect-grid-3" style="align-items:end;margin-bottom:14px" data-for="ambient">
+            <div class="prop"><label>Video</label>
+              <div class="select-wrap"><select id="startupAmbientSource"></select></div>
+            </div>
+            <label class="inline"><input type="checkbox" id="startupAmbientDisplay" checked> also play it on the display</label>
+            <label class="inline">plays
+              <input type="number" id="startupShow" min="2" max="30" step="0.5" value="8" style="width:64px"> s</label>
+          </div>
+
+          <div class="effect-grid" style="align-items:end;margin-bottom:0">
+            <label class="inline"><input type="checkbox" id="startupFinale" checked onchange="updateStartupProps()">
+              RAM and board light up at the end</label>
+            <label class="inline">switch to your effect over <input type="number" id="startupFade" min="0" max="10"
+              step="0.1" value="1.5" style="width:64px"> s</label>
+          </div>
+          <div class="note" data-for="ambient" style="margin-top:10px">
+            The fans follow the video's colours by their place in the case. The TRYX default
+            animations only exist on the panel itself, so pick a video from your gallery.</div>
+
+          <div class="row" style="margin-top:14px">
+            <button class="btn sec sm" onclick="previewStartupAnimation()">Preview</button>
+            <button class="btn sm" onclick="saveStartupAnimation()">Save</button>
+            <span class="note" id="startupAnimNote"></span>
+          </div>
         </div>
       </section>
-
+      </div>
     </div>
 
     <!-- ================= DISPLAY ================= -->
@@ -600,9 +651,10 @@
           </div>
           <div class="card">
             <div class="card-title">Power-on screen</div>
-            <div class="note" id="panoBootInfo" style="line-height:1.8"></div>
+            <div class="callout" id="panoBootInfo"></div>
             <div class="row" style="margin-top:10px">
-              <button class="btn sec sm" id="panoBootResetBtn" onclick="resetPanoBoot()">Reset to TRYX default</button>
+              <button class="btn sec sm" id="panoBootResetBtn" onclick="resetPanoBoot()" style="display:none">Reset to TRYX default</button>
+              <button class="btn sec sm" onclick="showPage('rgb','startup')">Startup animation &rarr;</button>
             </div>
           </div>
           <div class="card">
@@ -630,18 +682,22 @@
               stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
           </button>
         </div>
-        <div class="row" style="margin-top:14px">
-          <input type="file" id="galleryUploadFile" accept="image/*,video/*">
-          <button class="btn sm" onclick="uploadToGallery()">Add media</button>
+        <div class="row" style="margin-top:14px;justify-content:center">
+          <label class="btn sm file-btn">+ Add image or video
+            <input type="file" id="galleryUploadFile" accept="image/*,video/*" onchange="uploadToGallery()">
+          </label>
+          <span class="note">shown on the panel with Apply &middot; images and GIFs work too</span>
         </div>
       </section>
 
       <section>
-        <div class="section-head"><h2>Media on device</h2><div class="rule"></div>
-          <span class="note">as reported by the panel itself</span></div>
-        <div class="card">
-          <table class="res" id="panoMediaTable"></table>
-        </div>
+        <details class="more">
+          <summary class="section-head"><h2>Files on the panel</h2><div class="rule"></div>
+            <span class="note">as the panel itself lists them</span></summary>
+          <div class="card">
+            <table class="res" id="panoMediaTable"></table>
+          </div>
+        </details>
       </section>
     </div>
 
@@ -657,10 +713,48 @@
       <!-- ---- general ---- -->
       <div class="settings-tab active" id="settings-general">
         <section>
-          <div class="section-head"><h2>Connections</h2><div class="rule"></div></div>
+          <div class="section-head"><h2>Devices</h2><div class="rule"></div></div>
           <div class="card" id="connections"></div>
           <div class="row" style="margin-top:12px">
             <button class="btn sec sm" onclick="reconnectAll()">Reconnect all</button>
+          </div>
+        </section>
+        <section id="autostartSection" style="display:none">
+          <div class="section-head"><h2>Startup</h2><div class="rule"></div></div>
+          <div class="card">
+            <label class="inline">
+              <input type="checkbox" id="autostartToggle" onchange="setAutostart(this.checked)">
+              Start shyyctl automatically when Windows logs in
+            </label>
+          </div>
+        </section>
+        <section id="elevatedHelpersSection" style="display:none">
+          <div class="section-head"><h2>Start without UAC prompts</h2><div class="rule"></div>
+            <span class="note" id="elevatedHelpersNote"></span></div>
+          <div class="card">
+            <div class="callout" id="elevatedHelpersText"></div>
+            <div class="row" style="margin-top:12px">
+              <button class="btn sm" id="elevatedSetupBtn" onclick="elevatedHelpers('install')">Set up</button>
+              <button class="btn sec sm" id="elevatedRemoveBtn" onclick="elevatedHelpers('remove')">Undo</button>
+            </div>
+          </div>
+        </section>
+        <section id="backgroundServicesSection">
+          <div class="section-head"><h2>Helper programs</h2><div class="rule"></div>
+            <span class="note" id="servicesStatusNote"></span></div>
+          <div class="card">
+            <div class="callout" style="margin-bottom:12px">Fans, fan lighting and the display need nothing extra.
+              <strong>OpenRGB</strong> runs RAM and motherboard lighting, <strong>SensorHelper</strong> reads
+              temperatures (fan curves need it).</div>
+            <div class="row">
+              <button class="btn sec sm" data-mode="all" onclick="setServiceMode('all')">Both</button>
+              <button class="btn sec sm" data-mode="effects" onclick="setServiceMode('effects')">Only OpenRGB</button>
+              <button class="btn sec sm" data-mode="fans_display" onclick="setServiceMode('fans_display')">Only SensorHelper</button>
+              <button class="btn sec sm" data-mode="stop" onclick="setServiceMode('stop')">Neither</button>
+            </div>
+            <div class="row" style="margin-top:14px">
+              <button class="btn hot sm" onclick="quitShyyctl()">Quit shyyctl completely</button>
+            </div>
           </div>
         </section>
         <section id="updatesSection">
@@ -680,20 +774,6 @@
             <button class="btn sec" id="themeToggle" onclick="toggleTheme()">Switch to light</button>
           </div>
         </section>
-        <section id="backgroundServicesSection">
-          <div class="section-head"><h2>Background services</h2><div class="rule"></div>
-            <span class="note" id="servicesStatusNote"></span></div>
-          <div class="card">
-            <div class="row">
-              <button class="btn sec sm" data-mode="stop" onclick="setServiceMode('stop')">All off</button>
-              <button class="btn sec sm" data-mode="effects" onclick="setServiceMode('effects')">Effects, display &amp; fans</button>
-              <button class="btn sec sm" data-mode="all" onclick="setServiceMode('all')">All on</button>
-            </div>
-            <div class="row" style="margin-top:14px">
-              <button class="btn hot sm" onclick="quitShyyctl()">Quit shyyctl completely</button>
-            </div>
-          </div>
-        </section>
         <section id="resourceUsageSection">
           <div class="section-head"><h2>Resource usage</h2><div class="rule"></div>
             <span class="note">what shyyctl itself is costing this machine right now</span></div>
@@ -708,15 +788,6 @@
             <div class="row">
               <button class="btn sec sm" onclick="exportLog()">Export debug log</button>
             </div>
-          </div>
-        </section>
-        <section id="autostartSection" style="display:none">
-          <div class="section-head"><h2>Startup</h2><div class="rule"></div></div>
-          <div class="card">
-            <label class="inline">
-              <input type="checkbox" id="autostartToggle" onchange="setAutostart(this.checked)">
-              Start shyyctl automatically when Windows logs in
-            </label>
           </div>
         </section>
         <section id="liteExportSection">
@@ -815,9 +886,10 @@
 <div id="log"></div>
 
 <script>
-const PAGES = ["status","fans","rgb","display","settings","advanced"];
-const PAGE_TITLES = {status:"Status", fans:"Fans", rgb:"RGB", display:"Display", settings:"Settings", advanced:"Advanced"};
+const PAGES = ["status","fans","rgb","display","settings"];
+const PAGE_TITLES = {status:"Status", fans:"Fans", rgb:"RGB", display:"Display", settings:"Settings"};
 const SETTINGS_TABS = ["general","scan","placement","advanced"];
+const RGB_TABS = ["effects","colours","startup"];
 let status_ = null, fans = null, scanState = null, panoStatus = null, panoMedia = null;
 let layoutData = null, selectedUnit = null, dragState = null;
 let dutyOverride = {}, dutySliderActive = false;
@@ -877,37 +949,62 @@ function showSettingsTab(name){
   // One check per session the first time General is opened - not a
   // recurring background poller, see checkForUpdate's own docstring.
   if(name === "general" && !checkForUpdate._done) checkForUpdate();
+  if(name === "general"){ loadResourceUsage(); loadSystemInfo(); }
   if(location.hash.startsWith("#/settings")) location.hash = "#/settings/"+name;
 }
 
+/* RGB's tabs work like Settings' - the effect editor (formerly its own
+   "Advanced" page behind a button) is the first of them. */
+function showRgbTab(name){
+  if(!RGB_TABS.includes(name)) name = "effects";
+  RGB_TABS.forEach(t=>{
+    document.getElementById("rgb-"+t).classList.toggle("active", t===name);
+    const btn = document.querySelector(`#rgbSubnav button[data-tab="${t}"]`);
+    if(t===name) btn.setAttribute("aria-current","page"); else btn.removeAttribute("aria-current");
+  });
+  showRgbTab._last = name;
+  syncCanvasVideo();
+  if(name === "effects") drawAdvancedCase();
+  if(location.hash.startsWith("#/rgb")) location.hash = "#/rgb/"+name;
+}
+
+function effectsTabVisible(){
+  return document.getElementById("page-rgb").classList.contains("active")
+    && document.getElementById("rgb-effects").classList.contains("active");
+}
+
+// The display unit's preview <video> on the effects canvas autoplays/loops
+// as long as it exists in the DOM, which is always (just hidden via CSS
+// elsewhere) - left running it'd decode video in the background forever.
+function syncCanvasVideo(){
+  const video = document.querySelector("#advDisplayLayer video");
+  if(!video) return;
+  if(effectsTabVisible()){ if(video.paused) video.play().catch(()=>{}); }
+  else if(!video.paused) video.pause();
+}
+
 function showPage(name, sub){
+  // the effect editor used to be its own page
+  if(name === "advanced"){ name = "rgb"; sub = "effects"; }
   if(!PAGES.includes(name)) name = "status";
   PAGES.forEach(p=>{
     document.getElementById("page-"+p).classList.toggle("active", p===name);
-    // "advanced" is reached only via the button on the RGB page, not a
-    // sidebar tab, so it has no matching tab-advanced element.
     const tab = document.getElementById("tab-"+p);
     if(!tab) return;
     if(p===name) tab.setAttribute("aria-current","page"); else tab.removeAttribute("aria-current");
   });
   document.getElementById("pageTitle").textContent = PAGE_TITLES[name] || name;
-  // The display unit's preview <video> autoplays/loops as long as it
-  // exists in the DOM, which is always (just hidden via CSS on other
-  // pages) - left running it'd decode video in the background forever,
-  // so pause it off Advanced and resume it on return.
-  const advVideo = document.querySelector("#advDisplayLayer video");
-  if(advVideo){
-    if(name === "advanced"){ if(advVideo.paused) advVideo.play().catch(()=>{}); }
-    else if(!advVideo.paused) advVideo.pause();
-  }
   if(name === "settings") showSettingsTab(sub || showSettingsTab._last || "general");
+  if(name === "rgb") showRgbTab(sub || showRgbTab._last || "effects");
+  else syncCanvasVideo();
   // Fan readings are only polled while Status/Fans is open (see the 3s
   // refresh loop) - fetch once right away on arriving there instead of
   // showing whatever was last read until the next tick.
   if((name === "fans" || name === "status") && showPage._last && showPage._last !== name){
     loadFans().then(()=>{ if(name === "fans") renderFans(); else renderStatus(); }).catch(()=>{});
   }
-  const hash = "#/"+name+(name==="settings" ? "/"+(sub || showSettingsTab._last || "general") : "");
+  const hash = "#/"+name+(name==="settings" ? "/"+(sub || showSettingsTab._last || "general")
+                        : name==="rgb" ? "/"+(sub || showRgbTab._last || "effects") : "");
   if(location.hash !== hash) location.hash = hash;
   if(showPage._last && showPage._last !== name) window.scrollTo({top:0});
   showPage._last = name;
@@ -928,6 +1025,24 @@ function toggleTheme(){
 applyTheme(localStorage.getItem("shyyctl-theme") || "dark");
 
 function hexToRgb(h){ h=h.replace("#",""); return [0,2,4].map(i=>parseInt(h.slice(i,i+2),16)); }
+
+/* ---------- names ----------
+   Hub channels ("led1", "fan3") read better as the fan on them: the name
+   given in Placement, else its model, with the channel alongside. */
+function fanUnitFor(channel){
+  const key = String(channel).startsWith("fan") ? "fan_channel" : "led_channel";
+  return ((layoutData && layoutData.units) || []).find(u => u.kind === "fan" && u[key] === channel);
+}
+function channelTitle(channel){
+  const u = fanUnitFor(channel);
+  if(!u) return channel;
+  const custom = u.name && u.name !== u.led_channel && u.name !== u.fan_channel ? u.name : null;
+  return custom || u.model || channel;
+}
+function channelLabel(channel){
+  const title = channelTitle(channel);
+  return title === channel ? channel : `${title} · ${channel}`;
+}
 
 /* ---------- device rail ---------- */
 
@@ -968,7 +1083,10 @@ function renderStatus(){
   const stats = [];
   if(fans && fans.readings){
     fans.readings.filter(r=>String(r.key).toLowerCase().includes("speed"))
-      .forEach(r=>stats.push([r.key, r.value, r.unit||""]));
+      .forEach(r=>{
+        const m = /fan (\d+) speed/i.exec(r.key);
+        stats.push([m ? esc(channelLabel("fan"+m[1])) : esc(r.key), r.value, r.unit||""]);
+      });
   }
   if(!stats.length) stats.push(["Fans", "--", ""]);
   document.getElementById("statusStats").innerHTML = stats.map(([l,v,u])=>`
@@ -977,6 +1095,82 @@ function renderStatus(){
   document.getElementById("statusEmpty").textContent =
     status_.hub.connected ? "" : "Hub not connected — check Settings.";
   renderSensorTiles();
+  renderOverview();
+}
+
+/* ---------- status: overview ----------
+   What's going on right now and the one button each that matters - the
+   rest of the app is a click away from here. */
+let lastEffectStatus = null;
+
+const ICONS = {
+  rgb: `<svg class="icon" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  display: `<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>`,
+  fans: `<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2"/></svg>`,
+};
+
+function ovCard(icon, head, value, sub, actions){
+  return `<div class="ov-card">
+    <div class="ov-head">${icon}${head}</div>
+    <div class="ov-value" title="${esc(value)}">${esc(value)}</div>
+    <div class="ov-sub" title="${esc(sub)}">${esc(sub)}</div>
+    <div class="row">${actions}</div>
+  </div>`;
+}
+
+function effectName(status){
+  if(!status || !status.running) return null;
+  if(status.kind === "startup") return "Startup animation";
+  if(status.kind === "chase") return "LED order test";
+  const opt = document.querySelector(`#effectShapeSelect option[value="${status.shape}"]`);
+  return opt ? opt.textContent : (status.shape || "Effect");
+}
+
+function renderOverview(){
+  const box = document.getElementById("statusOverview");
+  if(!box) return;
+  if(!status_){
+    box.innerHTML = [["rgb","Lighting"],["display","Display"],["fans","Fans"]]
+      .map(([icon, head]) => ovCard(ICONS[icon], head, "--", "loading…", "")).join("");
+    return;
+  }
+  const cards = [];
+
+  const name = effectName(lastEffectStatus);
+  cards.push(name
+    ? ovCard(ICONS.rgb, "Lighting", name,
+        lastEffectStatus.kind === "position" ? `${lastEffectStatus.moving ? "moving" : "static"} · ${lastEffectStatus.period_s}s` : "running",
+        `<button class="btn sec sm" onclick="stopEffect()">Stop</button>
+         <button class="btn sec sm" onclick="showPage('rgb','effects')">Edit</button>`)
+    : ovCard(ICONS.rgb, "Lighting", "Static colours",
+        lastEffectStatus && lastEffectStatus.error ? `stopped: ${lastEffectStatus.error}` : "no effect running",
+        `<button class="btn sm" onclick="showPage('rgb','effects')">Choose an effect</button>`));
+
+  if(panoStatus && panoStatus.connected){
+    const applied = panoStatus.last_applied || {};
+    const item = applied.gallery_id ? galleryItems.find(i => i.id === applied.gallery_id) : null;
+    cards.push(ovCard(ICONS.display, "Display", item ? item.name : "Showing panel media",
+      `brightness ${applied.brightness ?? "--"}%`,
+      `<button class="btn sec sm" onclick="showPage('display')">Open</button>`));
+  } else {
+    cards.push(ovCard(ICONS.display, "Display", "Not connected", "the panel reconnects by itself",
+      `<button class="btn sec sm" onclick="showPage('display')">Open</button>`));
+  }
+
+  if(status_.hub.connected && fans && fans.channels && fans.channels.length){
+    const rpms = fans.channels.map(ch => (fans.readings||[]).find(r =>
+      String(r.key).toLowerCase() === `fan ${ch.replace("fan","")} speed`)).filter(Boolean).map(r => r.value);
+    const curves = [...new Set(fans.channels.map(ch => fanGroupOf(ch)).filter(Boolean))]
+      .map(id => (curveProfiles.find(c => c.id === id) || {}).name).filter(Boolean);
+    cards.push(ovCard(ICONS.fans, "Fans", curves.length ? `Curve: ${curves.join(", ")}` : "Fixed speed",
+      `${fans.channels.length} fans` + (rpms.length ? ` · ${Math.min(...rpms)}–${Math.max(...rpms)} rpm` : ""),
+      `<button class="btn sec sm" onclick="showPage('fans')">Open</button>`));
+  } else {
+    cards.push(ovCard(ICONS.fans, "Fans", status_.hub.connected ? "No fans found" : "Hub not connected",
+      status_.hub.connected ? "run a scan in Settings" : (status_.hub.error || ""),
+      `<button class="btn sec sm" onclick="showPage('settings','general')">Settings</button>`));
+  }
+  box.innerHTML = cards.join("");
 }
 
 /* ---------- status: system sensors -----------
@@ -1086,7 +1280,7 @@ function renderFans(){
           <path d="M12 13c0 3.5-2.2 6.5-4.8 6.5-1.1 0-1.7-2.3.6-5 1-1.2 2.8-1.7 4.2-1.5z"/>
           <path d="M11 12c-3.5 0-6.5-2.2-6.5-4.8 0-1.1 2.3-1.7 5 .6 1.2 1 1.7 2.8 1.5 4.2z"/></svg></div>
         <div>
-          <div class="fan-card-name">${ch}</div>
+          <div class="fan-card-name">${esc(channelLabel(ch))}</div>
           <div class="fan-card-rpm">${rpm ? rpm.value : "--"}<span class="u">rpm</span></div>
         </div>
       </div>
@@ -1104,8 +1298,8 @@ function renderFans(){
       </div>
       `}
       <select class="fan-group-select" style="width:100%;margin-top:10px" onchange="setFanGroup('${ch}', this.value)">
-        <option value="" ${!groupId?"selected":""}>Fixed</option>
-        ${curveProfiles.map(c=>`<option value="${c.id}" ${groupId===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}
+        <option value="" ${!groupId?"selected":""}>Fixed speed (slider)</option>
+        ${curveProfiles.map(c=>`<option value="${c.id}" ${groupId===c.id?"selected":""}>Curve: ${esc(c.name)}</option>`).join("")}
       </select>
     </div>`;
   }).join("");
@@ -1245,8 +1439,9 @@ function renderCurveList(){
       <svg class="curve-diagram" data-id="${curve.id}" viewBox="0 0 ${CURVE_W} ${CURVE_H}"
         style="width:100%;display:block;touch-action:none;background:var(--panel-2);border-radius:8px"
         ondblclick="addCurvePointAt(event,'${curve.id}')">${curveDiagramSvg(curve)}</svg>
-      <div class="curve-channels">${curve.channels.length ? curve.channels.join(", ")
-        : "no fans assigned - pick this group on a fan card above"}</div>
+      <div class="curve-channels">${curve.channels.length
+        ? "used by " + curve.channels.map(ch => esc(channelLabel(ch))).join(", ")
+        : `<span class="note">not used yet - pick "Curve: ${esc(curve.name)}" on a fan above</span>`}</div>
     </div>`;
   }).join("");
 }
@@ -1448,16 +1643,19 @@ function renderHubRgb(){
     const sized = r.leds != null;
     const saved = rgbState.hub && rgbState.hub[ch];
     const color = saved ? saved.color : "#4c79ff";
+    // With direct control a colour is simply re-sent at every launch -
+    // "persistent" only means something when OpenRGB drives the hub.
+    const direct = status_ && status_.hub && status_.hub.control === "direct";
     return `<div class="rgb-card">
       <div class="rgb-card-top">
         <div class="rgb-swatch" id="hubSwatch-${ch}" style="background:${color}"></div>
-        <div><div class="rgb-card-name">${ch}</div>
-          <div class="rgb-card-sub">${r.model ? r.model+" · "+r.leds+" LED" : (sized ? r.leds+" LED" : "not sized - see Settings")}</div></div>
+        <div><div class="rgb-card-name">${esc(channelTitle(ch))}</div>
+          <div class="rgb-card-sub">${ch} &middot; ${sized ? r.leds+" LED" : "not sized - see Settings"}</div></div>
       </div>
       <div class="row">
         <input type="color" id="color-${ch}" value="${color}"
           oninput="previewSwatch('hubSwatch-${ch}',this.value)">
-        <label class="inline"><input type="checkbox" id="persist-${ch}" checked> persistent</label>
+        ${direct ? "" : `<label class="inline"><input type="checkbox" id="persist-${ch}" checked> store on device</label>`}
         <button class="btn sm" onclick="setHubColor('${ch}')">Apply</button>
       </div>
     </div>`;
@@ -1466,12 +1664,13 @@ function renderHubRgb(){
 
 async function setHubColor(channel){
   const hex = document.getElementById(`color-${channel}`).value;
-  const persistent = document.getElementById(`persist-${channel}`).checked;
+  const persistBox = document.getElementById(`persist-${channel}`);
+  const persistent = persistBox ? persistBox.checked : true;
   try{
     await api(`/api/rgb/hub/${channel}/color`,{method:"POST",body:JSON.stringify({color:hex, persistent})});
     (rgbState.hub ||= {})[channel] = {color:hex, persistent};
     previewSwatch(`hubSwatch-${channel}`, hex);
-    say(`${channel} colour applied.`);
+    say(`${channelTitle(channel)} colour applied.`);
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -1614,10 +1813,10 @@ function syncAdvancedDisplayPreview(){
       </div>
     </foreignObject>`;
   // Built while another page is showing (e.g. after Apply on Display):
-  // autoplay would start decoding in the background - showPage resumes it
-  // on arriving at Advanced.
+  // autoplay would start decoding in the background - syncCanvasVideo
+  // resumes it on arriving at the effects tab.
   const video = layer.querySelector("video");
-  if(video && !document.getElementById("page-advanced").classList.contains("active")){
+  if(video && !effectsTabVisible()){
     video.autoplay = false;
     video.pause();
   }
@@ -2181,14 +2380,11 @@ function effectFrameColor(shape, direction, palette, colors, l, bounds, phase, m
     return [Math.round(r*brightness), Math.round(g*brightness), Math.round(b*brightness)];
   }
   if(shape === "ambient"){
-    // Mirrors main.py's ambient branch's blend exactly - the sampled
-    // zones themselves are this preview's own best-effort read of the
-    // same video (see updateAmbientZones's docstring on why that's an
-    // approximation, not a guaranteed exact match).
-    const {top, bottom, left, right} = ambientZones;
-    const v = positionValue("top_to_bottom", l, bounds);
-    const h = positionValue("left_to_right", l, bounds);
-    return [0,1,2].map(c => Math.round((top[c]*(1-v) + bottom[c]*v + left[c]*(1-h) + right[c]*h) / 2));
+    // The picture's edge extended outwards from the panel, as main.py's
+    // ambient branch does it (app/ambient.py's edge_color) - the edge
+    // colours themselves are this preview's own read of the same video.
+    const [dx, dy] = ambientDirection(l);
+    return ambientEdgeColor(dx, dy);
   }
   // Default wave behavior
   const pos = positionValue(direction, l, bounds);
@@ -2205,48 +2401,78 @@ function effectBounds(leds){
 }
 
 /* ---------- ambient preview sampling ----------
-   Mirrors app/ambient.py's zones() exactly (top/bottom/left/right
-   averages of a 4x4 downscale), just sampled from the same <video>
-   element drawAdvancedCase already renders for the display unit instead
-   of a separate ffmpeg decode - same source file either way (whatever's
-   currently applied to the panel), so the preview tracks the real
-   ambient effect closely without needing its own video pipeline. Not
-   pixel-identical to the backend's decode (browser video frame timing
-   vs ffmpeg's own, and this canvas resample vs ffmpeg's scale filter),
-   close enough for a live preview of "roughly this colour, roughly
-   this bright" rather than an exact match - the other shapes' preview
-   guarantee (bit-for-bit identical formulas) doesn't apply here since
-   there's no way to feed this canvas the same decode ffmpeg is doing
-   server-side out of band. */
-let ambientZones = {top:[20,20,20], bottom:[20,20,20], left:[20,20,20], right:[20,20,20]};
+   Mirrors app/ambient.py: the video scaled to 32x16, the colours along
+   its edge averaged 2 cells deep, and each LED taking the edge colour
+   where a line from the panel's centre towards it leaves the picture
+   (main.py's _ambient_directions for the direction). Sampled from the
+   same <video> drawAdvancedCase renders for the display unit rather than
+   a separate decode - the same file the panel plays, so the preview
+   tracks the real LEDs closely, if not frame-exactly. */
+const AMB_W = 32, AMB_H = 16, AMB_DEPTH = 2;
+const MEDIA_ASPECT = 2240 / 1080;
+const CANVAS_STEP_ASPECT = (900 - 48) / (600 - 48);  // CANVAS_W/H less padding (declared further down), as main.py's _CANVAS_ASPECT
+let ambientEdges = null;
 const _ambientCanvas = document.createElement("canvas");
-_ambientCanvas.width = 4; _ambientCanvas.height = 4;
+_ambientCanvas.width = AMB_W; _ambientCanvas.height = AMB_H;
 const _ambientCtx = _ambientCanvas.getContext("2d", {willReadFrequently: true});
 
+function ambientDirection(l){
+  const units = (layoutData && layoutData.units) || [];
+  const display = units.find(u => u.kind === "display");
+  let cx, cy, rot = 0;
+  if(display){ cx = display.x ?? 0.5; cy = display.y ?? 0.5; rot = (display.rotation || 0) * Math.PI / 180; }
+  else {
+    const leds = (layoutData && layoutData.leds) || [];
+    cx = leds.reduce((t, p) => t + p.x, 0) / (leds.length || 1);
+    cy = leds.reduce((t, p) => t + p.y, 0) / (leds.length || 1);
+  }
+  const dx = (l.x - cx) * CANVAS_STEP_ASPECT, dy = l.y - cy;
+  const c = Math.cos(-rot), s = Math.sin(-rot);
+  return [dx*c - dy*s, dx*s + dy*c];
+}
+
+function ambientEdgeColor(dx, dy){
+  if(!ambientEdges) return [20, 20, 20];
+  let side = "top", u = 0.5;
+  if(dx || dy){
+    const toSide = dx ? MEDIA_ASPECT / Math.abs(dx) : Infinity;
+    const toTopBottom = dy ? 1 / Math.abs(dy) : Infinity;
+    if(toSide <= toTopBottom){ side = dx > 0 ? "right" : "left"; u = (dy * toSide + 1) / 2; }
+    else { side = dy > 0 ? "bottom" : "top"; u = (dx * toTopBottom / MEDIA_ASPECT + 1) / 2; }
+  }
+  const cells = ambientEdges[side];
+  const pos = Math.max(0, Math.min(1, u)) * cells.length - 0.5;
+  const i = Math.max(0, Math.min(cells.length - 1, Math.floor(pos)));
+  const j = Math.min(cells.length - 1, i + 1);
+  const f = Math.max(0, Math.min(1, pos - i));
+  return [0,1,2].map(k => Math.round(cells[i][k] + (cells[j][k] - cells[i][k]) * f));
+}
+
 function updateAmbientZones(){
-  // The video only ever exists on the Advanced page (and is paused
-  // elsewhere - see showPage), but the canvas resample itself is wasted
-  // work on every other page too, so skip it there rather than running a
+  // The video only plays on the effects tab (paused elsewhere - see
+  // syncCanvasVideo), and the canvas resample itself is wasted work on
+  // every other page too, so skip it there rather than running a
   // getImageData every 500ms forever regardless of what's on screen.
-  if(!document.getElementById("page-advanced").classList.contains("active")) return;
+  if(!effectsTabVisible()) return;
   const video = document.querySelector("#advancedCase video");
   const img = document.querySelector("#advancedCase img[alt]"); // the display unit's own preview <img>, when the applied media is a still image
   const source = (video && video.readyState >= 2) ? video : (img && img.complete ? img : null);
   if(!source) return;
   try{
-    _ambientCtx.drawImage(source, 0, 0, 4, 4);
-    const {data} = _ambientCtx.getImageData(0, 0, 4, 4);
-    const px = (x,y) => { const i = (y*4+x)*4; return [data[i], data[i+1], data[i+2]]; };
-    const avg = pts => [0,1,2].map(c => Math.round(pts.reduce((s,p)=>s+p[c],0)/pts.length));
-    ambientZones = {
-      top: avg([px(0,0),px(1,0),px(2,0),px(3,0)]),
-      bottom: avg([px(0,3),px(1,3),px(2,3),px(3,3)]),
-      left: avg([px(0,0),px(0,1),px(0,2),px(0,3)]),
-      right: avg([px(3,0),px(3,1),px(3,2),px(3,3)]),
+    _ambientCtx.drawImage(source, 0, 0, AMB_W, AMB_H);
+    const {data} = _ambientCtx.getImageData(0, 0, AMB_W, AMB_H);
+    const px = (x,y) => { const i = (y*AMB_W+x)*4; return [data[i], data[i+1], data[i+2]]; };
+    const avg = pts => [0,1,2].map(c => Math.round(pts.reduce((t,p)=>t+p[c],0)/pts.length));
+    const depth = [...Array(AMB_DEPTH).keys()];
+    ambientEdges = {
+      top: [...Array(AMB_W).keys()].map(x => avg(depth.map(d => px(x, d)))),
+      bottom: [...Array(AMB_W).keys()].map(x => avg(depth.map(d => px(x, AMB_H-1-d)))),
+      left: [...Array(AMB_H).keys()].map(y => avg(depth.map(d => px(d, y)))),
+      right: [...Array(AMB_H).keys()].map(y => avg(depth.map(d => px(AMB_W-1-d, y)))),
     };
   }catch(e){ /* cross-origin or not-yet-decoded frame - keep the last good sample */ }
 }
-setInterval(updateAmbientZones, 500);
+setInterval(updateAmbientZones, 100);
 
 // Backend equivalent: PositionEffectRequest.led_selection / _run_position_effect's
 // led_selection param. A dict of {unit: [index,...]} (the shape sent over the
@@ -2386,6 +2612,8 @@ async function stopEffect(){
 async function pollEffectStatus(){
   try{
     const s = await api("/api/rgb/effects/status");
+    lastEffectStatus = s;
+    renderOverview();
     const note = document.getElementById("effectStatusNote");
     if(note) note.textContent = s.running ? "running on the PC" : (s.error ? "stopped - " + s.error : "");
     if(s.running && s.kind === "position" && !manualPreviewActive) startSyncedPreview(s);
@@ -2414,12 +2642,16 @@ function renderPanorama(){
     Resolution: ${info.width||"?"} &times; ${info.height||"?"}
   ` : `<span class="note">Panel not connected.</span>`;
 
+  // The panel's firmware plays its own TRYX animation at power-on whatever
+  // is put in its power-on slot (tested with a cold start) - the honest
+  // answer is shyyctl's own startup animation, which can play a video.
   const boot = panoStatus.boot;
-  const bootItem = boot && boot.gallery_id ? galleryItems.find(i=>i.id===boot.gallery_id) : null;
-  document.getElementById("panoBootInfo").innerHTML = !boot ? "--"
-    : boot.is_default ? "TRYX default animation"
-    : `${esc(bootItem ? bootItem.name : boot.media)}<br><span class="note">shown at power-on, before shyyctl starts</span>`;
-  document.getElementById("panoBootResetBtn").disabled = !boot || boot.is_default;
+  const custom = boot && !boot.is_default;
+  document.getElementById("panoBootInfo").innerHTML =
+    `The panel always starts with the <strong>TRYX animation</strong> - its firmware doesn't take another one.
+     For your own intro, let shyyctl play a video when it starts.`
+    + (custom ? `<br><span class="note">An older custom power-on setting is still stored on the panel.</span>` : "");
+  document.getElementById("panoBootResetBtn").style.display = custom ? "" : "none";
 
   document.getElementById("panoMediaTable").innerHTML = panoMedia.length ? `
     <thead><tr><th>Path</th><th>Suffix</th><th>Size</th></tr></thead>
@@ -2522,7 +2754,6 @@ function renderGallery(){
       </div>
       ${isCenter ? `<div class="kanali-card-actions">
         <button class="btn sm" onclick="event.stopPropagation(); doApplyGalleryItem('${item.id}')">Apply</button>
-        <button class="btn sec sm" onclick="event.stopPropagation(); doSetBootGalleryItem('${item.id}')">Set as boot</button>
         <button class="btn sec sm" onclick="event.stopPropagation(); deleteGalleryItem('${item.id}')">Delete</button>
       </div>` : ``}
     </div>`;
@@ -2574,7 +2805,7 @@ function galleryCardHoverEnd(el, id){
 
 async function uploadToGallery(){
   const input = document.getElementById("galleryUploadFile");
-  if(!input.files.length){ say("Pick a file first.","error"); return; }
+  if(!input.files.length) return;
   const form = new FormData();
   form.append("file", input.files[0]);
   say("Uploading and generating a thumbnail…");
@@ -2585,7 +2816,7 @@ async function uploadToGallery(){
     await loadGallery();
     galleryCenterIndex = galleryItems.length - 1; // focus the newly added item
     renderGallery();
-  }catch(e){ say(e.message,"error"); }
+  }catch(e){ say(e.message,"error"); input.value = ""; }
 }
 
 async function doApplyGalleryItem(id){
@@ -2598,15 +2829,6 @@ async function doApplyGalleryItem(id){
     renderGallery();
     await loadPanorama(); renderPanorama();
     drawAdvancedCase(); // Advanced canvas's display-unit preview mirrors whatever's applied now
-  }catch(e){ say(e.message,"error"); }
-}
-
-async function doSetBootGalleryItem(id){
-  say("Encoding and uploading the power-on screen…");
-  try{
-    await api(`/api/panorama/gallery/${id}/boot`,{method:"POST"});
-    say("Power-on screen set - it shows the next time the PC is switched on.");
-    await loadPanorama(); renderPanorama();
   }catch(e){ say(e.message,"error"); }
 }
 
@@ -3082,14 +3304,19 @@ loadStartupAnimation();
 function renderSettings(){
   if(!status_) return;
   const {hub, openrgb, panorama} = status_;
-  document.getElementById("connections").innerHTML = `
-    <div class="note" style="line-height:1.9">
-      <strong style="color:var(--ink)">Hub</strong> — ${esc(hub.connected?(hub.description||"connected"):hub.error)}<br>
-      fan channels: ${(hub.channels&&hub.channels.fan||[]).join(", ")||"none"}<br>
-      led channels: ${(hub.channels&&hub.channels.led||[]).join(", ")||"none"}<br><br>
-      <strong style="color:var(--ink)">OpenRGB</strong> — ${esc(openrgb.connected?"connected":openrgb.error)}<br><br>
-      <strong style="color:var(--ink)">Panorama</strong> — ${panorama.connected?"connected":"not connected"}
-    </div>`;
+  const leds = (hub.channels && hub.channels.led) || [];
+  const conn = (name, on, detail) => `<div class="conn-row">
+      <span class="lamp" data-on="${!!on}"></span><span class="conn-name">${name}</span>
+      <span class="conn-detail">${detail}</span></div>`;
+  document.getElementById("connections").innerHTML =
+    conn("Fan hub", hub.connected, hub.connected
+      ? `${esc(hub.description || "NZXT Control Hub")} · ${hub.control === "direct" ? "driven by shyyctl" : "LEDs through OpenRGB"}
+         · ${leds.map(ch => esc(channelLabel(ch))).join(", ") || "no LED channels"}`
+      : esc(hub.error || "not connected"))
+    + conn("OpenRGB", openrgb.connected, openrgb.connected ? "RAM and motherboard lighting" : esc(openrgb.error || "not connected"))
+    + conn("Display", panorama.connected, panorama.connected
+      ? esc([panoStatus && panoStatus.info && panoStatus.info.product, panoStatus && panoStatus.info && panoStatus.info.firmware].filter(Boolean).join(" · ") || "connected")
+      : "not connected - it reconnects by itself");
   renderHubSizes();
 }
 
@@ -3147,6 +3374,13 @@ async function refresh(){
 }
 
 (async ()=>{
+  // show the page the address asks for right away, before any data arrives
+  {
+    const parts = (location.hash||"").replace("#/","").split("/");
+    showPage(parts[0]||"status", parts[1]);
+    renderOverview(); renderSensorTiles();
+  }
+  try{ await loadLayout(); }catch(e){}
   await refresh();
   await loadRgbState();
   applyMoboState();
@@ -3238,6 +3472,47 @@ async function loadSystemInfo(){
     renderServicesStatus(services);
     renderAutostart(autostart);
   }catch(e){}
+  try{ renderElevatedHelpers(await api("/api/system/elevated-helpers")); }catch(e){}
+}
+
+/* ---------- start without UAC prompts ----------
+   OpenRGB (RAM lighting) and SensorHelper (temperatures) need admin
+   rights - by default that's a UAC prompt for each at every launch. Set
+   up once here (one prompt), protected copies start through Windows'
+   Task Scheduler instead; see tools/elevated_helpers.ps1. */
+function renderElevatedHelpers(h){
+  const section = document.getElementById("elevatedHelpersSection");
+  section.style.display = h.supported ? "" : "none";
+  if(!h.supported) return;
+  const outdated = Object.values(h.states).includes("outdated");
+  document.getElementById("elevatedHelpersNote").textContent =
+    h.ready ? "set up" : outdated ? "needs setting up again" : "not set up";
+  document.getElementById("elevatedHelpersText").innerHTML = h.ready
+    ? `OpenRGB and SensorHelper start with admin rights <strong>without a prompt</strong>, from protected copies in
+       <span class="note">${esc(h.folder)}</span> that only administrators can change.`
+    : outdated
+    ? `OpenRGB or SensorHelper was updated since this was set up, so shyyctl asks with a UAC prompt again until
+       it's set up once more.`
+    : `OpenRGB (RAM lighting) and SensorHelper (temperatures) need admin rights, so Windows asks at every start
+       - and until you answer, they wait. Set up once (one prompt) to start them without asking: shyyctl copies
+       them to a folder only administrators can change and starts them through Windows' Task Scheduler.`;
+  const setup = document.getElementById("elevatedSetupBtn");
+  setup.textContent = h.ready ? "Set up again" : "Set up (one admin prompt)";
+  setup.className = h.ready ? "btn sec sm" : "btn sm";
+  document.getElementById("elevatedRemoveBtn").style.display = h.any ? "" : "none";
+}
+
+async function elevatedHelpers(action){
+  const buttons = ["elevatedSetupBtn","elevatedRemoveBtn"].map(id => document.getElementById(id));
+  buttons.forEach(b => b.disabled = true);
+  say(action === "install" ? "Confirm the Windows prompt to set it up…" : "Confirm the Windows prompt to undo it…");
+  try{
+    const r = await api(`/api/system/elevated-helpers/${action}`,{method:"POST"});
+    say(r.ok ? (action === "install" ? "Done - no more UAC prompts at startup." : "Undone - Windows asks again at startup.")
+             : r.message, r.ok ? "info" : "error");
+    renderElevatedHelpers(r);
+  }catch(e){ say(e.message,"error"); }
+  finally{ buttons.forEach(b => b.disabled = false); }
 }
 
 async function loadResourceUsage(){
@@ -3359,6 +3634,10 @@ async function applyUpdate(){
 function renderServicesStatus(s){
   document.getElementById("servicesStatusNote").textContent =
     `OpenRGB: ${s.openrgb ? "running" : "stopped"} · SensorHelper: ${s.sensor_helper ? "running" : "stopped"}`;
+  // the button matching what's actually running is the highlighted one
+  const current = s.openrgb ? (s.sensor_helper ? "all" : "effects") : (s.sensor_helper ? "fans_display" : "stop");
+  document.querySelectorAll("#backgroundServicesSection button[data-mode]").forEach(b =>
+    b.className = b.dataset.mode === current ? "btn sm" : "btn sec sm");
 }
 
 function renderAutostart(a){
