@@ -43,8 +43,12 @@ SetCompressor /SOLID lzma
 !ifdef MUI_ICON
   !undef MUI_ICON
 !endif
+!ifdef MUI_UNICON
+  !undef MUI_UNICON
+!endif
 !ifdef ICON_FILE
   !define MUI_ICON "${ICON_FILE}"
+  !define MUI_UNICON "${ICON_FILE}"
 !endif
 
 !insertmacro MUI_PAGE_WELCOME
